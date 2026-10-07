@@ -11,7 +11,8 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "allocator-telemetry")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const INITIAL_CURSOR: u32 = 8;
@@ -187,6 +188,12 @@ thread_local! {
     };
 }
 
+// Ordinary allocations can avoid touching TLS when no thread is batching
+// releases. A thread's collector increments this before its operation runs
+// and decrements only after clearing its TLS slot, so its own allocation
+// cannot observe zero while its collector is active.
+static ACTIVE_RELEASE_COLLECTOR_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 struct ReleaseBatchScope {
     collector: *mut ReleaseCollector,
     previous: *mut ReleaseCollector,
@@ -195,6 +202,9 @@ struct ReleaseBatchScope {
 impl Drop for ReleaseBatchScope {
     fn drop(&mut self) {
         ACTIVE_RELEASE_COLLECTOR.with(|active| active.set(self.previous));
+        if ENABLE_PENDING_REUSE {
+            ACTIVE_RELEASE_COLLECTOR_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
         // SAFETY: the collector is stack-local to `with_batched_releases` and
         // this scope guard is dropped before that local leaves scope.
         unsafe { (*self.collector).flush() };
@@ -674,6 +684,9 @@ impl CompactRuntime {
         let mut collector = ReleaseCollector::new();
         let collector_pointer = &mut collector as *mut ReleaseCollector;
         let previous = ACTIVE_RELEASE_COLLECTOR.with(|active| active.replace(collector_pointer));
+        if ENABLE_PENDING_REUSE {
+            ACTIVE_RELEASE_COLLECTOR_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         let scope = ReleaseBatchScope {
             collector: collector_pointer,
             previous,
@@ -1384,6 +1397,8 @@ fn take_pending_reuse(
     if !ENABLE_PENDING_REUSE {
         let _ = (state, bytes, alignment);
         (PendingLookup::Disabled, None)
+    } else if ACTIVE_RELEASE_COLLECTOR_COUNT.load(Ordering::Relaxed) == 0 {
+        (PendingLookup::NoCollector, None)
     } else {
         ACTIVE_RELEASE_COLLECTOR.with(|active| {
             let collector = active.get();
@@ -2175,10 +2190,7 @@ fn release_many_locked(
         }
     }
 
-    if extents.len() == 1
-        && cache_small_classes
-        && allocator.size_class_counts.iter().all(|count| *count == 0)
-    {
+    if extents.len() == 1 && allocator.size_class_counts.iter().all(|count| *count == 0) {
         let extent = extents[0];
         validate_free_extent(allocator, extent)?;
         let new_live_bytes = allocator
@@ -2187,9 +2199,8 @@ fn release_many_locked(
             .ok_or(Error::InvalidOffset)?;
         // With no cached ranges, the ordered list is the complete free
         // structure. Keep its established insertion path for coalescing and
-        // cursor contraction instead of building batch scratch. Size-class
-        // caching is reserved for multi-extent releases so a stream of
-        // individual drops does not force a full class merge on the next drop.
+        // cursor contraction instead of building batch scratch. This also
+        // applies when global size-class caching is disabled.
         insert_free(state, allocator, extent.start, extent.len)?;
         allocator.live_bytes = new_live_bytes;
         #[cfg(feature = "allocator-telemetry")]
