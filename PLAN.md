@@ -430,6 +430,43 @@ cargo test -p compact_backend_std
 
 Add Miri commands once the implementation layout supports them.
 
+
+## Cargo distribution and consumer import
+
+V1 must be consumable as ordinary Rust library crates rather than requiring a custom compiler, patched toolchain, or repository-local source copy.
+
+Requirements:
+
+- `compact_core` and `compact_backend_std` are normal Cargo packages with complete package metadata.
+- Package/crate names must permit normal imports such as `use compact_core::...` and `use compact_backend_std::...`.
+- Keep dependencies publishable: no accidental absolute filesystem paths, generated local-only dependencies, or unpublished cyclic workspace assumptions.
+- A normal external Cargo project must be able to depend on V1 through a path dependency immediately, a Git dependency from this repository, and eventually a registry dependency without source changes.
+- `compact_backend_std` should re-export the common core types needed by hosted users when doing so does not create ambiguous APIs, so a typical std-hosted application does not need unnecessary duplicate imports.
+- Do not rely on `cargo install` for library consumption; `cargo install` is principally for binaries. The supported library installation/import model is Cargo dependency resolution (`cargo add`, `Cargo.toml` path/git/registry dependency) followed by ordinary `use` imports.
+- Keep the workspace structured so a future top-level `compact_std` facade package can be added as the ergonomic default dependency without changing `compact_core` ABI or backend contracts.
+- Add a minimal external-consumer fixture/example that compiles as a separate crate and proves the public crates can be imported and used without workspace-private APIs.
+- Run `cargo package` or `cargo package --allow-dirty`/equivalent dry validation for publishable packages as appropriate; do not publish to a registry in this milestone.
+- Document path and Git dependency examples in the V1 README.
+
+Expected consumer shape:
+
+```toml
+[dependencies]
+compact_core = { path = "../compact-std-library-rust/crates/compact_core" }
+compact_backend_std = { path = "../compact-std-library-rust/crates/compact_backend_std" }
+```
+
+or, when consumed from Git/registry, the equivalent dependency declarations.
+
+Expected source-level usage must be ordinary Rust imports, for example:
+
+```rust
+use compact_backend_std::StdArena;
+use compact_core::Offset32;
+```
+
+The precise hosted constructor/type name may differ after the backing ownership design is finalized, but no custom compiler invocation may be required.
+
 ## Performance constraints
 
 Do not add expensive machinery to the hot dereference path.
