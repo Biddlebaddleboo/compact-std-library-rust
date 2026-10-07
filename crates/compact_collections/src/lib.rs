@@ -8,6 +8,7 @@ mod compact_bytes;
 mod deque;
 mod enum_value;
 mod error;
+mod hash_control;
 mod hash_map;
 mod intern;
 mod os_path;

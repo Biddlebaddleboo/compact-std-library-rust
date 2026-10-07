@@ -144,9 +144,13 @@ through `FfiByteBuffer`; a cage offset is never exported as a pointer.
 
 ## Portable implementation
 
-The V2.4 kernel uses ordinary Rust and atomics/mutexes. No assembly or
-architecture-specific implementation was needed to meet the representation or
-correctness goals. The portable Rust implementation is the reference path.
+The V2.4 retained architecture remains frozen. Implementation hot paths use
+temporary borrow-bound resolved views, batch append writers, and direct deque
+iteration without adding state to retained owners. Hash control-byte probing
+keeps the `EMPTY`/`FULL`/`TOMBSTONE` format and has a portable scalar reference,
+an AArch64 NEON classifier, and an x86-64 SSE2 classifier. The SIMD code only
+classifies copied 16-byte groups; probing order and key equality remain in
+ordinary Rust. No inline assembly is used.
 
 Compact cage bytes are process-local runtime representation, not a stable file,
 IPC, network, or cross-target format. Use an external serialization format for

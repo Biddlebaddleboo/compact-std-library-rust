@@ -1,5 +1,6 @@
 //! Randomized cage-backed hash map and set.
 
+use crate::hash_control::{self, WIDTH as CONTROL_GROUP_WIDTH};
 use compact_backend_std::{CageAllocation, CompactRuntime};
 use compact_core::CompactValue;
 use core::borrow::Borrow;
@@ -13,6 +14,46 @@ use crate::{CollectionError, Result};
 const EMPTY: u8 = 0;
 const FULL: u8 = 1;
 const TOMBSTONE: u8 = 2;
+
+fn control_group(
+    control: &[u8],
+    start: usize,
+    mask: usize,
+    count: usize,
+) -> [u8; CONTROL_GROUP_WIDTH] {
+    let mut group = [FULL; CONTROL_GROUP_WIDTH];
+    for (lane, value) in group.iter_mut().take(count).enumerate() {
+        *value = control[start.wrapping_add(lane) & mask];
+    }
+    group
+}
+
+fn first_empty_slot(control: &[u8], start: usize) -> Option<usize> {
+    let mask = control.len().checked_sub(1)?;
+    let mut consumed = 0;
+    while consumed < control.len() {
+        let count = (control.len() - consumed).min(CONTROL_GROUP_WIDTH);
+        let cursor = start.wrapping_add(consumed) & mask;
+        let group = control_group(control, cursor, mask, count);
+        let classes = hash_control::classify(&group);
+        let active = lane_mask(count);
+        let empty = classes.empty & active;
+        if empty != 0 {
+            let lane = empty.trailing_zeros() as usize;
+            return Some(cursor.wrapping_add(lane) & mask);
+        }
+        consumed += count;
+    }
+    None
+}
+
+fn lane_mask(count: usize) -> u16 {
+    if count == CONTROL_GROUP_WIDTH {
+        u16::MAX
+    } else {
+        (1_u16 << count) - 1
+    }
+}
 
 /// Compact SipHash key pair used by default to retain randomized hashing.
 #[derive(Clone, Copy, Debug)]
@@ -197,14 +238,12 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (index, found) = self.find_slot(key, self.hash(key))?;
+        let control = self.control.as_ref()?.as_slice();
+        let entries = self.entries.as_ref()?.as_slice();
+        let (index, found) = Self::find_slot_in(control, entries, key, self.hash(key))?;
         found.then(|| {
             // SAFETY: FULL control state corresponds to one initialized pair.
-            unsafe {
-                &self.entries.as_ref().unwrap().as_slice()[index]
-                    .assume_init_ref()
-                    .1
-            }
+            unsafe { &entries[index].assume_init_ref().1 }
         })
     }
     /// Return key and value by borrowed key.
@@ -213,11 +252,12 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (index, found) = self.find_slot(key, self.hash(key))?;
+        let control = self.control.as_ref()?.as_slice();
+        let entries = self.entries.as_ref()?.as_slice();
+        let (index, found) = Self::find_slot_in(control, entries, key, self.hash(key))?;
         found.then(|| {
             // SAFETY: FULL control state corresponds to one initialized pair.
-            let pair =
-                unsafe { self.entries.as_ref().unwrap().as_slice()[index].assume_init_ref() };
+            let pair = unsafe { entries[index].assume_init_ref() };
             (&pair.0, &pair.1)
         })
     }
@@ -276,14 +316,18 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         let Some(control) = &mut self.control else {
             return;
         };
-        for index in 0..control.len() {
-            if control.as_slice()[index] == FULL {
-                control.as_mut_slice()[index] = EMPTY;
+        let controls = control.as_mut_slice();
+        let entries = self
+            .entries
+            .as_mut()
+            .expect("allocated control has entries")
+            .as_mut_slice();
+        for index in 0..controls.len() {
+            if controls[index] == FULL {
+                controls[index] = EMPTY;
                 self.len -= 1;
                 // SAFETY: the control byte marks one initialized pair.
-                let pair = unsafe {
-                    self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_read()
-                };
+                let pair = unsafe { entries[index].assume_init_read() };
                 drop(pair);
             }
         }
@@ -295,15 +339,16 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         let required = (self.len as usize)
             .checked_add(additional)
             .ok_or(CollectionError::CapacityOverflow)?;
-        let mut slots = self.capacity().max(8);
+        let current_capacity = self.capacity();
+        let mut slots = current_capacity.max(8);
         while required.saturating_mul(8) >= slots.saturating_mul(7) {
             slots = slots
                 .checked_mul(2)
                 .ok_or(CollectionError::CapacityOverflow)?;
         }
-        if self.capacity() == 0
-            || slots > self.capacity()
-            || self.tombstones as usize > self.capacity() / 4
+        if current_capacity == 0
+            || slots > current_capacity
+            || self.tombstones as usize > current_capacity / 4
         {
             self.rehash(slots)?;
         }
@@ -370,20 +415,22 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         let Some(control) = &mut self.control else {
             return;
         };
-        for index in 0..control.len() {
-            if control.as_slice()[index] == FULL {
+        let controls = control.as_mut_slice();
+        let entries = self
+            .entries
+            .as_mut()
+            .expect("allocated control has entries")
+            .as_mut_slice();
+        for index in 0..controls.len() {
+            if controls[index] == FULL {
                 // SAFETY: the map is exclusively borrowed and the slot is live.
-                let pair = unsafe {
-                    self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_mut()
-                };
+                let pair = unsafe { entries[index].assume_init_mut() };
                 if !keep(&pair.0, &mut pair.1) {
-                    control.as_mut_slice()[index] = TOMBSTONE;
+                    controls[index] = TOMBSTONE;
                     self.len -= 1;
                     self.tombstones += 1;
                     // SAFETY: control was made vacant and the pair is moved out exactly once.
-                    let pair = unsafe {
-                        self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_read()
-                    };
+                    let pair = unsafe { entries[index].assume_init_read() };
                     drop(pair);
                 }
             }
@@ -400,6 +447,75 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     {
         let control = self.control.as_ref()?.as_slice();
         let entries = self.entries.as_ref()?.as_slice();
+        Self::find_slot_in(control, entries, key, hash)
+    }
+
+    fn find_slot_in<Q>(
+        control: &[u8],
+        entries: &[MaybeUninit<(K, V)>],
+        key: &Q,
+        hash: u64,
+    ) -> Option<(usize, bool)>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let mask = control.len().checked_sub(1)?;
+        let mut first_tombstone = None;
+        let start = hash as usize & mask;
+        let mut consumed = 0;
+        while consumed < control.len() {
+            let count = (control.len() - consumed).min(CONTROL_GROUP_WIDTH);
+            let cursor = start.wrapping_add(consumed) & mask;
+            let group = control_group(control, cursor, mask, count);
+            let classes = hash_control::classify(&group);
+            let active = lane_mask(count);
+            let empty = classes.empty & active;
+            let full = classes.full & active;
+            let tombstone = classes.tombstone & active;
+            if active & !(empty | full | tombstone) != 0 {
+                unreachable!("control state is an internal two-bit invariant");
+            }
+
+            let first_empty = if empty == 0 {
+                count
+            } else {
+                empty.trailing_zeros() as usize
+            };
+            let before_empty = lane_mask(first_empty);
+            let mut full_candidates = full & before_empty;
+            while full_candidates != 0 {
+                let lane = full_candidates.trailing_zeros() as usize;
+                full_candidates &= full_candidates - 1;
+                let index = cursor.wrapping_add(lane) & mask;
+                // SAFETY: FULL slots contain initialized key-value pairs.
+                let pair = unsafe { entries[index].assume_init_ref() };
+                if pair.0.borrow() == key {
+                    return Some((index, true));
+                }
+            }
+            let earlier_tombstones = tombstone & before_empty;
+            if first_tombstone.is_none() && earlier_tombstones != 0 {
+                let lane = earlier_tombstones.trailing_zeros() as usize;
+                first_tombstone = Some(cursor.wrapping_add(lane) & mask);
+            }
+            if first_empty < count {
+                let empty_index = cursor.wrapping_add(first_empty) & mask;
+                return Some((first_tombstone.unwrap_or(empty_index), false));
+            }
+            consumed += count;
+        }
+        first_tombstone.map(|index| (index, false))
+    }
+
+    #[cfg(test)]
+    fn find_slot_scalar<Q>(&self, key: &Q, hash: u64) -> Option<(usize, bool)>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let control = self.control.as_ref()?.as_slice();
+        let entries = self.entries.as_ref()?.as_slice();
         let mask = control.len().checked_sub(1)?;
         let mut first_tombstone = None;
         let start = hash as usize & mask;
@@ -408,9 +524,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
             match control[index] {
                 EMPTY => return Some((first_tombstone.unwrap_or(index), false)),
                 TOMBSTONE => {
-                    if first_tombstone.is_none() {
-                        first_tombstone = Some(index);
-                    }
+                    first_tombstone.get_or_insert(index);
                 }
                 FULL => {
                     // SAFETY: FULL slots contain initialized key-value pairs.
@@ -420,14 +534,15 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
                     }
                 }
                 _ => unreachable!("control state is an internal two-bit invariant"),
-            }
+            };
         }
         first_tombstone.map(|index| (index, false))
     }
     fn ensure_insert_capacity(&mut self) -> Result<()> {
-        if self.capacity() == 0
+        let capacity = self.capacity();
+        if capacity == 0
             || ((self.len as usize + self.tombstones as usize + 1).saturating_mul(8))
-                >= self.capacity().saturating_mul(7)
+                >= capacity.saturating_mul(7)
         {
             self.reserve(1)?;
         }
@@ -446,6 +561,8 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
             .try_reserve_exact(old_control.len())
             .map_err(|_| CollectionError::Core(compact_core::Error::AllocationFailed))?;
         destinations.resize(old_control.len(), usize::MAX);
+        let mask = slots - 1;
+        let new_control_slice = new_control.as_mut_slice();
         for old_index in 0..old_control.len() {
             if old_control[old_index] != FULL {
                 continue;
@@ -453,32 +570,24 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
             // SAFETY: FULL slots contain initialized pairs.
             let pair = unsafe { old_entries[old_index].assume_init_ref() };
             let hash = self.hash(&pair.0);
-            let mask = slots - 1;
             let start = hash as usize & mask;
-            let control = new_control.as_mut_slice();
-            let mut target = None;
-            for step in 0..slots {
-                let index = start.wrapping_add(step) & mask;
-                if control[index] == EMPTY {
-                    target = Some(index);
-                    break;
-                }
-            }
-            let index = target.ok_or(CollectionError::Core(
+            let index = first_empty_slot(new_control_slice, start).ok_or(CollectionError::Core(
                 compact_core::Error::AllocationExhausted,
             ))?;
-            control[index] = FULL;
+            new_control_slice[index] = FULL;
             destinations[old_index] = index;
         }
         // No user code or fallible operation remains; transfer all pairs.
+        let new_entries_slice = new_entries.as_mut_slice();
         if let Some(entries) = &mut self.entries {
+            let entries = entries.as_mut_slice();
             for (old_index, target) in destinations.iter().copied().enumerate() {
                 if target == usize::MAX {
                     continue;
                 }
                 // SAFETY: this pair is moved exactly once into an empty slot.
-                let pair = unsafe { entries.as_mut_slice()[old_index].assume_init_read() };
-                new_entries.as_mut_slice()[target].write(pair);
+                let pair = unsafe { entries[old_index].assume_init_read() };
+                new_entries_slice[target].write(pair);
             }
         }
         self.control = Some(new_control);
@@ -493,13 +602,9 @@ type TableStorage<K, V> = (CageAllocation<u8>, EntryStorage<K, V>);
 
 fn empty_table<K: CompactValue, V: CompactValue>(slots: usize) -> Result<TableStorage<K, V>> {
     let mut control = CompactRuntime::alloc_owned_slice::<u8>(slots)?;
-    for _ in 0..slots {
-        control.push(EMPTY)?;
-    }
+    control.extend_from_fn(slots, || EMPTY)?;
     let mut entries = CompactRuntime::alloc_owned_slice::<MaybeUninit<(K, V)>>(slots)?;
-    for _ in 0..slots {
-        entries.push(MaybeUninit::uninit())?;
-    }
+    entries.extend_from_fn(slots, MaybeUninit::uninit)?;
     Ok((control, entries))
 }
 
@@ -517,14 +622,18 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         // SAFETY: guard is created from an exclusive borrow during map drop.
         let map = unsafe { &mut *self.map };
         if let Some(control) = &mut map.control {
-            for index in 0..control.len() {
-                if control.as_slice()[index] == FULL {
-                    control.as_mut_slice()[index] = EMPTY;
+            let controls = control.as_mut_slice();
+            let entries = map
+                .entries
+                .as_mut()
+                .expect("allocated control has entries")
+                .as_mut_slice();
+            for index in 0..controls.len() {
+                if controls[index] == FULL {
+                    controls[index] = EMPTY;
                     map.len -= 1;
                     // SAFETY: FULL marked an initialized pair and is cleared before its destructor.
-                    let pair = unsafe {
-                        map.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_read()
-                    };
+                    let pair = unsafe { entries[index].assume_init_read() };
                     drop(pair);
                 }
             }
@@ -724,4 +833,91 @@ impl<T: CompactValue + Hash + Eq> Default for CompactHashSet<T, CompactBuildHash
 unsafe impl<T: CompactValue + Hash + Eq, S: BuildHasher + CompactValue> CompactValue
     for CompactHashSet<T, S>
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompactHashMap, CompactValue};
+    use compact_backend_std::{CageConfig, CompactRuntime};
+    use core::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
+
+    static INIT: OnceLock<()> = OnceLock::new();
+
+    fn init() {
+        INIT.get_or_init(|| {
+            CompactRuntime::init(CageConfig::new(32 * 1024 * 1024)).unwrap();
+        });
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct IdentityBuildHasher;
+    struct IdentityHasher(u64);
+
+    impl Hasher for IdentityHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0 = bytes
+                .iter()
+                .take(8)
+                .enumerate()
+                .fold(0_u64, |hash, (index, byte)| {
+                    hash | (u64::from(*byte) << (index * 8))
+                });
+        }
+        fn write_u32(&mut self, value: u32) {
+            self.0 = u64::from(value);
+        }
+    }
+    impl BuildHasher for IdentityBuildHasher {
+        type Hasher = IdentityHasher;
+        fn build_hasher(&self) -> Self::Hasher {
+            IdentityHasher(0)
+        }
+    }
+    // SAFETY: this is a zero-sized native hasher builder.
+    unsafe impl CompactValue for IdentityBuildHasher {}
+
+    fn assert_probe_matches_scalar(map: &CompactHashMap<u32, u32, IdentityBuildHasher>) {
+        let capacity = map.capacity() as u32;
+        for key in 0..capacity.saturating_mul(8).saturating_add(128) {
+            let hash = map.hash(&key);
+            assert_eq!(map.find_slot(&key, hash), map.find_slot_scalar(&key, hash));
+        }
+    }
+
+    #[test]
+    fn grouped_probe_matches_scalar_across_wrap_and_tombstones() {
+        init();
+        let mut small = CompactHashMap::with_capacity_and_hasher(3, IdentityBuildHasher).unwrap();
+        let small_capacity = small.capacity() as u32;
+        let small_start = small_capacity - 2;
+        for index in 0..5_u32 {
+            let key = small_start + index * small_capacity;
+            small.insert(key, key).unwrap();
+        }
+        assert_probe_matches_scalar(&small);
+
+        let mut map = CompactHashMap::with_capacity_and_hasher(20, IdentityBuildHasher).unwrap();
+        let capacity = map.capacity() as u32;
+        let start = capacity - 3;
+        let keys: Vec<u32> = (0..20).map(|index| start + index * capacity).collect();
+        for key in keys.iter().copied() {
+            map.insert(key, key ^ 0x5a5a).unwrap();
+        }
+        assert_probe_matches_scalar(&map);
+
+        for key in keys.iter().step_by(3).copied() {
+            assert_eq!(map.remove(&key), Some(key ^ 0x5a5a));
+        }
+        assert_probe_matches_scalar(&map);
+
+        for index in 0..8_u32 {
+            let key = start + (100 + index) * capacity;
+            map.insert(key, key ^ 0xa5a5).unwrap();
+        }
+        assert_probe_matches_scalar(&map);
+    }
 }

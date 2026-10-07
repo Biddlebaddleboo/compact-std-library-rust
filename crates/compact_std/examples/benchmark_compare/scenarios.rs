@@ -3,7 +3,7 @@ use crate::measure::{self, BenchResult, Mutation, Read};
 use crate::models::*;
 use compact_std::{
     CompactBox, CompactBytes, CompactHashMap, CompactHashSet, CompactPathBuf, CompactRuntime,
-    CompactString, CompactVec, CompactVecDeque, FrozenBuilder, FrozenGraph,
+    CompactString, CompactVec, CompactVecDeque, FrozenBuilder, FrozenGraph, FrozenGraphView,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -83,11 +83,9 @@ fn vector_build_churn(variant: &str, repetitions: usize) -> BenchResult<u64> {
     let compact = variant == "compact";
     let build = move || -> BenchResult<VectorState> {
         if compact {
-            let mut values = CompactVec::new();
-            for value in 0..BASE as u32 {
-                values.push(value)?;
-            }
-            Ok(VectorState::Compact(values))
+            Ok(VectorState::Compact(CompactVec::try_from_iter(
+                0..BASE as u32,
+            )?))
         } else {
             Ok(VectorState::Native((0..BASE as u32).collect()))
         }
@@ -98,27 +96,23 @@ fn vector_build_churn(variant: &str, repetitions: usize) -> BenchResult<u64> {
             match state {
                 VectorState::Native(values) => {
                     for cycle in 0..4_u32 {
-                        values.reserve(50_000);
-                        for value in 0..50_000_u32 {
-                            values.push(100_000 + cycle * 50_000 + value);
-                        }
+                        values
+                            .extend((0..50_000_u32).map(|value| 100_000 + cycle * 50_000 + value));
                         values.truncate(BASE);
-                        for value in 0..25_000_u32 {
-                            values.push(200_000 + cycle * 25_000 + value);
-                        }
+                        values
+                            .extend((0..25_000_u32).map(|value| 200_000 + cycle * 25_000 + value));
                         values.truncate(BASE);
                     }
                 }
                 VectorState::Compact(values) => {
                     for cycle in 0..4_u32 {
-                        values.reserve(50_000)?;
-                        for value in 0..50_000_u32 {
-                            values.push(100_000 + cycle * 50_000 + value)?;
-                        }
+                        values.try_extend(
+                            (0..50_000_u32).map(|value| 100_000 + cycle * 50_000 + value),
+                        )?;
                         values.truncate(BASE);
-                        for value in 0..25_000_u32 {
-                            values.push(200_000 + cycle * 25_000 + value)?;
-                        }
+                        values.try_extend(
+                            (0..25_000_u32).map(|value| 200_000 + cycle * 25_000 + value),
+                        )?;
                         values.truncate(BASE);
                     }
                 }
@@ -1709,11 +1703,12 @@ fn frozen_catalog(variant: &str, repetitions: usize) -> BenchResult<u64> {
                     }
                 }
                 FrozenState::Compact(graph) => {
-                    let records = graph.slice(&graph.root().records)?;
+                    let view = graph.view();
+                    let records = view.slice(&graph.root().records)?;
                     for offset in 0..8_000 {
                         let index = (offset * 7_919) % records.len();
                         checksum =
-                            checksum.wrapping_add(compact_catalog_record(graph, &records[index]));
+                            checksum.wrapping_add(compact_catalog_record(&view, &records[index]));
                     }
                 }
             }
@@ -1758,17 +1753,14 @@ fn native_frozen_checksum(title: &str, records: &[NativeCatalogRecord]) -> u64 {
         .wrapping_add(title.len() as u64)
 }
 
-fn compact_catalog_record(
-    graph: &FrozenGraph<FrozenCatalogRoot>,
-    record: &FrozenCatalogRecord,
-) -> u64 {
-    let name = graph
+fn compact_catalog_record(view: &FrozenGraphView<'_>, record: &FrozenCatalogRecord) -> u64 {
+    let name = view
         .str(&record.name)
         .expect("catalog name descriptor is valid");
-    let category = graph
+    let category = view
         .str(&record.category)
         .expect("catalog category descriptor is valid");
-    let related = graph
+    let related = view
         .slice(&record.related)
         .expect("catalog related descriptor is valid");
     record.id as u64
@@ -1779,16 +1771,17 @@ fn compact_catalog_record(
 }
 
 fn compact_frozen_checksum(graph: &FrozenGraph<FrozenCatalogRoot>) -> u64 {
+    let view = graph.view();
     let root = graph.root();
-    let title = graph
+    let title = view
         .str(&root.title)
         .expect("catalog title descriptor is valid");
-    let records = graph
+    let records = view
         .slice(&root.records)
         .expect("catalog records descriptor is valid");
     records
         .iter()
-        .map(|record| compact_catalog_record(graph, record))
+        .map(|record| compact_catalog_record(&view, record))
         .sum::<u64>()
         .wrapping_add(title.len() as u64)
 }
@@ -1813,7 +1806,8 @@ fn native_parallel_checksum(records: &[NativeCatalogRecord]) -> u64 {
 }
 
 fn compact_parallel_checksum(graph: &FrozenGraph<FrozenCatalogRoot>) -> u64 {
-    let records = graph
+    let view = graph.view();
+    let records = view
         .slice(&graph.root().records)
         .expect("catalog records descriptor is valid");
     let mid = records.len() / 2;
@@ -1821,13 +1815,13 @@ fn compact_parallel_checksum(graph: &FrozenGraph<FrozenCatalogRoot>) -> u64 {
         let first = scope.spawn(|| {
             records[..mid]
                 .iter()
-                .map(|record| compact_catalog_record(graph, record))
+                .map(|record| compact_catalog_record(&view, record))
                 .sum::<u64>()
         });
         let second = scope.spawn(|| {
             records[mid..]
                 .iter()
-                .map(|record| compact_catalog_record(graph, record))
+                .map(|record| compact_catalog_record(&view, record))
                 .sum::<u64>()
         });
         first.join().expect("catalog read worker") + second.join().expect("catalog read worker")

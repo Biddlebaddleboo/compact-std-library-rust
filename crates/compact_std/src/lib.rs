@@ -22,8 +22,8 @@ pub use compact_core::{
     NULL_OFFSET, OFFSET_WIDTH_BYTES,
 };
 pub use compact_frozen::{
-    FrozenBuilder, FrozenBytes, FrozenError, FrozenGraph, FrozenMap, FrozenOsString, FrozenPathBuf,
-    FrozenResult, FrozenSet, FrozenString, FrozenValue, FrozenVec,
+    FrozenBuilder, FrozenBytes, FrozenError, FrozenGraph, FrozenGraphView, FrozenMap,
+    FrozenOsString, FrozenPathBuf, FrozenResult, FrozenSet, FrozenString, FrozenValue, FrozenVec,
 };
 pub use compact_macros::{compact, CompactDeserialize, FrozenValue};
 #[cfg(feature = "json")]

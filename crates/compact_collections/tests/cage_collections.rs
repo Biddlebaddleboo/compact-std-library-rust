@@ -76,6 +76,27 @@ fn vec_string_box_and_bytes_grow_and_release() {
     assert_eq!(bytes.as_slice(), b"first fragment + second fragment");
     bytes.truncate(5);
     assert_eq!(bytes.as_slice(), b"first");
+
+    let mut fallible_bytes = CompactBytes::new();
+    let mut emitted = 0;
+    let mut source_error = None;
+    fallible_bytes
+        .try_extend_fallible(
+            0,
+            || {
+                emitted += 1;
+                if emitted <= 25 {
+                    Ok(Some(emitted as u8))
+                } else {
+                    Err("source failed")
+                }
+            },
+            &mut source_error,
+        )
+        .unwrap();
+    assert_eq!(source_error, Some("source failed"));
+    assert_eq!(fallible_bytes.len(), 25);
+    assert_eq!(fallible_bytes.as_slice(), (1_u8..=25).collect::<Vec<_>>());
 }
 
 #[test]
@@ -100,6 +121,76 @@ fn drop_runs_exactly_once_when_a_vector_is_truncated_and_dropped() {
     assert_eq!(DROPS.load(Ordering::SeqCst), 7);
     drop(values);
     assert_eq!(DROPS.load(Ordering::SeqCst), 12);
+}
+
+#[test]
+fn bulk_vector_extend_preserves_prefixes_on_iterator_and_clone_panics() {
+    static CLONES: AtomicUsize = AtomicUsize::new(0);
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CloneProbe;
+    impl Clone for CloneProbe {
+        fn clone(&self) -> Self {
+            let clone = CLONES.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(clone, 2, "requested clone panic");
+            Self
+        }
+    }
+    impl Drop for CloneProbe {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    unsafe impl CompactValue for CloneProbe {}
+
+    init();
+    let mut values = CompactVec::with_capacity(2).unwrap();
+    values.try_extend([1_u32, 2, 3]).unwrap();
+
+    struct LowHint {
+        next: u32,
+        end: u32,
+    }
+    impl Iterator for LowHint {
+        type Item = u32;
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.next == self.end {
+                None
+            } else {
+                let value = self.next;
+                self.next += 1;
+                Some(value)
+            }
+        }
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (0, None)
+        }
+    }
+    values.try_extend(LowHint { next: 4, end: 13 }).unwrap();
+    assert_eq!(values.as_slice(), (1_u32..13).collect::<Vec<_>>());
+
+    let mut yielded = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        values.try_extend(std::iter::from_fn(|| {
+            yielded += 1;
+            match yielded {
+                1..=3 => Some(100 + yielded),
+                _ => panic!("requested iterator panic"),
+            }
+        }))
+    }));
+    assert!(result.is_err());
+    assert_eq!(&values.as_slice()[12..], &[101, 102, 103]);
+
+    let mut probes = CompactVec::with_capacity(4).unwrap();
+    probes.try_extend((0..4).map(|_| CloneProbe)).unwrap();
+    CLONES.store(0, Ordering::SeqCst);
+    DROPS.store(0, Ordering::SeqCst);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probes.try_clone()));
+    assert!(result.is_err());
+    assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+    drop(probes);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 6);
 }
 
 #[test]
@@ -138,6 +229,34 @@ fn deque_ring_smallvec_and_bits_preserve_order_and_capacity_rules() {
     bits.set(31, true).unwrap();
     bits.truncate(31);
     assert_eq!(bits.len(), 31);
+}
+
+#[test]
+fn deque_iterator_handles_wrapping_and_alternating_ends() {
+    init();
+    let mut deque = CompactVecDeque::with_capacity(5).unwrap();
+    for value in 0..5 {
+        deque.push_back(value).unwrap();
+    }
+    assert_eq!(deque.pop_front(), Some(0));
+    assert_eq!(deque.pop_front(), Some(1));
+    deque.push_back(5).unwrap();
+    deque.push_back(6).unwrap();
+    assert_eq!(deque.iter().copied().collect::<Vec<_>>(), [2, 3, 4, 5, 6]);
+    assert_eq!(
+        deque.iter().rev().copied().collect::<Vec<_>>(),
+        [6, 5, 4, 3, 2]
+    );
+
+    let mut iter = deque.iter();
+    assert_eq!(iter.len(), 5);
+    assert_eq!(iter.next(), Some(&2));
+    assert_eq!(iter.next_back(), Some(&6));
+    assert_eq!(iter.next_back(), Some(&5));
+    assert_eq!(iter.next(), Some(&3));
+    assert_eq!(iter.next(), Some(&4));
+    assert_eq!(iter.next_back(), None);
+    assert_eq!(iter.len(), 0);
 }
 
 #[test]

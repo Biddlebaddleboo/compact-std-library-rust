@@ -50,16 +50,18 @@ impl<T: CompactValue> CompactVec<T> {
 
     /// Ensure room for at least `additional` more elements.
     pub fn reserve(&mut self, additional: usize) -> Result<()> {
-        let required = self
-            .len()
+        let (len, old) = self
+            .storage
+            .as_ref()
+            .map_or((0, 0), CageAllocation::len_capacity);
+        let required = len
             .checked_add(additional)
             .ok_or(CollectionError::CapacityOverflow)?;
         let required =
             u32::try_from(required).map_err(|_| CollectionError::CapacityOverflow)? as usize;
-        if required <= self.capacity() {
+        if required <= old {
             return Ok(());
         }
-        let old = self.capacity();
         let new_capacity = required.max(if old == 0 { 4 } else { old.saturating_mul(2) });
         if let Some(storage) = &mut self.storage {
             if storage.try_resize(new_capacity)? {
@@ -144,20 +146,128 @@ impl<T: CompactValue> CompactVec<T> {
 
     /// Build a compact vector from an iterator.
     pub fn try_from_iter<I: IntoIterator<Item = T>>(iter: I) -> Result<Self> {
-        let iterator = iter.into_iter();
-        let (lower, _) = iterator.size_hint();
-        let mut values = Self::with_capacity(lower)?;
-        values.try_extend(iterator)?;
+        let mut values = Self::new();
+        values.try_extend(iter)?;
         Ok(values)
     }
 
     /// Append values from an iterator.
     pub fn try_extend<I: IntoIterator<Item = T>>(&mut self, iter: I) -> Result<()> {
-        let iterator = iter.into_iter();
+        let mut iterator = iter.into_iter();
         let (lower, _) = iterator.size_hint();
         self.reserve(lower)?;
-        for value in iterator {
-            self.push(value)?;
+
+        // Fill the current allocation in batches. If it is full, pull one
+        // pending value before growing so exact-capacity iterators do not cause
+        // an unnecessary allocation at the end.
+        let mut pending = None;
+        loop {
+            let (len, capacity) = self
+                .storage
+                .as_ref()
+                .map_or((0, 0), CageAllocation::len_capacity);
+            if len == capacity {
+                pending = iterator.next();
+                let Some(_) = pending else {
+                    break;
+                };
+                self.reserve(1)?;
+            }
+
+            let available = self.storage.as_ref().map_or(0, |storage| {
+                let (len, capacity) = storage.len_capacity();
+                capacity - len
+            });
+            let written = {
+                let storage = self.storage.as_mut().expect("reserve allocates storage");
+                if let Some(value) = pending.take() {
+                    let first = Some(value).into_iter();
+                    let mut batch = first.chain(iterator.by_ref());
+                    storage.extend_from_iter(&mut batch, available)?
+                } else {
+                    storage.extend_from_iter(&mut iterator, available)?
+                }
+            };
+            if written < available {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append a copied slice through one reserve and one resolved cage view.
+    pub fn try_extend_copy(&mut self, values: &[T]) -> Result<()>
+    where
+        T: Copy,
+    {
+        if values.is_empty() {
+            return Ok(());
+        }
+        self.reserve(values.len())?;
+        self.storage
+            .as_mut()
+            .expect("reserve allocates storage")
+            .extend_copy(values)?;
+        Ok(())
+    }
+
+    /// Append values from a fallible source in batches. If the source returns
+    /// an error, its error is saved and the successfully appended prefix stays
+    /// initialized and owned by this vector.
+    #[doc(hidden)]
+    pub fn try_extend_fallible<E>(
+        &mut self,
+        lower_bound: usize,
+        mut next: impl FnMut() -> core::result::Result<Option<T>, E>,
+        source_error: &mut Option<E>,
+    ) -> Result<()> {
+        self.reserve(lower_bound)?;
+        let mut pending = None;
+        loop {
+            if source_error.is_some() {
+                break;
+            }
+            let (len, capacity) = self
+                .storage
+                .as_ref()
+                .map_or((0, 0), CageAllocation::len_capacity);
+            if len == capacity {
+                pending = match next() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        *source_error = Some(error);
+                        break;
+                    }
+                };
+                if pending.is_none() {
+                    break;
+                }
+                self.reserve(1)?;
+            }
+
+            let available = self.storage.as_ref().map_or(0, |storage| {
+                let (len, capacity) = storage.len_capacity();
+                capacity - len
+            });
+            let written = {
+                let storage = self.storage.as_mut().expect("reserve allocates storage");
+                if let Some(value) = pending.take() {
+                    let mut first = Some(value);
+                    storage.extend_from_fallible_fn(
+                        available,
+                        || match first.take() {
+                            Some(value) => Ok(Some(value)),
+                            None => next(),
+                        },
+                        source_error,
+                    )?
+                } else {
+                    storage.extend_from_fallible_fn(available, &mut next, source_error)?
+                }
+            };
+            if source_error.is_some() || written < available {
+                break;
+            }
         }
         Ok(())
     }
@@ -167,10 +277,20 @@ impl<T: CompactValue> CompactVec<T> {
     where
         T: Clone,
     {
-        let mut cloned = Self::with_capacity(self.len())?;
-        for value in self.as_slice() {
-            cloned.push(value.clone())?;
-        }
+        let mut cloned = Self::new();
+        let values = self.as_slice();
+        cloned.try_extend(values.iter().cloned())?;
+        Ok(cloned)
+    }
+
+    /// Clone all values when `T` is copyable using a single bulk copy.
+    pub fn try_clone_copy(&self) -> Result<Self>
+    where
+        T: Copy,
+    {
+        let values = self.as_slice();
+        let mut cloned = Self::with_capacity(values.len())?;
+        cloned.try_extend_copy(values)?;
         Ok(cloned)
     }
 }

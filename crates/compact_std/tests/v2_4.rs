@@ -128,17 +128,26 @@ fn frozen_graph_owns_one_immutable_offset_domain() {
     assert_eq!(graph.bytes(&graph.root().bytes).unwrap(), &[0, 255, 1, 128]);
     assert!(graph.used_bytes() >= 8);
 
+    let view = graph.view();
+    assert_eq!(view.str(&graph.root().title).unwrap(), "edge-router");
+    assert_eq!(
+        view.slice(&graph.root().ids).unwrap(),
+        &[4, 8, 15, 16, 23, 42]
+    );
+
     let other = FrozenBuilder::new().unwrap();
     let other_graph = other.finish(0_u32).unwrap();
     assert!(other_graph.str(&title).is_err());
     assert!(other_graph.str(&graph.root().title).is_err());
     let copied = graph.root().title;
     assert!(graph.str(&copied).is_err());
+    assert!(view.str(&copied).is_err());
+    assert!(other_graph.view().str(&graph.root().title).is_err());
 
     std::thread::scope(|scope| {
         for _ in 0..4 {
             let graph = &graph;
-            scope.spawn(move || assert_eq!(graph.str(&graph.root().title).unwrap(), "edge-router"));
+            scope.spawn(move || assert_eq!(view.str(&graph.root().title).unwrap(), "edge-router"));
         }
     });
 }

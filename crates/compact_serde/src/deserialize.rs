@@ -102,10 +102,14 @@ impl<'de> Visitor<'de> for BytesVisitor {
         self.visit_bytes(&value)
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut bytes =
-            CompactBytes::with_capacity(seq.size_hint().unwrap_or(0)).map_err(de::Error::custom)?;
-        while let Some(byte) = seq.next_element::<u8>()? {
-            bytes.push(byte).map_err(de::Error::custom)?;
+        let lower_bound = seq.size_hint().unwrap_or(0);
+        let mut bytes = CompactBytes::new();
+        let mut source_error = None;
+        bytes
+            .try_extend_fallible(lower_bound, || seq.next_element::<u8>(), &mut source_error)
+            .map_err(de::Error::custom)?;
+        if let Some(error) = source_error {
+            return Err(error);
         }
         Ok(bytes)
     }
@@ -186,10 +190,18 @@ impl<'de, T: CompactValue + CompactDeserialize<'de>> Visitor<'de> for VecVisitor
         f.write_str("a sequence")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut values =
-            CompactVec::with_capacity(seq.size_hint().unwrap_or(0)).map_err(de::Error::custom)?;
-        while let Some(value) = seq.next_element_seed(CompactDeserializeSeed::<T>::new())? {
-            values.push(value).map_err(de::Error::custom)?;
+        let lower_bound = seq.size_hint().unwrap_or(0);
+        let mut values = CompactVec::new();
+        let mut source_error = None;
+        values
+            .try_extend_fallible(
+                lower_bound,
+                || seq.next_element_seed(CompactDeserializeSeed::<T>::new()),
+                &mut source_error,
+            )
+            .map_err(de::Error::custom)?;
+        if let Some(error) = source_error {
+            return Err(error);
         }
         Ok(values)
     }

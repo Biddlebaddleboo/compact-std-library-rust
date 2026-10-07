@@ -46,6 +46,12 @@ capacity, and initialized count. Its start is derived from the owner offset and
 prefix. Typed accesses verify the header's capacity fits the reserved block.
 Offset arithmetic is checked before allocation metadata is updated.
 
+Hot owner methods can form a temporary resolved view containing the native
+data pointer and one copied header. The view carries the shared or exclusive
+owner borrow in `PhantomData`, is stack-local, and cannot be stored in a compact
+value. Bulk append guards publish only the successfully written initialized
+prefix if an iterator or element constructor panics.
+
 `CageAllocation<T>` receives automatic `Send`/`Sync` behavior from `T` through
 its `PhantomData<T>`. Moving an owner between threads is safe when `T: Send`;
 shared reads require `T: Sync`. Mutation remains governed by exclusive Rust
@@ -91,6 +97,14 @@ graph, verify that the descriptor itself lies in the graph's owned byte range,
 then validate the target range and typed alignment. This rejects a descriptor
 reference from another graph without retaining graph identity. Returned
 references borrow the graph, whose one cage allocation remains alive.
+
+`FrozenGraphView` resolves the graph byte slice once and applies the same
+descriptor identity, bounds, and alignment checks against that borrowed byte
+range. Its lifetime is tied to the graph; it stores no persistent state in the
+graph or descriptor. Hash control SIMD classifies a copied 16-byte temporary
+group, so architecture-specific loads do not cross cage/table bounds. The
+portable scalar classifier defines the same masks and remains the reference
+implementation.
 
 ## Collections and macros
 

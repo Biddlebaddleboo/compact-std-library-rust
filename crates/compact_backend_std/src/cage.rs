@@ -322,6 +322,73 @@ pub struct CageAllocation<T: CompactValue> {
 #[derive(Clone, Copy)]
 struct NonZeroOffset(core::num::NonZeroU32);
 
+/// Temporary native view whose lifetime is tied to an owner borrow.
+struct ResolvedAllocation<'a, T> {
+    ptr: *mut T,
+    header: AllocationHeader,
+    marker: PhantomData<&'a [T]>,
+}
+
+impl<'a, T> ResolvedAllocation<'a, T> {
+    fn as_slice(&self) -> &'a [T] {
+        // SAFETY: the view was resolved from its live owner and its marker keeps
+        // the owner borrowed for `'a`; the header records the initialized prefix.
+        unsafe { slice::from_raw_parts(self.ptr, self.header.initialized as usize) }
+    }
+}
+
+/// Temporary exclusive native view whose lifetime is tied to an owner borrow.
+struct ResolvedAllocationMut<'a, T> {
+    ptr: *mut T,
+    header_ptr: *mut AllocationHeader,
+    header: AllocationHeader,
+    marker: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> ResolvedAllocationMut<'a, T> {
+    fn into_mut_slice(self) -> &'a mut [T] {
+        // SAFETY: the view holds the unique owner borrow and the header records
+        // exactly the initialized prefix.
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.header.initialized as usize) }
+    }
+
+    fn set_initialized(&mut self, initialized: u32) {
+        debug_assert!(initialized <= self.header.capacity);
+        self.header.initialized = initialized;
+        // SAFETY: this view is exclusively borrowed from the live allocation.
+        unsafe { (*self.header_ptr).initialized = initialized };
+    }
+}
+
+struct AppendInitGuard<'a, T> {
+    ptr: *mut T,
+    header_ptr: *mut AllocationHeader,
+    start: u32,
+    written: u32,
+    marker: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> AppendInitGuard<'a, T> {
+    fn new<'v>(view: &'v mut ResolvedAllocationMut<'_, T>) -> AppendInitGuard<'v, T> {
+        AppendInitGuard {
+            ptr: view.ptr,
+            header_ptr: view.header_ptr,
+            start: view.header.initialized,
+            written: 0,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T> Drop for AppendInitGuard<'_, T> {
+    fn drop(&mut self) {
+        // Publish the initialized prefix even if the iterator or constructor
+        // panicked. Any already-written values will then be dropped normally.
+        // SAFETY: created while holding the owner's exclusive borrow.
+        unsafe { (*self.header_ptr).initialized = self.start + self.written };
+    }
+}
+
 impl<T: CompactValue> CageAllocation<T> {
     fn allocate(capacity: usize) -> Result<Self> {
         let capacity_u32 = u32::try_from(capacity).map_err(|_| Error::OffsetOverflow)?;
@@ -358,6 +425,12 @@ impl<T: CompactValue> CageAllocation<T> {
     pub fn capacity(&self) -> usize {
         self.header().expect("live cage owner header").capacity as usize
     }
+    /// Return initialized length and capacity from one resolved header read.
+    #[doc(hidden)]
+    pub fn len_capacity(&self) -> (usize, usize) {
+        let header = self.header().expect("live cage owner header");
+        (header.initialized as usize, header.capacity as usize)
+    }
     /// Return whether the allocation has no initialized elements.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -369,45 +442,50 @@ impl<T: CompactValue> CageAllocation<T> {
     }
     /// Borrow the initialized prefix.
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: the owner tracks the initialized prefix and remains borrowed.
-        unsafe { slice::from_raw_parts(self.data_ptr(), self.len()) }
+        self.resolved().expect("live cage owner header").as_slice()
     }
     /// Mutably borrow the initialized prefix.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        let len = self.len();
-        // SAFETY: the unique owner is mutably borrowed.
-        unsafe { slice::from_raw_parts_mut(self.data_ptr(), len) }
+        self.resolved_mut()
+            .expect("live cage owner header")
+            .into_mut_slice()
     }
     /// Return an initialized element by index.
     pub fn get(&self, index: usize) -> Option<&T> {
-        self.as_slice().get(index)
+        self.resolved()
+            .expect("live cage owner header")
+            .as_slice()
+            .get(index)
     }
     /// Mutably borrow an initialized element by index.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        self.as_mut_slice().get_mut(index)
+        self.resolved_mut()
+            .expect("live cage owner header")
+            .into_mut_slice()
+            .get_mut(index)
     }
     /// Initialize the next element slot.
     pub fn push(&mut self, value: T) -> Result<()> {
-        let header = self.header()?;
-        if header.initialized >= header.capacity {
+        let mut resolved = self.resolved_mut()?;
+        if resolved.header.initialized >= resolved.header.capacity {
             return Err(Error::OutOfBounds);
         }
-        let index = header.initialized as usize;
+        let index = resolved.header.initialized as usize;
         // SAFETY: this is the next uninitialized slot within the owner.
-        unsafe { self.data_ptr().add(index).write(value) };
-        self.set_initialized(index as u32 + 1)?;
+        unsafe { resolved.ptr.add(index).write(value) };
+        resolved.set_initialized(index as u32 + 1);
         Ok(())
     }
     /// Remove and return the final initialized element.
     pub fn pop(&mut self) -> Option<T> {
-        let len = self.len();
+        let mut resolved = self.resolved_mut().expect("live cage owner header");
+        let len = resolved.header.initialized as usize;
         if len == 0 {
             return None;
         }
-        self.set_initialized((len - 1) as u32)
-            .expect("live cage owner header");
+        resolved.set_initialized((len - 1) as u32);
         // SAFETY: the element was initialized and removed from the drop prefix.
-        Some(unsafe { self.data_ptr().add(len - 1).read() })
+        Some(unsafe { resolved.ptr.add(len - 1).read() })
     }
     /// Drop initialized elements until `new_len` remain.
     pub fn truncate(&mut self, new_len: usize) {
@@ -418,21 +496,18 @@ impl<T: CompactValue> CageAllocation<T> {
         };
         // SAFETY: the guard is created from this exclusive owner borrow.
         let allocation = unsafe { &mut *guard.allocation };
+        let mut resolved = allocation.resolved_mut().expect("live cage owner header");
         if !core::mem::needs_drop::<T>() {
-            let target_len = new_len.min(allocation.len());
-            allocation
-                .set_initialized(target_len as u32)
-                .expect("live cage owner header");
+            let target_len = new_len.min(resolved.header.initialized as usize);
+            resolved.set_initialized(target_len as u32);
             guard.armed = false;
             return;
         }
-        while allocation.len() > new_len {
-            let index = allocation.len() - 1;
-            allocation
-                .set_initialized(index as u32)
-                .expect("live cage owner header");
+        while resolved.header.initialized as usize > new_len {
+            let index = resolved.header.initialized as usize - 1;
+            resolved.set_initialized(index as u32);
             // SAFETY: length was lowered first, so unwinding cannot double-drop this element.
-            unsafe { allocation.data_ptr().add(index).drop_in_place() };
+            unsafe { resolved.ptr.add(index).drop_in_place() };
         }
         guard.armed = false;
     }
@@ -441,43 +516,131 @@ impl<T: CompactValue> CageAllocation<T> {
     where
         T: Copy,
     {
-        let start = self.len();
+        let mut resolved = self.resolved_mut()?;
+        let start = resolved.header.initialized as usize;
         let end = start
             .checked_add(values.len())
             .ok_or(Error::OffsetOverflow)?;
-        if end > self.capacity() {
+        if end > resolved.header.capacity as usize {
             return Err(Error::OutOfBounds);
         }
         if !values.is_empty() {
             // SAFETY: destination is uninitialized and the source is valid.
             unsafe {
-                self.data_ptr()
+                resolved
+                    .ptr
                     .add(start)
                     .copy_from_nonoverlapping(values.as_ptr(), values.len())
             };
         }
-        self.set_initialized(end as u32)
+        resolved.set_initialized(end as u32);
+        Ok(())
+    }
+
+    /// Append values from an iterator into available capacity, resolving the
+    /// allocation once. A panic publishes the exact initialized prefix.
+    #[doc(hidden)]
+    pub fn extend_from_iter(
+        &mut self,
+        iterator: &mut impl Iterator<Item = T>,
+        max: usize,
+    ) -> Result<usize> {
+        let mut resolved = self.resolved_mut()?;
+        let start = resolved.header.initialized as usize;
+        let available = resolved.header.capacity as usize - start;
+        if max > available {
+            return Err(Error::OutOfBounds);
+        }
+        let mut guard = AppendInitGuard::new(&mut resolved);
+        while (guard.written as usize) < max {
+            let Some(value) = iterator.next() else {
+                break;
+            };
+            // SAFETY: max was checked against available capacity and each slot
+            // is written once before the guard publishes it as initialized.
+            unsafe { guard.ptr.add(start + guard.written as usize).write(value) };
+            guard.written += 1;
+        }
+        Ok(guard.written as usize)
+    }
+
+    /// Append values from a fallible producer into available capacity. Source
+    /// errors are saved for the caller after the successfully produced prefix
+    /// has been published.
+    #[doc(hidden)]
+    pub fn extend_from_fallible_fn<E>(
+        &mut self,
+        max: usize,
+        mut next: impl FnMut() -> core::result::Result<Option<T>, E>,
+        source_error: &mut Option<E>,
+    ) -> Result<usize> {
+        let mut resolved = self.resolved_mut()?;
+        let start = resolved.header.initialized as usize;
+        let available = resolved.header.capacity as usize - start;
+        if max > available {
+            return Err(Error::OutOfBounds);
+        }
+        let mut guard = AppendInitGuard::new(&mut resolved);
+        while (guard.written as usize) < max {
+            let value = match next() {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(error) => {
+                    *source_error = Some(error);
+                    break;
+                }
+            };
+            // SAFETY: max was checked against available capacity and each value
+            // is written before the guard publishes it as initialized.
+            unsafe { guard.ptr.add(start + guard.written as usize).write(value) };
+            guard.written += 1;
+        }
+        Ok(guard.written as usize)
+    }
+
+    /// Construct and append `count` values, publishing an initialized prefix
+    /// safely if the constructor panics.
+    #[doc(hidden)]
+    pub fn extend_from_fn(
+        &mut self,
+        count: usize,
+        mut make_value: impl FnMut() -> T,
+    ) -> Result<()> {
+        let mut resolved = self.resolved_mut()?;
+        let start = resolved.header.initialized as usize;
+        let available = resolved.header.capacity as usize - start;
+        if count > available {
+            return Err(Error::OutOfBounds);
+        }
+        let mut guard = AppendInitGuard::new(&mut resolved);
+        while (guard.written as usize) < count {
+            let value = make_value();
+            // SAFETY: count was checked against available capacity and each
+            // produced value is written before the guard publishes it.
+            unsafe { guard.ptr.add(start + guard.written as usize).write(value) };
+            guard.written += 1;
+        }
+        Ok(())
     }
     /// Move the initialized prefix into an empty owner of the same type.
     pub fn move_into(&mut self, destination: &mut Self) -> Result<()> {
-        if !destination.is_empty() {
+        let mut source = self.resolved_mut()?;
+        let mut destination = destination.resolved_mut()?;
+        if destination.header.initialized != 0 {
             return Err(Error::InitializationError);
         }
-        let len = self.len();
-        if len > destination.capacity() {
+        let len = source.header.initialized as usize;
+        if len > destination.header.capacity as usize {
             return Err(Error::OutOfBounds);
         }
-        self.set_initialized(0)?;
-        for index in 0..len {
-            // SAFETY: source is read once and destination is uninitialized.
-            unsafe {
-                destination
-                    .data_ptr()
-                    .add(index)
-                    .write(self.data_ptr().add(index).read())
-            };
+        if len != 0 {
+            // SAFETY: the owners are distinct, the source prefix is initialized,
+            // and the destination range is uninitialized and large enough.
+            unsafe { destination.ptr.copy_from_nonoverlapping(source.ptr, len) };
         }
-        destination.set_initialized(len as u32)
+        source.set_initialized(0);
+        destination.set_initialized(len as u32);
+        Ok(())
     }
     /// Move initialized values from an inline uninitialized slice.
     ///
@@ -491,22 +654,28 @@ impl<T: CompactValue> CageAllocation<T> {
         source: *mut MaybeUninit<T>,
         len: usize,
     ) -> Result<()> {
-        let start = self.len();
+        let mut resolved = self.resolved_mut()?;
+        let start = resolved.header.initialized as usize;
         let end = start.checked_add(len).ok_or(Error::OffsetOverflow)?;
-        if end > self.capacity() {
+        if end > resolved.header.capacity as usize {
             return Err(Error::OutOfBounds);
         }
         for index in 0..len {
             // SAFETY: guaranteed by the caller; the destination is in capacity.
             let value = unsafe { source.add(index).cast::<T>().read() };
-            unsafe { self.data_ptr().add(start + index).write(value) };
+            unsafe { resolved.ptr.add(start + index).write(value) };
         }
-        self.set_initialized(end as u32)
+        resolved.set_initialized(end as u32);
+        Ok(())
     }
     /// Try to change capacity without relocating the allocation.
     pub fn try_resize(&mut self, capacity: usize) -> Result<bool> {
         let requested = u32::try_from(capacity).map_err(|_| Error::OffsetOverflow)?;
-        let header = self.header()?;
+        let state = state()?;
+        let offset = self.raw_offset();
+        // SAFETY: this non-copy owner represents a live allocator-issued offset.
+        let header = unsafe { read_header(state, offset) }?;
+        validate_typed_header::<T>(state, offset, header)?;
         if requested < header.initialized {
             return Err(Error::InitializationError);
         }
@@ -514,7 +683,6 @@ impl<T: CompactValue> CageAllocation<T> {
             .checked_mul(capacity)
             .ok_or(Error::OffsetOverflow)?
             .max(1);
-        let state = state()?;
         let mut allocator = lock(state)?;
         let start = self
             .raw_offset()
@@ -538,7 +706,8 @@ impl<T: CompactValue> CageAllocation<T> {
             let mut changed = header;
             changed.block_len = new_len;
             changed.capacity = requested;
-            self.write_header(changed);
+            // SAFETY: this owner uniquely represents the live allocation.
+            unsafe { header_ptr(state, offset).write(changed) };
             return Ok(true);
         }
         let end = start.checked_add(old_len).ok_or(Error::OffsetOverflow)?;
@@ -568,32 +737,32 @@ impl<T: CompactValue> CageAllocation<T> {
         let mut changed = header;
         changed.block_len = new_len;
         changed.capacity = requested;
-        self.write_header(changed);
+        // SAFETY: this owner uniquely represents the live allocation.
+        unsafe { header_ptr(state, offset).write(changed) };
         Ok(true)
     }
     /// Borrow the full capacity as potentially uninitialized slots.
     pub fn uninit_capacity(&self) -> &[MaybeUninit<T>] {
-        // SAFETY: MaybeUninit permits reading every slot state.
-        unsafe { slice::from_raw_parts(self.data_ptr().cast::<MaybeUninit<T>>(), self.capacity()) }
+        let resolved = self.resolved().expect("live cage owner header");
+        // SAFETY: MaybeUninit permits reading every slot state; the owner borrow
+        // keeps the allocation live for the returned slice.
+        unsafe {
+            slice::from_raw_parts(
+                resolved.ptr.cast::<MaybeUninit<T>>(),
+                resolved.header.capacity as usize,
+            )
+        }
     }
     /// Mutably borrow the full capacity as potentially uninitialized slots.
     pub fn uninit_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+        let resolved = self.resolved_mut().expect("live cage owner header");
+        let ptr = resolved.ptr;
+        let capacity = resolved.header.capacity as usize;
         // SAFETY: the unique owner is mutably borrowed and every capacity slot is writable.
-        unsafe {
-            slice::from_raw_parts_mut(self.data_ptr().cast::<MaybeUninit<T>>(), self.capacity())
-        }
+        unsafe { slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<T>>(), capacity) }
     }
     fn raw_offset(&self) -> u32 {
         self.offset.0.get()
-    }
-    fn data_ptr(&self) -> *mut T {
-        // SAFETY: offset comes only from this allocator and the process cage is never moved.
-        unsafe {
-            ptr_from_offset(
-                state().expect("initialized compact runtime"),
-                self.raw_offset(),
-            )
-        }
     }
     fn header(&self) -> Result<AllocationHeader> {
         // SAFETY: this non-copy owner represents an allocator-issued offset.
@@ -602,43 +771,48 @@ impl<T: CompactValue> CageAllocation<T> {
         validate_typed_header::<T>(state, self.raw_offset(), header)?;
         Ok(header)
     }
-    fn write_header(&self, header: AllocationHeader) {
-        // SAFETY: this owner represents the live allocation whose header is updated.
-        unsafe {
-            header_ptr(
-                state().expect("initialized compact runtime"),
-                self.raw_offset(),
-            )
-            .write(header)
-        }
+    fn resolved(&self) -> Result<ResolvedAllocation<'_, T>> {
+        let state = state()?;
+        let offset = self.raw_offset();
+        // SAFETY: this owner represents an allocator-issued live allocation.
+        let header = unsafe { read_header(state, offset) }?;
+        validate_typed_header::<T>(state, offset, header)?;
+        // SAFETY: the validated owner offset points to its aligned payload.
+        let ptr = unsafe { ptr_from_offset::<T>(state, offset) };
+        Ok(ResolvedAllocation {
+            ptr,
+            header,
+            marker: PhantomData,
+        })
     }
-    fn set_initialized(&mut self, initialized: u32) -> Result<()> {
-        let mut header = self.header()?;
-        if initialized > header.capacity {
-            return Err(Error::InitializationError);
-        }
-        header.initialized = initialized;
-        self.write_header(header);
-        Ok(())
+    fn resolved_mut(&mut self) -> Result<ResolvedAllocationMut<'_, T>> {
+        let state = state()?;
+        let offset = self.raw_offset();
+        // SAFETY: this exclusive owner represents an allocator-issued live allocation.
+        let header = unsafe { read_header(state, offset) }?;
+        validate_typed_header::<T>(state, offset, header)?;
+        // SAFETY: the validated owner offset points to its aligned payload/header.
+        let ptr = unsafe { ptr_from_offset::<T>(state, offset) };
+        let header_ptr = unsafe { header_ptr(state, offset) };
+        Ok(ResolvedAllocationMut {
+            ptr,
+            header_ptr,
+            header,
+            marker: PhantomData,
+        })
     }
 }
 
 impl CageAllocation<u64> {
     /// Borrow the initialized words as their exact byte representation.
     pub fn as_byte_slice(&self) -> &[u8] {
-        let len = self
-            .len()
+        let resolved = self.resolved().expect("live cage owner header");
+        let len = (resolved.header.initialized as usize)
             .checked_mul(size_of::<u64>())
             .expect("cage byte length fits its allocation");
         // SAFETY: every initialized `u64` has all bytes initialized, and the
         // returned slice is tied to this immutable owner borrow.
-        unsafe {
-            slice_from_offset(
-                state().expect("initialized compact runtime"),
-                self.raw_offset(),
-                len,
-            )
-        }
+        unsafe { slice::from_raw_parts(resolved.ptr.cast::<u8>(), len) }
     }
 }
 

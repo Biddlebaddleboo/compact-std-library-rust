@@ -275,6 +275,14 @@ pub struct FrozenGraph<T: FrozenValue> {
     root_offset: u32,
     marker: PhantomData<T>,
 }
+
+/// Borrowed graph view for repeated traversal without resolving cage storage
+/// again for every descriptor.
+#[derive(Clone, Copy)]
+pub struct FrozenGraphView<'g> {
+    bytes: &'g [u8],
+}
+
 impl<T: FrozenValue> FrozenGraph<T> {
     /// Borrow the immutable root value.
     pub fn root(&self) -> &T {
@@ -284,6 +292,14 @@ impl<T: FrozenValue> FrozenGraph<T> {
     /// Return bytes owned by the graph, including alignment padding.
     pub const fn used_bytes(&self) -> usize {
         self.used_bytes as usize
+    }
+    /// Resolve a borrowed view for repeated descriptor reads.
+    pub fn view(&self) -> FrozenGraphView<'_> {
+        let bytes = self.storage.as_byte_slice();
+        let bytes = bytes
+            .get(..self.used_bytes as usize)
+            .expect("builder produced a complete graph byte range");
+        FrozenGraphView { bytes }
     }
     /// Read a typed frozen slice descriptor.
     pub fn slice<U: FrozenValue>(&self, values: &FrozenVec<U>) -> FrozenResult<&[U]> {
@@ -384,6 +400,106 @@ impl<T: FrozenValue> FrozenGraph<T> {
     fn byte_ptr(&self, offset: u32) -> FrozenResult<&[u8]> {
         self.storage
             .as_byte_slice()
+            .get(offset as usize..)
+            .ok_or(FrozenError::InvalidHandle)
+    }
+}
+
+impl<'g> FrozenGraphView<'g> {
+    /// Read a typed frozen slice descriptor from this graph.
+    pub fn slice<U: FrozenValue>(&self, values: &FrozenVec<U>) -> FrozenResult<&'g [U]> {
+        self.check_descriptor(values)?;
+        let bytes = (values.len as usize)
+            .checked_mul(size_of::<U>())
+            .ok_or(FrozenError::InvalidHandle)?;
+        self.check_range(values.offset, bytes)?;
+        if values.len == 0 {
+            return Ok(&[]);
+        }
+        if values.offset as usize % align_of::<U>() != 0 {
+            return Err(FrozenError::InvalidHandle);
+        }
+        let ptr = self.byte_ptr(values.offset)?.as_ptr().cast::<U>();
+        // SAFETY: descriptor identity, target bounds, and alignment are checked;
+        // the graph view's borrow keeps the owning bytes alive.
+        Ok(unsafe { slice::from_raw_parts(ptr, values.len as usize) })
+    }
+
+    /// Read a frozen UTF-8 string descriptor from this graph.
+    pub fn str(&self, value: &FrozenString) -> FrozenResult<&'g str> {
+        self.check_descriptor(value)?;
+        self.check_range(value.offset, value.len as usize)?;
+        str::from_utf8(
+            self.byte_ptr(value.offset)?
+                .get(..value.len as usize)
+                .ok_or(FrozenError::InvalidHandle)?,
+        )
+        .map_err(|_| FrozenError::InvalidUtf8)
+    }
+
+    /// Read a frozen byte descriptor from this graph.
+    pub fn bytes(&self, value: &FrozenBytes) -> FrozenResult<&'g [u8]> {
+        self.check_descriptor(value)?;
+        self.check_range(value.offset, value.len as usize)?;
+        self.byte_ptr(value.offset)?
+            .get(..value.len as usize)
+            .ok_or(FrozenError::InvalidHandle)
+    }
+
+    /// Read a frozen OS string as its target-local bytes.
+    pub fn os_string_bytes(&self, value: &FrozenOsString) -> FrozenResult<&'g [u8]> {
+        self.check_descriptor(value)?;
+        self.bytes(&value.0)
+    }
+
+    /// Read a frozen path as its target-local bytes.
+    pub fn path_bytes(&self, value: &FrozenPathBuf) -> FrozenResult<&'g [u8]> {
+        self.check_descriptor(value)?;
+        self.bytes(&value.0)
+    }
+
+    /// Read key-value entries from a frozen map descriptor.
+    pub fn map_entries<K: FrozenValue, V: FrozenValue>(
+        &self,
+        value: &FrozenMap<K, V>,
+    ) -> FrozenResult<&'g [(K, V)]> {
+        self.check_descriptor(value)?;
+        self.slice(&value.0)
+    }
+
+    /// Read entries from a frozen set descriptor.
+    pub fn set_entries<U: FrozenValue>(&self, value: &FrozenSet<U>) -> FrozenResult<&'g [U]> {
+        self.check_descriptor(value)?;
+        self.slice(&value.0)
+    }
+
+    fn check_descriptor<U>(&self, descriptor: &U) -> FrozenResult<()> {
+        let base = self.bytes.as_ptr() as usize;
+        let end = base
+            .checked_add(self.bytes.len())
+            .ok_or(FrozenError::InvalidHandle)?;
+        let descriptor_start = descriptor as *const U as usize;
+        let descriptor_end = descriptor_start
+            .checked_add(size_of::<U>())
+            .ok_or(FrozenError::InvalidHandle)?;
+        if descriptor_start < base || descriptor_end > end {
+            return Err(FrozenError::InvalidHandle);
+        }
+        Ok(())
+    }
+
+    fn check_range(&self, offset: u32, bytes: usize) -> FrozenResult<()> {
+        let end = (offset as usize)
+            .checked_add(bytes)
+            .ok_or(FrozenError::InvalidHandle)?;
+        if offset == 0 || end > self.bytes.len() {
+            return Err(FrozenError::InvalidHandle);
+        }
+        Ok(())
+    }
+
+    fn byte_ptr(&self, offset: u32) -> FrozenResult<&'g [u8]> {
+        self.bytes
             .get(offset as usize..)
             .ok_or(FrozenError::InvalidHandle)
     }

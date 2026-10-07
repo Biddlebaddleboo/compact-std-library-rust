@@ -50,43 +50,15 @@ impl<T: CompactValue> CompactVecDeque<T> {
         self.len == 0
     }
 
-    fn physical(&self, logical: usize) -> usize {
-        ((self.head as u64 + logical as u64) % self.capacity() as u64) as usize
-    }
-    fn value_at(&self, physical: usize) -> &T {
-        let slot = &self
-            .storage
-            .as_ref()
-            .expect("nonempty deque has storage")
-            .uninit_capacity()[physical];
-        // SAFETY: every logical deque slot contains an initialized nested value.
-        unsafe { slot.assume_init_ref().assume_init_ref() }
-    }
-    fn value_at_mut(&mut self, physical: usize) -> &mut T {
-        let slot = &mut self
-            .storage
-            .as_mut()
-            .expect("nonempty deque has storage")
-            .uninit_capacity_mut()[physical];
-        // SAFETY: every logical deque slot contains one uniquely borrowed value.
-        unsafe { slot.assume_init_mut().assume_init_mut() }
-    }
-    fn write_at(&mut self, physical: usize, value: T) {
-        let slot = &mut self
-            .storage
-            .as_mut()
-            .expect("deque storage exists")
-            .uninit_capacity_mut()[physical];
-        slot.write(MaybeUninit::new(value));
-    }
-    fn take_at(&mut self, physical: usize) -> T {
-        let slot = &mut self
-            .storage
-            .as_mut()
-            .expect("deque storage exists")
-            .uninit_capacity_mut()[physical];
-        // SAFETY: slot was initialized once and is removed from the logical range before return.
-        unsafe { slot.assume_init_read().assume_init_read() }
+    fn physical_index(head: usize, logical: usize, capacity: usize) -> usize {
+        debug_assert!(capacity > 0);
+        debug_assert!(head < capacity);
+        let until_wrap = capacity - head;
+        if logical >= until_wrap {
+            logical - until_wrap
+        } else {
+            head + logical
+        }
     }
 
     /// Return the front value.
@@ -94,7 +66,17 @@ impl<T: CompactValue> CompactVecDeque<T> {
         if self.len == 0 {
             None
         } else {
-            Some(self.value_at(self.head as usize))
+            let slots = self
+                .storage
+                .as_ref()
+                .expect("nonempty deque has storage")
+                .uninit_capacity();
+            // SAFETY: every logical deque slot contains an initialized nested value.
+            Some(unsafe {
+                slots[self.head as usize]
+                    .assume_init_ref()
+                    .assume_init_ref()
+            })
         }
     }
     /// Mutably borrow the front value.
@@ -102,7 +84,17 @@ impl<T: CompactValue> CompactVecDeque<T> {
         if self.len == 0 {
             None
         } else {
-            Some(self.value_at_mut(self.head as usize))
+            let slots = self
+                .storage
+                .as_mut()
+                .expect("nonempty deque has storage")
+                .uninit_capacity_mut();
+            // SAFETY: every logical deque slot contains one uniquely borrowed value.
+            Some(unsafe {
+                slots[self.head as usize]
+                    .assume_init_mut()
+                    .assume_init_mut()
+            })
         }
     }
     /// Return the back value.
@@ -110,7 +102,14 @@ impl<T: CompactValue> CompactVecDeque<T> {
         if self.len == 0 {
             None
         } else {
-            Some(self.value_at(self.physical(self.len() - 1)))
+            let slots = self
+                .storage
+                .as_ref()
+                .expect("nonempty deque has storage")
+                .uninit_capacity();
+            let physical = Self::physical_index(self.head as usize, self.len() - 1, slots.len());
+            // SAFETY: every logical deque slot contains an initialized nested value.
+            Some(unsafe { slots[physical].assume_init_ref().assume_init_ref() })
         }
     }
     /// Mutably borrow the back value.
@@ -118,8 +117,16 @@ impl<T: CompactValue> CompactVecDeque<T> {
         if self.len == 0 {
             None
         } else {
-            let at = self.physical(self.len() - 1);
-            Some(self.value_at_mut(at))
+            let head = self.head as usize;
+            let logical = self.len() - 1;
+            let slots = self
+                .storage
+                .as_mut()
+                .expect("nonempty deque has storage")
+                .uninit_capacity_mut();
+            let at = Self::physical_index(head, logical, slots.len());
+            // SAFETY: every logical deque slot contains one uniquely borrowed value.
+            Some(unsafe { slots[at].assume_init_mut().assume_init_mut() })
         }
     }
     /// Return a logical element by index.
@@ -127,7 +134,14 @@ impl<T: CompactValue> CompactVecDeque<T> {
         if index >= self.len() {
             None
         } else {
-            Some(self.value_at(self.physical(index)))
+            let slots = self
+                .storage
+                .as_ref()
+                .expect("nonempty deque has storage")
+                .uninit_capacity();
+            let physical = Self::physical_index(self.head as usize, index, slots.len());
+            // SAFETY: every logical deque slot contains an initialized nested value.
+            Some(unsafe { slots[physical].assume_init_ref().assume_init_ref() })
         }
     }
     /// Mutably borrow a logical element by index.
@@ -135,27 +149,49 @@ impl<T: CompactValue> CompactVecDeque<T> {
         if index >= self.len() {
             None
         } else {
-            let at = self.physical(index);
-            Some(self.value_at_mut(at))
+            let head = self.head as usize;
+            let slots = self
+                .storage
+                .as_mut()
+                .expect("nonempty deque has storage")
+                .uninit_capacity_mut();
+            let at = Self::physical_index(head, index, slots.len());
+            // SAFETY: the deque is exclusively borrowed and this logical slot is unique.
+            Some(unsafe { slots[at].assume_init_mut().assume_init_mut() })
         }
     }
     /// Append a value at the back.
     pub fn push_back(&mut self, value: T) -> Result<()> {
         self.reserve(1)?;
-        let at = self.physical(self.len());
-        self.write_at(at, value);
+        let head = self.head as usize;
+        let logical = self.len();
+        let slots = self
+            .storage
+            .as_mut()
+            .expect("reserve allocates storage")
+            .uninit_capacity_mut();
+        let at = Self::physical_index(head, logical, slots.len());
+        slots[at].write(MaybeUninit::new(value));
         self.len += 1;
         Ok(())
     }
     /// Append a value at the front.
     pub fn push_front(&mut self, value: T) -> Result<()> {
         self.reserve(1)?;
+        let slots = self
+            .storage
+            .as_mut()
+            .expect("reserve allocates storage")
+            .uninit_capacity_mut();
+        let capacity = slots.len();
         self.head = if self.len == 0 {
             0
+        } else if self.head == 0 {
+            (capacity - 1) as u32
         } else {
-            ((self.head as u64 + self.capacity() as u64 - 1) % self.capacity() as u64) as u32
+            self.head - 1
         };
-        self.write_at(self.head as usize, value);
+        slots[self.head as usize].write(MaybeUninit::new(value));
         self.len += 1;
         Ok(())
     }
@@ -165,53 +201,105 @@ impl<T: CompactValue> CompactVecDeque<T> {
             return None;
         }
         let at = self.head as usize;
-        self.head = if self.len == 1 {
+        let (value, capacity) = {
+            let slots = self
+                .storage
+                .as_mut()
+                .expect("nonempty deque has storage")
+                .uninit_capacity_mut();
+            let capacity = slots.len();
+            // SAFETY: the front slot is initialized and removed exactly once.
+            (
+                unsafe { slots[at].assume_init_read().assume_init_read() },
+                capacity,
+            )
+        };
+        self.head = if self.len == 1 || at + 1 == capacity {
             0
         } else {
-            ((self.head as u64 + 1) % self.capacity() as u64) as u32
+            self.head + 1
         };
         self.len -= 1;
-        Some(self.take_at(at))
+        Some(value)
     }
     /// Remove and return the back value.
     pub fn pop_back(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
         }
-        let at = self.physical(self.len() - 1);
+        let head = self.head as usize;
+        let logical = self.len() - 1;
+        let value = {
+            let slots = self
+                .storage
+                .as_mut()
+                .expect("nonempty deque has storage")
+                .uninit_capacity_mut();
+            let at = Self::physical_index(head, logical, slots.len());
+            // SAFETY: the back slot is initialized and removed exactly once.
+            unsafe { slots[at].assume_init_read().assume_init_read() }
+        };
         self.len -= 1;
         if self.len == 0 {
             self.head = 0;
         }
-        Some(self.take_at(at))
+        Some(value)
     }
     /// Return an iterator over logical order.
     pub fn iter(&self) -> CompactVecDequeIter<'_, T> {
+        let slots = self
+            .storage
+            .as_ref()
+            .map_or(&[][..], CageAllocation::uninit_capacity);
+        let capacity = slots.len();
+        let head = self.head as usize;
+        let len = self.len();
+        let back_index = if len == 0 {
+            head
+        } else {
+            Self::physical_index(head, len - 1, capacity)
+        };
         CompactVecDequeIter {
-            deque: self,
-            front: 0,
-            back: self.len(),
+            slots,
+            capacity,
+            front_index: head,
+            back_index,
+            remaining: len,
         }
     }
     /// Ensure room for at least `additional` values.
     pub fn reserve(&mut self, additional: usize) -> Result<()> {
-        let required = self
-            .len()
+        let required = (self.len as usize)
             .checked_add(additional)
             .ok_or(CollectionError::CapacityOverflow)?;
         let required =
             u32::try_from(required).map_err(|_| CollectionError::CapacityOverflow)? as usize;
-        if required <= self.capacity() {
+        let old_capacity = self
+            .storage
+            .as_ref()
+            .map_or(0, |storage| storage.capacity());
+        if required <= old_capacity {
             return Ok(());
         }
-        let cap = required.max(self.capacity().saturating_mul(2).max(4));
+        let cap = required.max(old_capacity.saturating_mul(2).max(4));
         let mut replacement = CompactRuntime::alloc_owned_slice::<MaybeUninit<T>>(cap)?;
         let slots = replacement.uninit_capacity_mut();
         // Allocate first. Moving values below cannot fail.
         let old_len = self.len();
-        for (index, slot) in slots.iter_mut().take(old_len).enumerate() {
-            let value = self.take_at(self.physical(index));
-            slot.write(MaybeUninit::new(value));
+        if old_len != 0 {
+            let head = self.head as usize;
+            let old_slots = self
+                .storage
+                .as_mut()
+                .expect("nonempty deque has storage")
+                .uninit_capacity_mut();
+            let old_capacity = old_slots.len();
+            for (index, slot) in slots.iter_mut().take(old_len).enumerate() {
+                let physical = Self::physical_index(head, index, old_capacity);
+                // SAFETY: these logical slots are initialized and each is moved once.
+                let value = unsafe { old_slots[physical].assume_init_read().assume_init_read() };
+                slot.write(MaybeUninit::new(value));
+            }
         }
         self.len = 0;
         self.storage = Some(replacement);
@@ -234,22 +322,34 @@ impl<T: CompactValue> CompactVecDeque<T> {
         if self.len == 0 {
             return Ok(&mut []);
         }
-        if self.head as usize + self.len() <= self.capacity() {
-            let start = self.head as usize;
-            let end = start + self.len();
-            let slots = self.storage.as_mut().unwrap().uninit_capacity_mut();
+        let start = self.head as usize;
+        let len = self.len();
+        let slots = self
+            .storage
+            .as_mut()
+            .expect("nonempty deque has storage")
+            .uninit_capacity_mut();
+        if start + len <= slots.len() {
+            let end = start + len;
             let ptr = slots[start..end]
                 .as_mut_ptr()
                 .cast::<MaybeUninit<T>>()
                 .cast::<T>();
             // SAFETY: this is the initialized logical range in storage.
-            return Ok(unsafe { slice::from_raw_parts_mut(ptr, self.len()) });
+            return Ok(unsafe { slice::from_raw_parts_mut(ptr, len) });
         }
-        let mut replacement = CompactRuntime::alloc_owned_slice::<MaybeUninit<T>>(self.len())?;
-        let len = self.len();
+        let mut replacement = CompactRuntime::alloc_owned_slice::<MaybeUninit<T>>(len)?;
         let slots = replacement.uninit_capacity_mut();
+        let old_slots = self
+            .storage
+            .as_mut()
+            .expect("nonempty deque has storage")
+            .uninit_capacity_mut();
+        let old_capacity = old_slots.len();
         for (index, slot) in slots.iter_mut().take(len).enumerate() {
-            let value = self.take_at(self.physical(index));
+            let physical = Self::physical_index(start, index, old_capacity);
+            // SAFETY: these logical slots are initialized and each is moved once.
+            let value = unsafe { old_slots[physical].assume_init_read().assume_init_read() };
             slot.write(MaybeUninit::new(value));
         }
         self.storage = Some(replacement);
@@ -298,32 +398,52 @@ unsafe impl<T: CompactValue> CompactValue for CompactVecDeque<T> {}
 
 /// Double-ended iterator over a compact deque.
 pub struct CompactVecDequeIter<'a, T: CompactValue> {
-    deque: &'a CompactVecDeque<T>,
-    front: usize,
-    back: usize,
+    slots: &'a [MaybeUninit<MaybeUninit<T>>],
+    capacity: usize,
+    front_index: usize,
+    back_index: usize,
+    remaining: usize,
 }
 impl<'a, T: CompactValue> Iterator for CompactVecDequeIter<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
+        if self.remaining == 0 {
             return None;
         }
-        let index = self.front;
-        self.front += 1;
-        self.deque.get(index)
+        let index = self.front_index;
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            self.front_index = if index + 1 == self.capacity {
+                0
+            } else {
+                index + 1
+            };
+        }
+        // SAFETY: the iterator borrows the deque, and every remaining logical
+        // slot contains an initialized value. Each front position is visited once.
+        Some(unsafe { self.slots[index].assume_init_ref().assume_init_ref() })
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.back - self.front;
-        (n, Some(n))
+        (self.remaining, Some(self.remaining))
     }
 }
 impl<T: CompactValue> DoubleEndedIterator for CompactVecDequeIter<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
+        if self.remaining == 0 {
             return None;
         }
-        self.back -= 1;
-        self.deque.get(self.back)
+        let index = self.back_index;
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            self.back_index = if index == 0 {
+                self.capacity - 1
+            } else {
+                index - 1
+            };
+        }
+        // SAFETY: the iterator borrows the deque, and every remaining logical
+        // slot contains an initialized value. Each back position is visited once.
+        Some(unsafe { self.slots[index].assume_init_ref().assume_init_ref() })
     }
 }
 impl<T: CompactValue> ExactSizeIterator for CompactVecDequeIter<'_, T> {}

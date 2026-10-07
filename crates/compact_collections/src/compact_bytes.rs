@@ -131,6 +131,82 @@ impl CompactBytes {
         }
         Ok(())
     }
+
+    /// Append bytes from a fallible source while preserving a successfully
+    /// written prefix if the source reports an error.
+    #[doc(hidden)]
+    pub fn try_extend_fallible<E>(
+        &mut self,
+        lower_bound: usize,
+        mut next: impl FnMut() -> core::result::Result<Option<u8>, E>,
+        source_error: &mut Option<E>,
+    ) -> Result<()> {
+        self.reserve(lower_bound)?;
+        let mut pending = None;
+        loop {
+            if source_error.is_some() {
+                break;
+            }
+            if self.len() == self.capacity() {
+                pending = match next() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        *source_error = Some(error);
+                        break;
+                    }
+                };
+                if pending.is_none() {
+                    break;
+                }
+                self.reserve(1)?;
+            }
+
+            let available = self.capacity() - self.len();
+            let written = match &mut self.repr {
+                BytesRepr::Inline { len, bytes } => {
+                    let start = *len as usize;
+                    let mut written = 0;
+                    while written < available {
+                        let value = if let Some(value) = pending.take() {
+                            value
+                        } else {
+                            match next() {
+                                Ok(Some(value)) => value,
+                                Ok(None) => break,
+                                Err(error) => {
+                                    *source_error = Some(error);
+                                    break;
+                                }
+                            }
+                        };
+                        bytes[start + written] = value;
+                        written += 1;
+                        *len = (start + written) as u8;
+                    }
+                    written
+                }
+                BytesRepr::Heap(allocation) => {
+                    if let Some(value) = pending.take() {
+                        let mut first = Some(value);
+                        allocation.extend_from_fallible_fn(
+                            available,
+                            || match first.take() {
+                                Some(value) => Ok(Some(value)),
+                                None => next(),
+                            },
+                            source_error,
+                        )?
+                    } else {
+                        allocation.extend_from_fallible_fn(available, &mut next, source_error)?
+                    }
+                }
+            };
+            if source_error.is_some() || written < available {
+                break;
+            }
+        }
+        Ok(())
+    }
     /// Drop bytes after `new_len`.
     pub fn truncate(&mut self, new_len: usize) {
         if let BytesRepr::Inline { len, .. } = &mut self.repr {
