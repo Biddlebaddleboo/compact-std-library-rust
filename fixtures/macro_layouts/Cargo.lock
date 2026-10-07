@@ -4,25 +4,25 @@ version = 4
 
 [[package]]
 name = "compact_backend_std"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "compact_core",
 ]
 
 [[package]]
 name = "compact_collections"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "compact_core",
 ]
 
 [[package]]
 name = "compact_core"
-version = "0.1.0"
+version = "2.1.0"
 
 [[package]]
 name = "compact_macros"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "compact_std"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "compact_backend_std",
  "compact_collections",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "macro_layouts_fixture"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "compact_std",
 ]
