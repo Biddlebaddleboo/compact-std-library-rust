@@ -181,3 +181,9 @@ pointer to yield disjoint mutable values; it advances monotonically, yields
 each occupied slot once, and keeps an exclusive borrow marker for the map's
 full lifetime. Rehash planning may call user hashing code, so all destination
 slots are computed before any old entry moves.
+
+The OS string and path wrappers keep their platform units in private compact
+storage. Unix values are reconstructed with `OsStringExt::from_vec`; Windows
+wide units are reconstructed with `OsStringExt::from_wide`. Borrowed compact
+views only expose slices of that private storage, so callers cannot violate
+the platform encoding invariant.

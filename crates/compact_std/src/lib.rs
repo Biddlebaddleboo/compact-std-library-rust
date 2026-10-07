@@ -11,11 +11,12 @@ pub use compact_backend_std::{
     CompactStore, RootHandle, StdArena, StdBackendError, StdBacking, StoreRoot,
 };
 pub use compact_collections::{
-    CollectionError, CompactBitVec, CompactBox, CompactBytes, CompactEnum, CompactHashMap,
-    CompactHashMapEntry, CompactHashMapIter, CompactHashMapIterMut, CompactHashSet,
-    CompactInterner, CompactOption, CompactRing, CompactSlab, CompactSmallVec, CompactString,
-    CompactStringWriter, CompactVec, CompactVecDeque, CompactVecDequeIter, InternId, Result,
-    SlabHandle, COMPACT_BYTES_INLINE_CAPACITY,
+    CollectionError, CompactBitVec, CompactBox, CompactBytes, CompactComponent,
+    CompactComponentKind, CompactComponents, CompactEnum, CompactHashMap, CompactHashMapEntry,
+    CompactHashMapIter, CompactHashMapIterMut, CompactHashSet, CompactInterner, CompactOption,
+    CompactOsStr, CompactOsString, CompactPath, CompactPathBuf, CompactPathDisplay, CompactRing,
+    CompactSlab, CompactSmallVec, CompactString, CompactStringWriter, CompactVec, CompactVecDeque,
+    CompactVecDequeIter, InternId, Result, SlabHandle, COMPACT_BYTES_INLINE_CAPACITY,
 };
 pub use compact_core::{
     bits_required, checked_align_up, read_bits, smallest_word, validate_bit_range, write_bits,
@@ -37,6 +38,10 @@ pub type HashMap<'arena, K, V, S = std::collections::hash_map::RandomState> =
 /// Hash set alias with randomized hashing by default.
 pub type HashSet<'arena, T, S = std::collections::hash_map::RandomState> =
     CompactHashSet<'arena, T, S>;
+/// Compact OS string alias.
+pub type OsString<'arena> = CompactOsString<'arena>;
+/// Compact path buffer alias.
+pub type PathBuf<'arena> = CompactPathBuf<'arena>;
 
 /// Implementation paths referenced by the proc-macro expansion.
 #[doc(hidden)]

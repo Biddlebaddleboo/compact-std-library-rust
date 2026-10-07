@@ -171,6 +171,11 @@ supported. Operations that can allocate, such as insertion, reserve, and
 shrink, take the arena explicitly. Lookup and iteration validate the owning
 arena before returning borrowed values.
 
+`CompactOsString` and `CompactPathBuf` preserve native Unix bytes and Windows
+wide units without converting through UTF-8. Their borrowed `CompactOsStr` and
+`CompactPath` views stay tied to the compact owner; mutating and joining paths
+take the arena and report allocation errors.
+
 ```rust
 use compact_std::prelude::*;
 

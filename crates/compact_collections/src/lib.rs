@@ -13,6 +13,7 @@ mod enum_value;
 mod error;
 mod hash_map;
 mod intern;
+mod os_path;
 mod slab;
 mod small;
 mod string;
@@ -28,6 +29,10 @@ pub use hash_map::{
     CompactHashMap, CompactHashMapEntry, CompactHashMapIter, CompactHashMapIterMut, CompactHashSet,
 };
 pub use intern::{CompactInterner, InternId};
+pub use os_path::{
+    CompactComponent, CompactComponentKind, CompactComponents, CompactOsStr, CompactOsString,
+    CompactPath, CompactPathBuf, CompactPathDisplay,
+};
 pub use slab::{CompactSlab, SlabHandle};
 pub use small::CompactSmallVec;
 pub use string::{CompactString, CompactStringWriter};

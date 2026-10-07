@@ -142,6 +142,15 @@ byte allocation.
 `clear` retains heap capacity. `shrink_to_fit_in` can release unused
 capacity or return to inline representation.
 
+### CompactOsString and CompactPathBuf
+
+On Unix, `CompactOsString` stores the exact OS byte sequence. On Windows, it
+stores each exact UTF-16 code unit in a two-byte little-endian slot. Native
+`OsString` and `PathBuf` conversions use the platform extension traits and do
+not pass through UTF-8. Borrowed compact views retain the original arena
+slice; path queries use standard library path rules, and `display` keeps the
+standard lossy formatting behavior.
+
 ### CompactSmallVec
 
 Initialized values stay in inline storage until promotion. Promotion allocates
