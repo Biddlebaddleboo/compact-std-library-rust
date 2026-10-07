@@ -89,6 +89,31 @@ fn compact_box_and_nullable_offset_resolve_through_the_arena() {
 }
 
 #[test]
+fn nested_scratch_scopes_host_temporary_compact_collections() {
+    StdArena::with_capacity(2048, |arena| {
+        let outer_used = arena.used_bytes();
+        arena
+            .scratch(1024, |scratch| {
+                let mut values = CompactVec::new_in(scratch);
+                values.push_in(3_u32, scratch).unwrap();
+                values.push_in(5, scratch).unwrap();
+                assert_eq!(values.as_slice(scratch).unwrap(), &[3, 5]);
+
+                let mut text =
+                    CompactString::from_str_in("temporary compact text", scratch).unwrap();
+                text.push_str_in("!", scratch).unwrap();
+                assert_eq!(text.as_str(scratch).unwrap(), "temporary compact text!");
+
+                let bytes = scratch.alloc_bytes(b"payload").unwrap();
+                assert_eq!(scratch.get_bytes(bytes).unwrap(), b"payload");
+            })
+            .unwrap();
+        assert_eq!(arena.used_bytes(), outer_used);
+    })
+    .unwrap();
+}
+
+#[test]
 fn small_vector_stays_inline_then_promotes_failure_safely() {
     StdArena::with_capacity(128, |arena| {
         let before = arena.used_bytes();

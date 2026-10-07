@@ -1,4 +1,7 @@
 use core::mem::{align_of, MaybeUninit};
+use std::cell::RefCell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::rc::Rc;
 
 use crate::{
     bits_required, checked_align_up, smallest_word, with_arena, with_arena_attached,
@@ -203,6 +206,132 @@ fn zero_sized_allocations_get_distinct_non_null_offsets() {
         assert_ne!(first.as_u32(), second.as_u32());
         assert!(arena.get(first).is_ok());
         assert!(arena.get(second).is_ok());
+    })
+    .unwrap();
+}
+
+#[test]
+fn scratch_scopes_nest_align_and_release_their_storage() {
+    #[repr(align(64))]
+    #[derive(Clone, Copy)]
+    struct Aligned(u8);
+    #[derive(Clone, Copy)]
+    struct Empty;
+
+    let mut backing = TestBacking::new(1024);
+    with_arena(&mut backing, |arena| {
+        let initial_used = arena.used_bytes();
+        let result = arena
+            .scratch(512, |scratch| {
+                let aligned = scratch.alloc_value(Aligned(17)).unwrap();
+                assert_eq!(scratch.get(aligned).unwrap().0, 17);
+                assert_eq!(
+                    (scratch.get(aligned).unwrap() as *const Aligned as usize)
+                        % align_of::<Aligned>(),
+                    0
+                );
+                let first_empty = scratch.alloc_value(Empty).unwrap();
+                let second_empty = scratch.alloc_value(Empty).unwrap();
+                assert_ne!(first_empty.as_u32(), second_empty.as_u32());
+
+                scratch
+                    .scratch(128, |nested| {
+                        let value = nested.alloc_value(91_u32).unwrap();
+                        assert_eq!(*nested.get(value).unwrap(), 91);
+                    })
+                    .unwrap();
+                29
+            })
+            .unwrap();
+        assert_eq!(result, 29);
+        assert_eq!(arena.used_bytes(), initial_used);
+    })
+    .unwrap();
+}
+
+struct DropTrace {
+    id: u8,
+    drops: Rc<RefCell<std::vec::Vec<u8>>>,
+    panic: bool,
+}
+
+// SAFETY: DropTrace is movable and its owned Rc remains valid until its
+// destructor runs; it contains no references into the arena.
+unsafe impl crate::CompactValue for DropTrace {}
+
+impl Drop for DropTrace {
+    fn drop(&mut self) {
+        self.drops.borrow_mut().push(self.id);
+        if self.panic {
+            panic!("test destructor panic");
+        }
+    }
+}
+
+#[test]
+fn scratch_drops_values_in_reverse_construction_order() {
+    let drops = Rc::new(RefCell::new(std::vec::Vec::new()));
+    let mut backing = TestBacking::new(512);
+    with_arena(&mut backing, |arena| {
+        arena
+            .scratch(256, |scratch| {
+                let mut values = scratch.alloc_owned_slice::<DropTrace>(3).unwrap();
+                for id in 0..3 {
+                    values
+                        .push(DropTrace {
+                            id,
+                            drops: Rc::clone(&drops),
+                            panic: false,
+                        })
+                        .unwrap();
+                }
+            })
+            .unwrap();
+    })
+    .unwrap();
+    assert_eq!(*drops.borrow(), [2, 1, 0]);
+}
+
+#[test]
+fn scratch_cleanup_continues_after_one_destructor_panics() {
+    let drops = Rc::new(RefCell::new(std::vec::Vec::new()));
+    let mut backing = TestBacking::new(512);
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        with_arena(&mut backing, |arena| {
+            let _ = arena.scratch(256, |scratch| {
+                let mut values = scratch.alloc_owned_slice::<DropTrace>(3).unwrap();
+                for id in 0..3 {
+                    values
+                        .push(DropTrace {
+                            id,
+                            drops: Rc::clone(&drops),
+                            panic: id == 1,
+                        })
+                        .unwrap();
+                }
+                drop(values);
+            });
+        })
+        .unwrap();
+    }));
+    assert!(outcome.is_err());
+    assert_eq!(*drops.borrow(), [2, 1, 0]);
+}
+
+#[test]
+fn scratch_reports_too_small_and_exhausted_regions() {
+    let mut backing = TestBacking::new(128);
+    with_arena(&mut backing, |arena| {
+        assert_eq!(
+            arena
+                .scratch(crate::MIN_ARENA_BYTES - 1, |_| ())
+                .unwrap_err(),
+            Error::InvalidCapacity
+        );
+        assert_eq!(
+            arena.scratch(128, |_| ()).unwrap_err(),
+            Error::AllocationExhausted
+        );
     })
     .unwrap();
 }

@@ -90,7 +90,10 @@ moving ownership unless it also provides a correct rollback guard.
 
 Before dropping one initialized element, containers reduce the recorded
 initialized prefix so unwinding cannot cause the same element to be dropped a
-second time.
+second time. If a destructor panics while truncating an owned allocation, a
+cleanup guard continues dropping the remaining initialized prefix during
+unwinding. A second destructor panic follows ordinary Rust double-panic
+behavior.
 
 Custom destructors must still obey ordinary Rust safety requirements.
 

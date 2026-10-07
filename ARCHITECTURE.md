@@ -31,6 +31,15 @@ identity.
 
 The minimum usable backing is `MIN_ARENA_BYTES`.
 
+### Scratch scopes
+
+`Arena::scratch(capacity, callback)` reserves a parent-owned byte allocation
+and initializes a separate nested arena inside it. The nested arena has its own
+allocator state, so releasing the scratch block cannot invalidate unrelated
+parent allocations. Nested scratch calls are supported. Ordinary compact
+owners run their destructors before the nested backing is released, and the
+callback lifetime prevents scratch-branded values from escaping.
+
 ### Persistent `CompactStore`
 
 `CompactStore` owns a fixed `StdBacking` and initializes a separate persistent

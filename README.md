@@ -63,6 +63,12 @@ format. Packed numeric storage uses target-native byte order.
 Arenas and owning compact allocations are intentionally single-owner and are
 not a cross-thread ownership mechanism.
 
+Use `arena.scratch(capacity, |scratch| { ... })` for temporary work. It creates
+a nested arena in a parent-owned allocation and releases that allocation when
+the callback returns. Scratch scopes can nest and can host compact vectors,
+strings, byte ranges, and other arena-owned values. Their higher-ranked
+lifetimes prevent scratch references and owners from escaping.
+
 ## Persistent in-process stores
 
 `CompactStore<T>` owns a stable backing and preserves allocator state across

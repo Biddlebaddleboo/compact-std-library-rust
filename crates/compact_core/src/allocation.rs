@@ -2,7 +2,7 @@
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, size_of, MaybeUninit};
 use core::ptr::{self, NonNull};
 use core::slice;
 
@@ -551,6 +551,11 @@ impl<'arena, T: CompactValue> ArenaAllocation<'arena, T> {
     /// Drop initialized elements until `new_len` remains.
     #[doc(hidden)]
     pub fn truncate(&mut self, new_len: usize) {
+        let mut guard = TruncateGuard {
+            allocation: self,
+            new_len,
+            armed: true,
+        };
         while self.len() > new_len {
             let index = self.len() - 1;
             self.set_initialized(index as u32);
@@ -558,6 +563,7 @@ impl<'arena, T: CompactValue> ArenaAllocation<'arena, T> {
             // cannot cause this element to be dropped twice.
             unsafe { self.data_ptr().add(index).drop_in_place() };
         }
+        guard.armed = false;
     }
 
     /// Append a copyable initialized slice to the current prefix.
@@ -677,6 +683,33 @@ impl<'arena, T: CompactValue> ArenaAllocation<'arena, T> {
         // SAFETY: the token is produced by the allocator and retains the same
         // arena state for its entire branded lifetime.
         unsafe { inner.base.add(self.offset as usize).cast::<T>() }
+    }
+}
+
+struct TruncateGuard<'arena, T: CompactValue> {
+    allocation: *mut ArenaAllocation<'arena, T>,
+    new_len: usize,
+    armed: bool,
+}
+
+impl<T: CompactValue> Drop for TruncateGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: this guard is created from the exclusive `&mut self` in
+            // `truncate`; it runs only while that call is unwinding and
+            // resumes dropping the still-initialized prefix.
+            unsafe { (*self.allocation).truncate(self.new_len) };
+        }
+    }
+}
+
+impl ArenaAllocation<'_, u8> {
+    pub(crate) fn uninit_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        // SAFETY: this owner describes a unique byte allocation and the full
+        // capacity is valid writable storage, whether or not it is initialized.
+        unsafe {
+            slice::from_raw_parts_mut(self.data_ptr().cast::<MaybeUninit<u8>>(), self.capacity())
+        }
     }
 }
 

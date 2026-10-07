@@ -157,6 +157,36 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         unsafe { self.state.as_ref() }.remaining_bytes()
     }
 
+    /// Run a nested arena in a parent-owned allocation and release all of its
+    /// storage when the callback returns.
+    ///
+    /// Scratch capacity includes the nested arena's allocator metadata. Values
+    /// with destructors are supported through ordinary arena owners, which are
+    /// dropped before the scratch allocation is released. Nested scratch calls
+    /// are supported. The callback's higher-ranked lifetimes prevent scratch
+    /// references and owner handles from escaping.
+    pub fn scratch<R, F>(&mut self, capacity: usize, action: F) -> Result<R>
+    where
+        F: for<'scratch, 'scratch_memory> FnOnce(&mut Arena<'scratch, 'scratch_memory>) -> R,
+    {
+        if capacity < crate::MIN_ARENA_BYTES {
+            return Err(Error::InvalidCapacity);
+        }
+        if capacity as u64 > MAX_ARENA_BYTES {
+            return Err(Error::BackingTooLarge);
+        }
+
+        let mut allocation = self.alloc_owned_slice::<u8>(capacity)?;
+        let result = {
+            let mut backing = ScratchBacking {
+                bytes: allocation.uninit_capacity_mut(),
+            };
+            with_arena(&mut backing, action)
+        };
+        drop(allocation);
+        result
+    }
+
     /// Allocate uninitialized storage owned by one move-only compact value.
     ///
     /// The returned owner tracks its initialized prefix, runs element
@@ -684,6 +714,18 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
             return Err(Error::AlignmentError);
         }
         Ok(start)
+    }
+}
+
+struct ScratchBacking<'memory> {
+    bytes: &'memory mut [MaybeUninit<u8>],
+}
+
+// SAFETY: the byte slice is borrowed from a unique parent-owned allocation;
+// its address stays fixed while the nested arena holds the mutable borrow.
+unsafe impl StableBacking for ScratchBacking<'_> {
+    fn bytes_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.bytes
     }
 }
 
