@@ -219,7 +219,11 @@ impl<'arena> CompactString<'arena> {
         &'view mut self,
         arena: &'view mut Arena<'arena, 'backing>,
     ) -> CompactStringWriter<'view, 'arena, 'backing> {
-        CompactStringWriter { text: self, arena }
+        CompactStringWriter {
+            text: self,
+            arena,
+            error: None,
+        }
     }
 }
 
@@ -228,6 +232,7 @@ impl<'arena> CompactString<'arena> {
 pub struct CompactStringWriter<'view, 'arena, 'backing> {
     text: &'view mut CompactString<'arena>,
     arena: &'view mut Arena<'arena, 'backing>,
+    error: Option<CollectionError>,
 }
 
 impl CompactStringWriter<'_, '_, '_> {
@@ -240,11 +245,29 @@ impl CompactStringWriter<'_, '_, '_> {
     pub fn write_char_in(&mut self, value: char) -> Result<()> {
         self.text.push_char_in(value, self.arena)
     }
+
+    /// Format values into the compact string and preserve arena errors.
+    ///
+    /// A `fmt::Display` implementation that returns `fmt::Error` without an
+    /// arena failure follows the behavior of standard formatting and panics.
+    pub fn write_fmt_in(&mut self, arguments: fmt::Arguments<'_>) -> Result<()> {
+        self.error = None;
+        match fmt::write(self, arguments) {
+            Ok(()) => Ok(()),
+            Err(_) => match self.error.take() {
+                Some(error) => Err(error),
+                None => panic!("a formatter returned an error"),
+            },
+        }
+    }
 }
 
 impl fmt::Write for CompactStringWriter<'_, '_, '_> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.write_str_in(value).map_err(|_| fmt::Error)
+        self.write_str_in(value).map_err(|error| {
+            self.error = Some(error);
+            fmt::Error
+        })
     }
 }
 

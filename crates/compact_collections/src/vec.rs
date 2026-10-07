@@ -136,7 +136,7 @@ impl<'arena, T: CompactValue> CompactVec<'arena, T> {
     }
 
     /// Borrow all initialized elements as a zero-copy native slice.
-    pub fn as_slice<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<&'view [T]> {
+    pub fn as_slice<'view>(&'view self, arena: &Arena<'arena, '_>) -> Result<&'view [T]> {
         if let Some(storage) = &self.storage {
             arena.validate_owned(storage)?;
             Ok(storage.as_slice())

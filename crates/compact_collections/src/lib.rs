@@ -5,6 +5,7 @@
 //! while their arena backing remains alive. Owning allocation tokens reclaim
 //! their storage on drop.
 
+mod arena_traits;
 mod bitvec;
 mod boxed;
 mod compact_bytes;
@@ -19,6 +20,7 @@ mod small;
 mod string;
 mod vec;
 
+pub use arena_traits::{CloneIn, ExtendIn, FromIteratorIn, ToCompactStringIn};
 pub use bitvec::CompactBitVec;
 pub use boxed::{CompactBox, CompactOption};
 pub use compact_bytes::{CompactBytes, COMPACT_BYTES_INLINE_CAPACITY};

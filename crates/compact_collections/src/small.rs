@@ -97,7 +97,7 @@ impl<'arena, T: CompactValue, const N: usize> CompactSmallVec<'arena, T, N> {
     }
 
     /// Borrow all initialized values as a contiguous native slice.
-    pub fn as_slice<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<&'view [T]> {
+    pub fn as_slice<'view>(&'view self, arena: &Arena<'arena, '_>) -> Result<&'view [T]> {
         match &self.storage {
             SmallStorage::Inline { len, values } => {
                 if *len == 0 {

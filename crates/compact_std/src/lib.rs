@@ -11,12 +11,13 @@ pub use compact_backend_std::{
     CompactStore, RootHandle, StdArena, StdBackendError, StdBacking, StoreRoot,
 };
 pub use compact_collections::{
-    CollectionError, CompactBitVec, CompactBox, CompactBytes, CompactComponent,
+    CloneIn, CollectionError, CompactBitVec, CompactBox, CompactBytes, CompactComponent,
     CompactComponentKind, CompactComponents, CompactEnum, CompactHashMap, CompactHashMapEntry,
     CompactHashMapIter, CompactHashMapIterMut, CompactHashSet, CompactInterner, CompactOption,
     CompactOsStr, CompactOsString, CompactPath, CompactPathBuf, CompactPathDisplay, CompactRing,
     CompactSlab, CompactSmallVec, CompactString, CompactStringWriter, CompactVec, CompactVecDeque,
-    CompactVecDequeIter, InternId, Result, SlabHandle, COMPACT_BYTES_INLINE_CAPACITY,
+    CompactVecDequeIter, ExtendIn, FromIteratorIn, InternId, Result, SlabHandle, ToCompactStringIn,
+    COMPACT_BYTES_INLINE_CAPACITY,
 };
 pub use compact_core::{
     bits_required, checked_align_up, read_bits, smallest_word, validate_bit_range, write_bits,

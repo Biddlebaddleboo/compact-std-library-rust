@@ -176,6 +176,11 @@ wide units without converting through UTF-8. Their borrowed `CompactOsStr` and
 `CompactPath` views stay tied to the compact owner; mutating and joining paths
 take the arena and report allocation errors.
 
+`FromIteratorIn`, `ExtendIn`, and `CloneIn` make allocation-aware collection
+operations explicit. `ToCompactStringIn` formats through
+`CompactStringWriter`, preserving arena exhaustion as a collection error.
+These traits are the primitive operations used by `arena!` syntax lowering.
+
 ```rust
 use compact_std::prelude::*;
 

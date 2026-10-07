@@ -116,6 +116,12 @@ See [SAFETY.md](SAFETY.md).
 
 ## Collections
 
+Allocation-requiring collection operations use `FromIteratorIn`, `ExtendIn`,
+and `CloneIn` with an explicit destination arena. `CloneIn` recursively clones
+compact values into that arena; the ordinary `Clone` trait is reserved for
+operations that do not need hidden allocation context. `ToCompactStringIn`
+formats through a compact writer and returns arena errors directly.
+
 ### CompactVec
 
 `CompactVec<T>` owns one optional `ArenaAllocation<T>`.
