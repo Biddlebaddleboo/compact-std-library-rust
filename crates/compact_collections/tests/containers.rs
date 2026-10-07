@@ -1,15 +1,19 @@
 use compact_backend_std::StdArena;
 use compact_collections::{
     CollectionError, CompactBitVec, CompactBox, CompactBytes, CompactInterner, CompactOption,
-    CompactSlab, CompactSmallVec, CompactString, CompactVec, InternId,
+    CompactRing, CompactSlab, CompactSmallVec, CompactString, CompactVec, CompactVecDeque,
+    InternId,
 };
 use compact_core::CompactValue;
 use compact_core::Offset32;
 use std::borrow::{Borrow, BorrowMut};
 use std::cell::Cell;
+use std::collections::VecDeque as StdVecDeque;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn hash_value(value: &impl Hash) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -186,6 +190,294 @@ fn compact_bytes_growth_failure_preserves_contents() {
         assert_eq!(bytes.as_slice(), old);
     })
     .unwrap();
+}
+
+#[test]
+fn compact_vec_deque_matches_std_across_wrapping_and_reallocation() {
+    StdArena::with_capacity(16 * 1024, |arena| {
+        let mut compact = CompactVecDeque::with_capacity(3, arena).unwrap();
+        let mut standard = StdVecDeque::with_capacity(3);
+        for step in 0_i32..700 {
+            match step % 7 {
+                0 => {
+                    compact.push_back(step, arena).unwrap();
+                    standard.push_back(step);
+                }
+                1 => {
+                    compact.push_front(-step, arena).unwrap();
+                    standard.push_front(-step);
+                }
+                2 => assert_eq!(compact.pop_back(arena).unwrap(), standard.pop_back()),
+                3 => {
+                    compact.push_back(step * 3, arena).unwrap();
+                    standard.push_back(step * 3);
+                }
+                4 => assert_eq!(compact.pop_front(arena).unwrap(), standard.pop_front()),
+                5 => {
+                    compact.push_front(step * 2, arena).unwrap();
+                    standard.push_front(step * 2);
+                }
+                _ => {
+                    if let Some(value) = compact.front_mut(arena).unwrap() {
+                        *value += 1;
+                    }
+                    if let Some(value) = standard.front_mut() {
+                        *value += 1;
+                    }
+                }
+            }
+            assert_eq!(compact.len(), standard.len());
+            assert_eq!(
+                compact.front(arena).unwrap().copied(),
+                standard.front().copied()
+            );
+            assert_eq!(
+                compact.back(arena).unwrap().copied(),
+                standard.back().copied()
+            );
+            assert_eq!(
+                compact
+                    .iter(arena)
+                    .unwrap()
+                    .copied()
+                    .collect::<std::vec::Vec<_>>(),
+                standard.iter().copied().collect::<std::vec::Vec<_>>()
+            );
+            for (index, value) in standard.iter().enumerate() {
+                assert_eq!(compact.get(index, arena).unwrap(), Some(value));
+            }
+            assert_eq!(
+                compact
+                    .iter(arena)
+                    .unwrap()
+                    .rev()
+                    .copied()
+                    .collect::<std::vec::Vec<_>>(),
+                standard.iter().rev().copied().collect::<std::vec::Vec<_>>()
+            );
+        }
+
+        compact.reserve(32, arena).unwrap();
+        for value in compact.iter_mut(arena).unwrap() {
+            *value += 5;
+        }
+        for value in &mut standard {
+            *value += 5;
+        }
+        assert_eq!(
+            compact.make_contiguous(arena).unwrap(),
+            standard.make_contiguous()
+        );
+
+        compact
+            .retain(arena, |value| value.rem_euclid(3) != 0)
+            .unwrap();
+        standard.retain(|value| value.rem_euclid(3) != 0);
+        compact.truncate(4);
+        standard.truncate(4);
+        assert_eq!(
+            compact
+                .iter(arena)
+                .unwrap()
+                .copied()
+                .collect::<std::vec::Vec<_>>(),
+            standard.iter().copied().collect::<std::vec::Vec<_>>()
+        );
+
+        compact.shrink_to_fit(arena).unwrap();
+        assert_eq!(compact.capacity(), compact.len());
+        compact.clear();
+        standard.clear();
+        compact.push_front(71, arena).unwrap();
+        standard.push_front(71);
+        assert_eq!(
+            compact
+                .iter(arena)
+                .unwrap()
+                .copied()
+                .collect::<std::vec::Vec<_>>(),
+            standard.iter().copied().collect::<std::vec::Vec<_>>()
+        );
+    })
+    .unwrap();
+}
+
+static ZERO_SIZED_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+struct ZeroSizedDrop;
+
+impl Drop for ZeroSizedDrop {
+    fn drop(&mut self) {
+        ZERO_SIZED_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// SAFETY: the zero-sized value has no address-dependent state, and its
+// destructor is safe while the arena remains alive.
+unsafe impl CompactValue for ZeroSizedDrop {}
+
+#[test]
+fn compact_vec_deque_counts_zero_sized_values_and_drops_them_once() {
+    assert_eq!(core::mem::size_of::<ZeroSizedDrop>(), 0);
+    ZERO_SIZED_DROPS.store(0, Ordering::SeqCst);
+    StdArena::with_capacity(512, |arena| {
+        let mut deque = CompactVecDeque::with_capacity(2, arena).unwrap();
+        deque.push_back(ZeroSizedDrop, arena).unwrap();
+        deque.push_front(ZeroSizedDrop, arena).unwrap();
+        deque.push_back(ZeroSizedDrop, arena).unwrap();
+        assert_eq!(deque.len(), 3);
+        assert_eq!(deque.iter(arena).unwrap().count(), 3);
+        drop(deque.pop_front(arena).unwrap().unwrap());
+        deque.clear();
+        assert_eq!(deque.len(), 0);
+    })
+    .unwrap();
+    assert_eq!(ZERO_SIZED_DROPS.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn compact_vec_deque_makes_a_single_wrapped_entry_contiguous() {
+    StdArena::with_capacity(512, |arena| {
+        let mut deque = CompactVecDeque::with_capacity(4, arena).unwrap();
+        deque.push_back(1_u32, arena).unwrap();
+        assert_eq!(deque.pop_front(arena).unwrap(), Some(1));
+        deque.push_front(7, arena).unwrap();
+        assert_eq!(deque.make_contiguous(arena).unwrap(), &[7]);
+        assert_eq!(
+            deque
+                .iter(arena)
+                .unwrap()
+                .copied()
+                .collect::<std::vec::Vec<_>>(),
+            [7]
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn compact_ring_evicts_before_reusing_slots_and_drops_exactly_once() {
+    let drops = Rc::new(Cell::new(0));
+    StdArena::with_capacity(1024, |arena| {
+        let mut ring = CompactRing::with_capacity(2, arena).unwrap();
+        ring.push_back(DropCounter(Rc::clone(&drops)), arena)
+            .unwrap();
+        ring.push_back(DropCounter(Rc::clone(&drops)), arena)
+            .unwrap();
+        ring.push_back(DropCounter(Rc::clone(&drops)), arena)
+            .unwrap();
+        assert_eq!(ring.len(), 2);
+        assert_eq!(drops.get(), 1);
+        ring.clear();
+        assert_eq!(drops.get(), 3);
+        ring.push_back(DropCounter(Rc::clone(&drops)), arena)
+            .unwrap();
+        ring.clear();
+    })
+    .unwrap();
+    assert_eq!(drops.get(), 4);
+}
+
+struct DropBomb {
+    id: u8,
+    drops: Rc<std::cell::RefCell<std::vec::Vec<u8>>>,
+    panic_on_drop: bool,
+}
+
+impl Drop for DropBomb {
+    fn drop(&mut self) {
+        self.drops.as_ref().borrow_mut().push(self.id);
+        if self.panic_on_drop {
+            panic!("evicted value destructor panic");
+        }
+    }
+}
+
+// SAFETY: DropBomb is movable and owns its logging state; it contains no
+// references into the arena.
+unsafe impl CompactValue for DropBomb {}
+
+#[test]
+fn ring_eviction_panic_does_not_resurrect_the_removed_entry() {
+    let drops = Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+    StdArena::with_capacity(1024, |arena| {
+        let mut ring = CompactRing::with_capacity(2, arena).unwrap();
+        ring.push_back(
+            DropBomb {
+                id: 1,
+                drops: Rc::clone(&drops),
+                panic_on_drop: true,
+            },
+            arena,
+        )
+        .unwrap();
+        ring.push_back(
+            DropBomb {
+                id: 2,
+                drops: Rc::clone(&drops),
+                panic_on_drop: false,
+            },
+            arena,
+        )
+        .unwrap();
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            ring.push_back(
+                DropBomb {
+                    id: 3,
+                    drops: Rc::clone(&drops),
+                    panic_on_drop: false,
+                },
+                arena,
+            )
+            .unwrap();
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(ring.len(), 1);
+        assert_eq!(
+            ring.iter(arena)
+                .unwrap()
+                .map(|value| value.id)
+                .collect::<std::vec::Vec<_>>(),
+            [2]
+        );
+        ring.push_back(
+            DropBomb {
+                id: 4,
+                drops: Rc::clone(&drops),
+                panic_on_drop: false,
+            },
+            arena,
+        )
+        .unwrap();
+        ring.clear();
+    })
+    .unwrap();
+    assert_eq!(*drops.as_ref().borrow(), [1, 3, 4, 2]);
+}
+
+#[test]
+fn deque_drop_finishes_remaining_entries_after_a_destructor_panics() {
+    let drops = Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+    StdArena::with_capacity(1024, |arena| {
+        let mut deque = CompactVecDeque::with_capacity(3, arena).unwrap();
+        for (id, panic_on_drop) in [(0, false), (1, true), (2, false)] {
+            deque
+                .push_back(
+                    DropBomb {
+                        id,
+                        drops: Rc::clone(&drops),
+                        panic_on_drop,
+                    },
+                    arena,
+                )
+                .unwrap();
+        }
+        let outcome = catch_unwind(AssertUnwindSafe(|| drop(deque)));
+        assert!(outcome.is_err());
+    })
+    .unwrap();
+    assert_eq!(*drops.as_ref().borrow(), [2, 1, 0]);
 }
 
 #[test]

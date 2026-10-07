@@ -25,6 +25,13 @@ Owned arena allocations have exactly one safe owner token.
 
 Do not duplicate, forge, or resurrect an owner token through unsafe code.
 
+`CompactVecDeque` stores `MaybeUninit<T>` slots and tracks which logical ring
+positions contain live values. Every insertion initializes one slot, every
+removal decrements the logical length before moving a value out, and deque drop
+drains the remaining entries before releasing the slot allocation. The ring's
+head and length, rather than allocator initialization metadata, define live
+`T` values.
+
 ## `CompactValue`
 
 `CompactValue` is an unsafe trait because containers may move values between

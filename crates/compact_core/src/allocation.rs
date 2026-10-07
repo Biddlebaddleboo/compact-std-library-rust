@@ -437,6 +437,9 @@ compact_values!(
 );
 
 unsafe impl<T: CompactValue, const N: usize> CompactValue for [T; N] {}
+// SAFETY: MaybeUninit can hold any bit pattern and moving it preserves every
+// initialized T value; its own destructor intentionally does not drop T.
+unsafe impl<T: CompactValue> CompactValue for MaybeUninit<T> {}
 unsafe impl<T: CompactValue> CompactValue for Option<T> {}
 unsafe impl<T: CompactValue, E: CompactValue> CompactValue for core::result::Result<T, E> {}
 unsafe impl<A: CompactValue, B: CompactValue> CompactValue for (A, B) {}

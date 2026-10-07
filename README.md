@@ -157,6 +157,9 @@ bytes inline and owns reclaimable arena storage for longer payloads.
 
 `CompactSmallVec<T, N>` stores up to `N` values inline before promotion.
 
+`CompactVecDeque<T>` provides a growable circular queue, and `CompactRing<T>`
+provides a fixed-capacity log buffer that drops its oldest entry before reuse.
+
 `CompactSlab` combines allocation identity with slot generations so stale
 handles remain invalid after slot or allocation reuse.
 

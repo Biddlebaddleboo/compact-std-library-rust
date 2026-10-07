@@ -156,6 +156,20 @@ reclaimable `ArenaAllocation<u8>`. The benchmark shows heap-backed compact
 buffers can be slower than native `Vec<u8>` for short-lived payloads, so they
 are intended where inline payloads or arena ownership are useful.
 
+### CompactVecDeque and CompactRing
+
+The deque tracks a physical head and logical length over one
+`ArenaAllocation<MaybeUninit<T>>`. Growth first makes wrapped values
+contiguous, then extends the allocation in place or moves the initialized
+prefix to a replacement. `make_contiguous` rotates the slots and returns a
+mutable slice. Zero-sized entries use the same finite logical capacity and
+drop rules as other entries.
+
+`CompactRing` allocates its full maximum length at construction. A full ring
+removes and drops the oldest entry before writing into that slot. If the
+removed entry's destructor panics, the entry remains removed and the new value
+is not inserted.
+
 ### CompactSlab
 
 A slab combines slot generations with the owning allocation identity. A handle

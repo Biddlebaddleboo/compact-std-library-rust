@@ -12,8 +12,9 @@ pub use compact_backend_std::{
 };
 pub use compact_collections::{
     CollectionError, CompactBitVec, CompactBox, CompactBytes, CompactEnum, CompactInterner,
-    CompactOption, CompactSlab, CompactSmallVec, CompactString, CompactStringWriter, CompactVec,
-    InternId, Result, SlabHandle, COMPACT_BYTES_INLINE_CAPACITY,
+    CompactOption, CompactRing, CompactSlab, CompactSmallVec, CompactString, CompactStringWriter,
+    CompactVec, CompactVecDeque, CompactVecDequeIter, InternId, Result, SlabHandle,
+    COMPACT_BYTES_INLINE_CAPACITY,
 };
 pub use compact_core::{
     bits_required, checked_align_up, read_bits, smallest_word, validate_bit_range, write_bits,
