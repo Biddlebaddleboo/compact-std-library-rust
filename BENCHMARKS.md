@@ -1,4 +1,4 @@
-# V2.4 native Rust comparison
+# V2.4 pre-optimization native Rust comparison
 
 Benchmark report for the frozen V2.4 architecture. The measured source revision is
 `1700bdc4d1cb8f242fdb2e565ab64fb1af324f27` (benchmark implementation commit).
@@ -275,4 +275,139 @@ and does not change allocation policy.
 **V2.4 is frozen after this benchmark and validation pass.** Further memory
 model, pointer model, owner/header, or allocator redesign belongs in V3.
 Correctness fixes, documentation corrections, test improvements, and benchmark
-maintenance remain allowed.
+maintenance remain allowed. The later optimization pass recorded below was
+authorized within that frozen contract and does not change retained layouts.
+
+# V2.4 optimized hot-path results
+
+Optimization commit: `0d7214810d40e48d2865c1a7357389f908040d68`, based on the
+verified `main` baseline `585f73e1abb02b7818719c4c622720c2a6af512a`. This is an
+implementation optimization within the frozen V2.4 retained representation.
+
+## Environment and method
+
+The authoritative `benchmark_compare` release suite ran twice on 2026-10-07 on
+the same ARM64 host and toolchain:
+
+- Ubuntu 24.04.4; Linux `6.17.0-1020-oracle`; AArch64 ARM Neoverse-N1, 2 CPUs
+- `rustc 1.95.0 (59807616e 2026-04-14)`; LLVM 22.1.2
+- Cargo `1.95.0 (f2d3ce0bd 2026-03-21)`; release profile, default target flags
+- Features `json,toml`; default 7–15 repetitions per scenario and variant
+
+The command was:
+
+```sh
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/compact-v24-optimized-run1.tsv
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/compact-v24-optimized-run2.tsv
+```
+
+All native/compact checksums matched in both runs for all 16 scenarios. Times
+below are end-to-end medians and p95s from run 1; the ratio column gives
+optimized V2.4/native for runs 1 and 2. Retained memory uses the same definition
+as the pre-optimization report: compact cage live bytes plus retained native
+auxiliary bytes, divided by native live bytes.
+
+## Primary result: native Rust vs optimized V2.4
+
+| ID | Workload | Native median / p95 (ms) | Optimized V2.4 median / p95 (ms) | Time ratio, run 1 / run 2 | Retained memory ratio |
+|---|---|---:|---:|---:|---:|
+| A1 | vector build/traverse/churn | 0.067 / 0.175 | 0.071 / 0.086 | 1.07x / 1.06x | 1.000x |
+| A2 | box and object allocation | 1.731 / 1.773 | 2.730 / 3.091 | 1.58x / 1.58x | 1.500x |
+| A3 | string and byte lengths | 4.719 / 5.467 | 0.614 / 0.683 | 0.13x / 0.14x | 1.001x |
+| A4 | FIFO deque churn | 0.363 / 0.394 | 2.727 / 3.243 | 7.51x / 7.58x | 1.000x |
+| A5 | hash map and set churn | 1.193 / 1.315 | 5.647 / 6.113 | 4.73x / 4.88x | 1.000x |
+| A6 | path build and query | 1.178 / 1.338 | 1.535 / 1.591 | 1.30x / 1.27x | 1.233x |
+| B1 | 10k record JSON API response | 13.444 / 15.025 | 20.006 / 20.507 | 1.49x / 1.39x | 0.618x |
+| B2 | large TOML service configuration | 0.984 / 1.013 | 1.266 / 1.315 | 1.29x / 1.30x | 0.802x |
+| B3 | 24k request metadata batch | 28.303 / 34.681 | 22.880 / 23.498 | 0.81x / 0.75x | 0.911x |
+| B4 | bounded logging history churn | 6.416 / 6.785 | 7.949 / 8.473 | 1.24x / 1.25x | 0.860x |
+| B5 | mobility dispatch state | 8.888 / 11.505 | 7.296 / 7.896 | 0.82x / 0.79x | 0.710x |
+| B6 | market data order book | 0.038 / 0.042 | 0.600 / 0.634 | 15.70x / 15.46x | 1.000x |
+| B7 | 100k filesystem catalog | 17.455 / 22.582 | 17.586 / 18.092 | 1.01x / 1.21x | 1.050x |
+| B8 | fixed population cache churn | 12.030 / 13.533 | 83.193 / 84.033 | 6.92x / 6.96x | 1.026x |
+| B9 | immutable/frozen catalog | 12.670 / 14.171 | 4.545 / 5.905 | 0.36x / 0.44x | 0.739x |
+| B10 | concurrent worker state | 0.694 / 1.785 | 1.028 / 1.173 | 1.48x / 2.18x | 1.000x |
+
+A1 now uses matched bulk operations: native `collect`/`extend` and compact
+`try_from_iter`/`try_extend`. The earlier published A1 measurement used
+per-element pushes, so its pre/post number is not a like-for-like speedup. Both
+versions still build and mutate the same element counts and produce equal
+checksums.
+
+## Secondary result: published V2.4 vs optimized V2.4
+
+This table measures the implementation optimization, not the native comparison.
+The previous published V2.4 medians are preserved from the pre-optimization
+report above. The optimized column is run 1 from the new suite.
+
+| ID | Published pre-optimization V2.4 median (ms) | Optimized V2.4 median / p95 (ms) | Old / new median |
+|---|---:|---:|---:|
+| A1 | 16.879 | 0.071 / 0.086 | not directly comparable† |
+| A2 | 4.679 | 2.730 / 3.091 | 1.71x |
+| A3 | 0.667 | 0.614 / 0.683 | 1.09x |
+| A4 | 4.504 | 2.727 / 3.243 | 1.65x |
+| A5 | 9.372 | 5.647 / 6.113 | 1.66x |
+| A6 | 2.135 | 1.535 / 1.591 | 1.39x |
+| B1 | 21.971 | 20.006 / 20.507 | 1.10x |
+| B2 | 1.344 | 1.266 / 1.315 | 1.06x |
+| B3 | 35.706 | 22.880 / 23.498 | 1.56x |
+| B4 | 10.549 | 7.949 / 8.473 | 1.33x |
+| B5 | 9.496 | 7.296 / 7.896 | 1.30x |
+| B6 | 1.081 | 0.600 / 0.634 | 1.80x |
+| B7 | 28.597 | 17.586 / 18.092 | 1.63x |
+| B8 | 89.125 | 83.193 / 84.033 | 1.07x |
+| B9 | 7.011 | 4.545 / 5.905 | 1.54x |
+| B10 | 3.578 | 1.028 / 1.173 | 3.48x |
+
+† A1 changed from per-element pushes to matched bulk construction and mutation
+on both native and compact sides. Its new result demonstrates the optimized
+bulk path against native bulk operations; the old/new ratio mixes methodology
+and implementation changes, so it is omitted.
+
+For the main B9 traversal phases, the old and optimized compact medians/p95s
+were:
+
+| B9 phase | Published V2.4 median / p95 (ms) | Optimized run 1 median / p95 (ms) | Optimized run 2 median / p95 (ms) |
+|---|---:|---:|---:|
+| Sequential traversal | 2.611 / 2.639 | 1.231 / 1.283 | 1.233 / 1.276 |
+| Deterministic random lookup | 1.163 / 1.336 | 0.827 / 0.853 | 0.877 / 1.200 |
+| Parallel read traversal | 1.455 / 1.496 | 0.751 / 0.811 | 0.761 / 0.831 |
+
+## Implementation and remaining costs
+
+The V2.4 retained layouts remain unchanged, including the 4-byte allocation
+owner, 4-byte vector, 16-byte allocation header, and 8-byte frozen descriptors.
+Temporary resolved views are scoped by Rust borrows. Bulk append publishes its
+initialized prefix even if an iterator, deserializer, or element constructor
+panics.
+
+Hash probing uses copied 16-byte control groups with AArch64 NEON on this
+benchmark host and SSE2 on x86-64; the scalar classifier remains the semantic
+reference. Release disassembly contains NEON lane compares. The x86-64 SSE2
+path and differential test targets cross-compile for `x86_64-apple-darwin`; it
+was not runtime-benchmarked. Intrinsics generated the required vector compares,
+so inline assembly was not needed.
+
+B5 retained memory stayed at 0.710x native, matching the previous report. B8
+retained memory stayed at 1.026x native. Its compact drop phase remains about
+49.5–49.8 ms versus 0.57–0.60 ms native, so per-entry cage release is still the
+dominant residual cost. This pass did not change allocator release policy.
+
+## Validation
+
+Passed after the implementation changes:
+
+```text
+cargo fmt --all -- --check
+cargo check --workspace --all-features
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo check --target x86_64-apple-darwin -p compact_collections --tests
+```
+
+Miri passed `compact_core`, `compact_backend_std` unit and integration tests,
+`compact_collections/tests/cage_collections.rs`, and
+`compact_std/tests/v2_4.rs`. The collections property test used
+`PROPTEST_CASES=8` with Miri isolation disabled because `proptest` accesses the
+working directory; all 15 tests passed. Release assembly was inspected for the
+AArch64 NEON classifier, the A4 deque scan, and the B9 frozen view traversal.
