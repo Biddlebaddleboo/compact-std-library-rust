@@ -2,12 +2,14 @@
 
 use core::marker::PhantomData;
 
+use crate::CompactValue;
+
 /// A typed arena-relative byte offset with a four-byte representation.
 ///
 /// The arena lifetime is a generative scope supplied by [`with_arena`](crate::with_arena).
 /// It prevents safe code from resolving a reference through a different arena.
-/// The marker carries no bytes; `T` must be sized and arena allocations currently
-/// require `Copy` values so the arena can be discarded without running drops.
+/// The marker carries no bytes. This is a non-owning view descriptor; values
+/// with destructor obligations belong in an [`ArenaAllocation`](crate::ArenaAllocation).
 /// Use [`null`](Self::null) for the V1 null sentinel; no `Option<Offset32<T>>`
 /// size or niche optimization is part of the ABI guarantee.
 #[repr(transparent)]
@@ -16,6 +18,10 @@ pub struct Offset32<'arena, T> {
     marker: PhantomData<fn(&'arena mut ()) -> &'arena mut ()>,
     type_marker: PhantomData<fn(T) -> T>,
 }
+
+// SAFETY: Offset32 stores only a byte offset and zero-sized type/lifetime
+// markers; moving it cannot change its target or create a native self-reference.
+unsafe impl<T> CompactValue for Offset32<'_, T> {}
 
 impl<T> Copy for Offset32<'_, T> {}
 
@@ -81,6 +87,9 @@ pub struct OffsetSlice32<'arena, T> {
     pub(crate) offset: Offset32<'arena, T>,
     pub(crate) len: u32,
 }
+
+// SAFETY: OffsetSlice32 stores only a byte offset and element count.
+unsafe impl<T> CompactValue for OffsetSlice32<'_, T> {}
 
 impl<'arena, T> OffsetSlice32<'arena, T> {
     pub(crate) const fn new(offset: Offset32<'arena, T>, len: u32) -> Self {

@@ -1,5 +1,6 @@
 use compact_backend_std::{
     CoreError, Offset32, StableBacking, StdArena, StdBackendError, StdBacking, MAX_ARENA_BYTES,
+    MIN_ARENA_BYTES,
 };
 
 #[test]
@@ -16,8 +17,8 @@ fn hosted_arena_round_trips_mutable_and_native_values() {
 
 #[test]
 fn fixed_backing_can_be_reused_as_separate_scoped_arenas() {
-    let mut backing = StdBacking::with_capacity(32).unwrap();
-    assert_eq!(backing.capacity(), 32);
+    let mut backing = StdBacking::with_capacity(MIN_ARENA_BYTES).unwrap();
+    assert_eq!(backing.capacity(), MIN_ARENA_BYTES);
     let first = backing
         .with_arena(|arena| {
             let offset = arena.alloc_value(7_u8).unwrap();
@@ -35,7 +36,7 @@ fn fixed_backing_can_be_reused_as_separate_scoped_arenas() {
 
 #[test]
 fn moving_the_owner_does_not_move_the_backing_allocation() {
-    let mut original = StdBacking::with_capacity(32).unwrap();
+    let mut original = StdBacking::with_capacity(MIN_ARENA_BYTES).unwrap();
     let original_address = original.bytes_mut().as_mut_ptr() as usize;
     let mut moved = original;
     let moved_address = moved.bytes_mut().as_mut_ptr() as usize;
@@ -52,7 +53,11 @@ fn capacity_errors_are_reported_without_large_allocations() {
         StdBacking::with_capacity(1),
         Err(StdBackendError::Core(CoreError::InvalidCapacity))
     ));
-    let smallest = StdArena::with_capacity(2, |arena| {
+    assert!(matches!(
+        StdBacking::with_capacity(MIN_ARENA_BYTES - 1),
+        Err(StdBackendError::Core(CoreError::InvalidCapacity))
+    ));
+    let smallest = StdArena::with_capacity(MIN_ARENA_BYTES, |arena| {
         let offset = arena.alloc_value(3_u8).unwrap();
         *arena.get(offset).unwrap()
     })
@@ -67,7 +72,7 @@ fn capacity_errors_are_reported_without_large_allocations() {
 
 #[test]
 fn allocation_exhaustion_is_deterministic() {
-    let result = StdArena::with_capacity(4, |arena| {
+    let result = StdArena::with_capacity(MIN_ARENA_BYTES, |arena| {
         arena.alloc_value(1_u8).unwrap();
         arena.alloc_slice(&[0_u8; 4]).unwrap_err()
     })

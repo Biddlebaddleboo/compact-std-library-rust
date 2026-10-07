@@ -24,8 +24,8 @@ pub const ABI_V1: CompactAbiVersion = CompactAbiVersion { major: 1, minor: 0 };
 /// Maximum logical span of one compact arena: 2^32 bytes.
 pub const MAX_ARENA_BYTES: u64 = 1_u64 << 32;
 
-/// Smallest usable arena capacity because byte offset zero is reserved.
-pub const MIN_ARENA_BYTES: usize = 2;
+/// Smallest backing that can hold allocator state and one byte allocation.
+pub const MIN_ARENA_BYTES: usize = 60;
 
 /// Width in bytes of an [`Offset32`](crate::Offset32) payload.
 pub const OFFSET_WIDTH_BYTES: usize = 4;

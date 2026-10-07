@@ -1,41 +1,45 @@
 //! Compact single-value and nullable-reference wrappers.
 
-use compact_core::{Arena, Offset32};
+use compact_core::{Arena, ArenaAllocation, CompactValue, Offset32};
 
 use crate::Result;
 
-/// An arena-owned value represented by one four-byte offset.
+/// An arena-owned value represented by a unique allocation token.
 ///
-/// Dropping this wrapper does not reclaim bytes from a monotonic arena.
-pub struct CompactBox<'arena, T: Copy> {
-    offset: Offset32<'arena, T>,
+/// Dropping the box runs `T::drop` once and returns its bytes to the arena.
+pub struct CompactBox<'arena, T: CompactValue> {
+    allocation: ArenaAllocation<'arena, T>,
 }
 
-impl<'arena, T: Copy> CompactBox<'arena, T> {
+impl<'arena, T: CompactValue> CompactBox<'arena, T> {
     /// Allocate and store one value in `arena`.
     pub fn new_in(value: T, arena: &mut Arena<'arena, '_>) -> Result<Self> {
         Ok(Self {
-            offset: arena.alloc_value(value)?,
+            allocation: arena.alloc_owned_value(value)?,
         })
     }
 
     /// Borrow the stored value.
-    pub fn get<'view>(&self, arena: &'view Arena<'arena, '_>) -> Result<&'view T> {
-        Ok(arena.get(self.offset)?)
+    pub fn get<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<&'view T> {
+        arena.validate_owned(&self.allocation)?;
+        Ok(&self.allocation.as_slice()[0])
     }
 
     /// Mutably borrow the stored value.
-    pub fn get_mut<'view>(&self, arena: &'view mut Arena<'arena, '_>) -> Result<&'view mut T> {
-        Ok(arena.get_mut(self.offset)?)
-    }
-
-    /// Return the compact offset without exposing a native arena pointer.
-    pub const fn offset(&self) -> Offset32<'arena, T> {
-        self.offset
+    pub fn get_mut<'view>(
+        &'view mut self,
+        arena: &'view mut Arena<'arena, '_>,
+    ) -> Result<&'view mut T> {
+        arena.validate_owned(&self.allocation)?;
+        Ok(&mut self.allocation.as_mut_slice()[0])
     }
 }
 
-/// An explicit four-byte nullable compact offset.
+// SAFETY: the owner token is movable and its drop glue destroys T before
+// releasing the allocation. T's own compact-move guarantees are explicit.
+unsafe impl<T: CompactValue> CompactValue for CompactBox<'_, T> {}
+
+/// An explicit four-byte nullable, non-owning compact offset.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct CompactOption<'arena, T> {
@@ -94,3 +98,6 @@ impl<'arena, T> CompactOption<'arena, T> {
         }
     }
 }
+
+// SAFETY: CompactOption stores only a branded offset and owns no allocation.
+unsafe impl<T> CompactValue for CompactOption<'_, T> {}

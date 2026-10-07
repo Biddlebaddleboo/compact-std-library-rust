@@ -132,6 +132,14 @@ pub(crate) fn expand_struct(attributes: TokenStream, mut item: ItemStruct) -> Re
     } else {
         None
     };
+    let source_value_impl = if soa && derives_copy(&item.attrs) {
+        quote! {
+            #[allow(clippy::undocumented_unsafe_blocks)]
+            unsafe impl ::compact_std::__private::core::CompactValue for #name {}
+        }
+    } else {
+        TokenStream::new()
+    };
 
     let original = quote!(#item);
     let soa_tokens = soa_items.unwrap_or_default();
@@ -145,6 +153,9 @@ pub(crate) fn expand_struct(attributes: TokenStream, mut item: ItemStruct) -> Re
             hot: ::compact_std::__private::core::ByteRange32<'arena>,
             cold: ::compact_std::__private::core::ByteRange32<'arena>,
         }
+
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        unsafe impl<'arena> ::compact_std::__private::core::CompactValue for #compact_name<'arena> {}
 
         impl<'arena> #compact_name<'arena> {
             #constants
@@ -169,6 +180,7 @@ pub(crate) fn expand_struct(attributes: TokenStream, mut item: ItemStruct) -> Re
         }
 
         #soa_tokens
+        #source_value_impl
     })
 }
 
@@ -286,11 +298,14 @@ pub(crate) fn expand_enum(attributes: TokenStream, item: ItemEnum) -> Result<Tok
             range: ::compact_std::__private::core::ByteRange32<'arena>,
         }
 
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        unsafe impl<'arena> ::compact_std::__private::core::CompactValue for #compact_name<'arena> {}
+
         impl<'arena> #compact_name<'arena> {
             /// Number of bits required by the enum discriminant.
             pub const DISCRIMINANT_BITS: u8 = #width;
             /// Number of payload bytes in the compact discriminant.
-            pub const STORAGE_BYTES: usize = (Self::DISCRIMINANT_BITS as usize + 7) / 8;
+            pub const STORAGE_BYTES: usize = (Self::DISCRIMINANT_BITS as usize).div_ceil(8);
         }
 
         impl #name {
@@ -332,6 +347,18 @@ pub(crate) fn expand_enum(attributes: TokenStream, item: ItemEnum) -> Result<Tok
         }
     };
     Ok(output)
+}
+
+fn derives_copy(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        if !attribute.path().is_ident("derive") {
+            return false;
+        }
+        attribute
+            .parse_args_with(Punctuated::<syn::Path, Token![,]>::parse_terminated)
+            .map(|derives| derives.iter().any(|path| path.is_ident("Copy")))
+            .unwrap_or(false)
+    })
 }
 
 fn parse_compact_args(attributes: TokenStream) -> Result<bool> {
@@ -507,11 +534,11 @@ fn layout_constants(specs: &[FieldSpec]) -> TokenStream {
         #(#width_constants)*
         #(#offsets)*
         /// Number of bytes used by ordinary compact fields.
-        pub const MAIN_STORAGE_BYTES: usize = (#main_bits + 7) / 8;
+        pub const MAIN_STORAGE_BYTES: usize = (#main_bits).div_ceil(8);
         /// Number of bytes used by explicitly hot fields.
-        pub const HOT_STORAGE_BYTES: usize = (#hot_bits + 7) / 8;
+        pub const HOT_STORAGE_BYTES: usize = (#hot_bits).div_ceil(8);
         /// Number of bytes used by explicitly cold fields.
-        pub const COLD_STORAGE_BYTES: usize = (#cold_bits + 7) / 8;
+        pub const COLD_STORAGE_BYTES: usize = (#cold_bits).div_ceil(8);
         /// Total bytes across this object's packed field sections.
         pub const STORAGE_BYTES: usize =
             Self::MAIN_STORAGE_BYTES + Self::HOT_STORAGE_BYTES + Self::COLD_STORAGE_BYTES;
@@ -846,6 +873,17 @@ fn generate_soa(name: &Ident, visibility: &Visibility, specs: &[FieldSpec]) -> R
             }
         })
         .collect();
+    let capacity_initializers: Vec<_> = specs
+        .iter()
+        .map(|spec| {
+            let field = &spec.ident;
+            if matches!(spec.kind, FieldKind::Bool) {
+                quote!(#field: ::compact_std::__private::collections::CompactBitVec::with_capacity_in(capacity, arena)?)
+            } else {
+                quote!(#field: ::compact_std::__private::collections::CompactVec::with_capacity_in(capacity, arena)?)
+            }
+        })
+        .collect();
     let reserves = specs.iter().map(|spec| {
         let field = &spec.ident;
         quote!(self.#field.reserve_in(1, arena)?;)
@@ -898,6 +936,14 @@ fn generate_soa(name: &Ident, visibility: &Visibility, specs: &[FieldSpec]) -> R
             /// Construct empty compact columns.
             pub fn new_in(arena: &::compact_std::__private::core::Arena<'arena, '_>) -> Self {
                 Self { #(#column_initializers,)* len: 0 }
+            }
+
+            /// Construct compact columns with capacity reserved for `capacity` records.
+            pub fn with_capacity_in(
+                capacity: usize,
+                arena: &mut ::compact_std::__private::core::Arena<'arena, '_>,
+            ) -> ::compact_std::__private::collections::Result<Self> {
+                Ok(Self { #(#capacity_initializers,)* len: 0 })
             }
 
             /// Return the number of logical records.

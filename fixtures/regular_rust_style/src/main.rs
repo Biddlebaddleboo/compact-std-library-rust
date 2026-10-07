@@ -112,12 +112,15 @@ fn main() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
         Ok(arena.used_bytes())
     })??;
     let struct_of_arrays_bytes = StdArena::with_capacity(4096, |arena| -> Result<usize> {
-        let mut records = PositionSoa::new_in(arena);
+        let mut records = PositionSoa::with_capacity_in(32, arena)?;
         for index in 0..32 {
             records.push_in(Position { x: index, y: index * 2, active: index % 2 == 0 }, arena)?;
         }
         Ok(arena.used_bytes())
     })??;
-    assert!(struct_of_arrays_bytes < array_of_structs_bytes);
+    assert!(
+        struct_of_arrays_bytes < array_of_structs_bytes,
+        "SoA used {struct_of_arrays_bytes} bytes; array-of-structs used {array_of_structs_bytes}"
+    );
     Ok(())
 }

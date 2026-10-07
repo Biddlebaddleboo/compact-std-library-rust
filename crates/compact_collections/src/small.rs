@@ -1,13 +1,14 @@
 //! Inline-first compact vector for small, known-capacity collections.
 
 use core::mem::MaybeUninit;
+use core::ptr;
 use core::slice;
 
-use compact_core::Arena;
+use compact_core::{Arena, CompactValue};
 
 use crate::{CollectionError, CompactVec, Result};
 
-enum SmallStorage<'arena, T: Copy, const N: usize> {
+enum SmallStorage<'arena, T: CompactValue, const N: usize> {
     Inline {
         len: u32,
         values: [MaybeUninit<T>; N],
@@ -17,14 +18,13 @@ enum SmallStorage<'arena, T: Copy, const N: usize> {
 
 /// A vector that stores up to `N` values inline before allocating arena bytes.
 ///
-/// Inline values live in this wrapper. After the inline capacity is reached,
-/// the values are copied into a compact arena vector. `T: Copy` keeps moves
-/// and arena teardown free of native drop obligations.
-pub struct CompactSmallVec<'arena, T: Copy, const N: usize> {
+/// Promotion moves values into the owned arena allocation; dropping the value
+/// runs destructors for either the inline prefix or heap-backed vector.
+pub struct CompactSmallVec<'arena, T: CompactValue, const N: usize> {
     storage: SmallStorage<'arena, T, N>,
 }
 
-impl<'arena, T: Copy, const N: usize> CompactSmallVec<'arena, T, N> {
+impl<'arena, T: CompactValue, const N: usize> CompactSmallVec<'arena, T, N> {
     /// Construct an empty inline vector without allocating in `arena`.
     pub fn new_in(_arena: &Arena<'arena, '_>) -> Self {
         assert!(
@@ -34,7 +34,7 @@ impl<'arena, T: Copy, const N: usize> CompactSmallVec<'arena, T, N> {
         Self {
             storage: SmallStorage::Inline {
                 len: 0,
-                values: [MaybeUninit::uninit(); N],
+                values: [const { MaybeUninit::uninit() }; N],
             },
         }
     }
@@ -103,8 +103,8 @@ impl<'arena, T: Copy, const N: usize> CompactSmallVec<'arena, T, N> {
                 if *len == 0 {
                     return Ok(&[]);
                 }
-                // SAFETY: only push_in increments len, and it initializes the
-                // corresponding MaybeUninit slot before publishing the length.
+                // SAFETY: len is advanced only after writing each value, and
+                // the wrapper borrow keeps the inline slots alive.
                 Ok(unsafe { slice::from_raw_parts(values.as_ptr().cast::<T>(), *len as usize) })
             }
             SmallStorage::Heap(values) => values.as_slice(arena),
@@ -121,8 +121,8 @@ impl<'arena, T: Copy, const N: usize> CompactSmallVec<'arena, T, N> {
                 if *len == 0 {
                     return Ok(&mut []);
                 }
-                // SAFETY: the private length tracks initialized elements and
-                // the exclusive wrapper borrow prevents any other inline view.
+                // SAFETY: len tracks the initialized prefix and exclusive
+                // access to self prevents other inline views.
                 Ok(unsafe {
                     slice::from_raw_parts_mut(values.as_mut_ptr().cast::<T>(), *len as usize)
                 })
@@ -142,7 +142,7 @@ impl<'arena, T: Copy, const N: usize> CompactSmallVec<'arena, T, N> {
         }
         match &self.storage {
             SmallStorage::Inline { values, .. } => {
-                // SAFETY: index was checked against the initialized prefix.
+                // SAFETY: index is below the initialized inline prefix.
                 Ok(Some(unsafe { values[index].assume_init_ref() }))
             }
             SmallStorage::Heap(values) => values.get(index, arena),
@@ -160,8 +160,7 @@ impl<'arena, T: Copy, const N: usize> CompactSmallVec<'arena, T, N> {
         }
         match &mut self.storage {
             SmallStorage::Inline { values, .. } => {
-                // SAFETY: index is initialized and the wrapper is exclusively
-                // borrowed for the returned mutable reference.
+                // SAFETY: index is initialized and self is exclusively borrowed.
                 Ok(Some(unsafe { values[index].assume_init_mut() }))
             }
             SmallStorage::Heap(values) => values.get_mut(index, arena),
@@ -177,46 +176,73 @@ impl<'arena, T: Copy, const N: usize> CompactSmallVec<'arena, T, N> {
                 }
                 *len -= 1;
                 // SAFETY: the previous length proved this slot initialized;
-                // T: Copy permits reading without changing drop obligations.
+                // lowering len transfers its unique ownership to the result.
                 Ok(Some(unsafe { values[*len as usize].assume_init_read() }))
             }
             SmallStorage::Heap(values) => values.pop_in(arena),
         }
     }
 
-    /// Reduce the logical length without reclaiming arena storage.
+    /// Drop initialized values after `len`.
     pub fn truncate(&mut self, len: usize) {
         match &mut self.storage {
-            SmallStorage::Inline { len: current, .. } => {
-                *current = (*current as usize).min(len) as u32;
+            SmallStorage::Inline {
+                len: current,
+                values,
+            } => {
+                while (*current as usize) > len {
+                    *current -= 1;
+                    // SAFETY: the length is reduced before the destructor is
+                    // called, so unwinding cannot drop this element twice.
+                    unsafe { values[*current as usize].assume_init_drop() };
+                }
             }
             SmallStorage::Heap(values) => values.truncate(len),
         }
     }
 
-    /// Clear all values while retaining the current representation.
+    /// Drop all values while retaining the current representation.
     pub fn clear(&mut self) {
         self.truncate(0);
     }
 
     fn promote(&mut self, required: usize, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        if matches!(self.storage, SmallStorage::Heap(_)) {
-            if let SmallStorage::Heap(values) = &mut self.storage {
-                return values.reserve_in(required.saturating_sub(values.len()), arena);
-            }
+        if let SmallStorage::Heap(values) = &mut self.storage {
+            return values.reserve_in(required.saturating_sub(values.len()), arena);
         }
+
         let inline_len = self.len();
         let grown = N.saturating_mul(2).max(4);
         let capacity = required.max(grown);
         let mut replacement = CompactVec::with_capacity_in(capacity, arena)?;
-        if let SmallStorage::Inline { values, .. } = &self.storage {
-            for value in values.iter().take(inline_len) {
-                // SAFETY: inline_len is advanced only after this slot is written.
-                let value = unsafe { value.assume_init() };
-                replacement.push_in(value, arena)?;
+        if let SmallStorage::Inline { len, values } = &mut self.storage {
+            if let Some(allocation) = replacement.allocation_mut() {
+                // SAFETY: the inline length is the initialized prefix. The
+                // destination was allocated with capacity >= inline_len.
+                unsafe {
+                    allocation.move_from_uninit_slice(values.as_mut_ptr(), inline_len)?;
+                }
             }
+            *len = 0;
         }
         self.storage = SmallStorage::Heap(replacement);
         Ok(())
     }
 }
+
+impl<T: CompactValue, const N: usize> Drop for CompactSmallVec<'_, T, N> {
+    fn drop(&mut self) {
+        if let SmallStorage::Inline { len, values } = &mut self.storage {
+            while *len != 0 {
+                *len -= 1;
+                // SAFETY: the stored prefix is initialized and len is reduced
+                // before each destructor invocation.
+                unsafe { ptr::drop_in_place(values[*len as usize].as_mut_ptr()) };
+            }
+        }
+    }
+}
+
+// SAFETY: all owned values move with the wrapper, and the explicit Drop impl
+// destroys inline values while the heap variant owns a CompactVec token.
+unsafe impl<T: CompactValue, const N: usize> CompactValue for CompactSmallVec<'_, T, N> {}

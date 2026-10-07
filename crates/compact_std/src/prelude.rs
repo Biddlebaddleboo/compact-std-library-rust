@@ -2,7 +2,7 @@
 
 pub use crate::{
     arena, compact, Arena, Box, CollectionError, CompactBitVec, CompactEnum, CompactInterner,
-    CompactOption, CompactSlab, CompactSmallVec, CoreError, InternId, Result, SlabHandle, StdArena,
-    StdBacking, String, Vec,
+    CompactOption, CompactSlab, CompactSmallVec, CompactValue, CoreError, InternId, Result,
+    SlabHandle, StdArena, StdBacking, String, Vec,
 };
-pub use compact_core::{Offset32, OffsetSlice32};
+pub use compact_core::{ArenaAllocation, Offset32, OffsetSlice32};

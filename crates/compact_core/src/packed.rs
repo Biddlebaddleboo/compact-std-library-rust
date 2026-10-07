@@ -7,9 +7,32 @@ use crate::{Error, Result};
 /// Bit zero is the least significant bit of `bytes[0]`. Fields may cross byte
 /// boundaries. A zero-width field reads as zero when `bit_offset` is in the
 /// inclusive range `0..=bytes.len() * 8`.
+#[inline]
 pub fn read_bits(bytes: &[u8], bit_offset: usize, width: u8) -> Result<u64> {
     let total_bits = bytes.len().checked_mul(8).ok_or(Error::OffsetOverflow)?;
     validate_byte_bit_range(total_bits, bit_offset, width)?;
+    if width == 0 {
+        return Ok(0);
+    }
+    if width == 1 {
+        return Ok(u64::from(
+            bytes[bit_offset / 8] & (1 << (bit_offset % 8)) != 0,
+        ));
+    }
+    let first_byte = bit_offset / 8;
+    let intra = bit_offset % 8;
+    let bytes_needed = (intra + width as usize).div_ceil(8);
+    if bytes_needed == 1 {
+        return Ok(((bytes[first_byte] >> intra) as u64) & low_mask(width));
+    }
+    if bytes_needed <= 8 {
+        let word = load_lsb_span(&bytes[first_byte..first_byte + bytes_needed]);
+        let mask = low_mask(width);
+        return Ok((word >> intra) & mask);
+    }
+
+    // A 64-bit field at a nonzero intra-byte offset spans nine bytes. Keep a
+    // simple fallback for this uncommon edge case rather than truncating it.
     let mut value = 0_u64;
     for index in 0..width as usize {
         let position = bit_offset + index;
@@ -22,19 +45,47 @@ pub fn read_bits(bytes: &[u8], bit_offset: usize, width: u8) -> Result<u64> {
 
 /// Write up to 64 LSB-first bits to an initialized byte range, preserving
 /// every bit outside the selected field.
+#[inline]
 pub fn write_bits(bytes: &mut [u8], bit_offset: usize, width: u8, value: u64) -> Result<()> {
     let total_bits = bytes.len().checked_mul(8).ok_or(Error::OffsetOverflow)?;
     validate_byte_bit_range(total_bits, bit_offset, width)?;
-    let value_mask = if width == 64 {
-        u64::MAX
-    } else if width == 0 {
-        0
-    } else {
-        (1_u64 << width) - 1
-    };
+    let value_mask = low_mask(width);
     if value & !value_mask != 0 {
         return Err(Error::ValueDoesNotFit);
     }
+    if width == 0 {
+        return Ok(());
+    }
+    if width == 1 {
+        let mask = 1_u8 << (bit_offset % 8);
+        let byte = &mut bytes[bit_offset / 8];
+        if value == 0 {
+            *byte &= !mask;
+        } else {
+            *byte |= mask;
+        }
+        return Ok(());
+    }
+    let first_byte = bit_offset / 8;
+    let intra = bit_offset % 8;
+    let bytes_needed = (intra + width as usize).div_ceil(8);
+    if bytes_needed == 1 {
+        let mask = (value_mask << intra) as u8;
+        let byte = &mut bytes[first_byte];
+        *byte = (*byte & !mask) | (((value << intra) as u8) & mask);
+        return Ok(());
+    }
+    if bytes_needed <= 8 {
+        let span = &mut bytes[first_byte..first_byte + bytes_needed];
+        let old = load_lsb_span(span);
+        let field_mask = value_mask << intra;
+        let updated = (old & !field_mask) | ((value << intra) & field_mask);
+        store_lsb_span(span, updated);
+        return Ok(());
+    }
+
+    // A 64-bit field starting mid-byte spans nine bytes; preserve the existing
+    // correct fallback for that shape.
     for index in 0..width as usize {
         let position = bit_offset + index;
         let mask = 1_u8 << (position % 8);
@@ -46,6 +97,40 @@ pub fn write_bits(bytes: &mut [u8], bit_offset: usize, width: u8, value: u64) ->
         }
     }
     Ok(())
+}
+
+#[inline]
+fn low_mask(width: u8) -> u64 {
+    match width {
+        0 => 0,
+        64 => u64::MAX,
+        _ => (1_u64 << width) - 1,
+    }
+}
+
+#[inline]
+fn load_lsb_span(bytes: &[u8]) -> u64 {
+    debug_assert!(bytes.len() <= 8);
+    let mut native = [0_u8; 8];
+    #[cfg(target_endian = "little")]
+    native[..bytes.len()].copy_from_slice(bytes);
+    #[cfg(target_endian = "big")]
+    for (index, byte) in bytes.iter().rev().enumerate() {
+        native[8 - bytes.len() + index] = *byte;
+    }
+    u64::from_ne_bytes(native)
+}
+
+#[inline]
+fn store_lsb_span(bytes: &mut [u8], value: u64) {
+    debug_assert!(bytes.len() <= 8);
+    let native = value.to_ne_bytes();
+    #[cfg(target_endian = "little")]
+    bytes.copy_from_slice(&native[..bytes.len()]);
+    #[cfg(target_endian = "big")]
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = native[7 - index];
+    }
 }
 
 fn validate_byte_bit_range(total_bits: usize, offset: usize, width: u8) -> Result<()> {

@@ -13,9 +13,9 @@ pub use compact_collections::{
 };
 pub use compact_core::{
     bits_required, checked_align_up, read_bits, smallest_word, validate_bit_range, write_bits,
-    Arena, BitField, ByteRange32, CompactAbiVersion, Error as CoreError, Offset32, OffsetSlice32,
-    PackedWord, StableBacking, StorageWord, ABI_V1, MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET,
-    OFFSET_WIDTH_BYTES,
+    Arena, ArenaAllocation, BitField, ByteRange32, CompactAbiVersion, CompactValue,
+    Error as CoreError, Offset32, OffsetSlice32, PackedWord, StableBacking, StorageWord, ABI_V1,
+    MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
 };
 pub use compact_macros::{arena, compact};
 

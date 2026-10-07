@@ -7,6 +7,7 @@
 //! create a scoped arena over a backend-provided stable memory region.
 
 mod abi;
+mod allocation;
 mod arena;
 mod backing;
 mod bytes;
@@ -19,6 +20,7 @@ mod packed;
 pub use abi::{
     CompactAbiVersion, ABI_V1, MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
 };
+pub use allocation::{ArenaAllocation, CompactValue};
 pub use arena::{with_arena, Arena};
 pub use backing::StableBacking;
 pub use bytes::ByteRange32;

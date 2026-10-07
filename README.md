@@ -17,9 +17,17 @@ does not replace Rust's standard library or process allocator.
 - `compact_std` re-exports the runtime, collections, macros, and prelude.
 
 One arena addresses at most 2^32 bytes. Offset zero remains the null sentinel,
-`Offset32<T>` remains four bytes, and the core stays backend-independent. Arena
-allocations use `Copy` values so native destructors are never silently skipped.
-Compact strings and collections own only arena-relative byte storage.
+`Offset32<T>` remains four bytes, and the core stays backend-independent. A
+reusable free-range list coalesces released blocks and extends tail allocations
+in place where possible. Allocation headers occupy sixteen bytes in the arena;
+free ranges store an eight-byte link in their released payload.
+
+Owning containers accept values implementing the unsafe `CompactValue`
+contract. Implementors must be safely movable between slots, must not depend
+on their address, and must be destructible while the backing remains alive.
+Primitive values and generated compact handles are supported directly. Custom
+types need an explicit `unsafe impl CompactValue` after checking that contract.
+Owning wrappers run destructors and release their allocation when dropped.
 
 ## Regular Rust style
 
@@ -46,14 +54,20 @@ inside its block. It does not install ambient state. `vec![]` is rejected in
 an arena block because it would allocate a native `Vec`; use `Vec::new()` and
 `push` instead.
 
-`CompactVec<T>` has twelve-byte offset/length/capacity metadata and requires
-`T: Copy`. Capacity doubles on growth; because a monotonic arena cannot reclaim
-old buffers, total vector payload allocations remain below twice the final
-capacity. `CompactSmallVec<T, N>` keeps up to `N` values in its own inline
-storage, then promotes to a compact arena vector. `CompactString` stores up to
-twelve UTF-8 bytes inline in a sixteen-byte handle and grows into initialized
-arena byte storage. Borrowed `&[T]`,
-`&[u8]`, and `&str` views are zero-copy and scoped to arena borrows.
+`CompactVec<T>` stores a sixteen-byte owner token; length and capacity live in
+its arena allocation header. Geometric growth moves non-`Copy` values safely,
+and old buffers are reclaimed or extended in place. `pop`, `truncate`, `clear`,
+and drop preserve ordinary destructor ownership. `CompactSmallVec<T, N>` keeps
+up to `N` values inline, then moves them into an arena vector. `CompactString`
+keeps its twelve-byte inline payload and owns a reclaimable byte buffer after
+promotion; its handle is twenty-four bytes. `CompactSlab` drops every occupied
+value and uses an allocation identity in addition to slot generations so a
+handle cannot become valid after its slab's storage is reused. Borrowed
+`&[T]`, `&[u8]`, and `&str` views are tied to both their wrapper and arena.
+
+Packed field reads and writes use byte-span scalar paths for fields spanning
+up to eight bytes, with a reference fallback for the nine-byte 64-bit edge
+case.
 
 ## Generated compact layouts
 

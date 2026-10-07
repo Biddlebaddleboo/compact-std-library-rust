@@ -1,9 +1,9 @@
 //! Dense fixed-capacity slab with reusable slots and generation-checked handles.
 
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
+use core::mem::ManuallyDrop;
 
-use compact_core::{Arena, OffsetSlice32};
+use compact_core::{Arena, ArenaAllocation, CompactValue};
 
 use crate::{CollectionError, Result};
 
@@ -12,29 +12,68 @@ const OCCUPIED: u32 = 1 << 31;
 const GENERATION_MASK: u32 = OCCUPIED - 1;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-union SlotPayload<T: Copy> {
-    value: MaybeUninit<T>,
+union SlotPayload<T: CompactValue> {
+    value: ManuallyDrop<T>,
     next_free: u32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct Slot<T: Copy> {
+struct Slot<T: CompactValue> {
     state: u32,
     payload: SlotPayload<T>,
 }
 
-/// A slab handle carrying slot index, generation, and owning slab offset.
+impl<T: CompactValue> Drop for Slot<T> {
+    fn drop(&mut self) {
+        if self.state & OCCUPIED != 0 {
+            // SAFETY: the occupied state is published only after the value
+            // union arm is initialized, and is cleared before moving it out.
+            unsafe { ManuallyDrop::drop(&mut self.payload.value) };
+        }
+    }
+}
+
+// SAFETY: a Slot moves its value arm together with occupancy metadata. Its
+// Drop implementation handles the live union arm exactly once.
+unsafe impl<T: CompactValue> CompactValue for Slot<T> {}
+
+/// A slab handle carrying slot index, generation, and unique slab identity.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlabHandle<'arena, T> {
-    owner_offset: u32,
+    owner_id: u32,
     index: u32,
     generation: u32,
     marker: PhantomData<fn(&'arena mut ()) -> &'arena mut ()>,
     type_marker: PhantomData<fn(T) -> T>,
 }
+
+impl<T> Copy for SlabHandle<'_, T> {}
+
+impl<T> Clone for SlabHandle<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> core::fmt::Debug for SlabHandle<'_, T> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SlabHandle")
+            .field("owner_id", &self.owner_id)
+            .field("index", &self.index)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl<T> PartialEq for SlabHandle<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.owner_id, self.index, self.generation)
+            == (other.owner_id, other.index, other.generation)
+    }
+}
+
+impl<T> Eq for SlabHandle<'_, T> {}
 
 impl<T> SlabHandle<'_, T> {
     /// Return the zero-based slot index.
@@ -50,44 +89,40 @@ impl<T> SlabHandle<'_, T> {
 
 /// A dense fixed-capacity arena-local slab.
 ///
-/// Slot handles reject stale generations and handles from another slab.
-/// Generation exhaustion retires a slot instead of allowing an ABA handle
-/// collision. The slab accepts `Copy` values and never runs native drops.
-pub struct CompactSlab<'arena, T: Copy> {
-    storage: OffsetSlice32<'arena, MaybeUninit<Slot<T>>>,
+/// Handles reject stale slot generations, handles from another slab, and
+/// handles whose former allocation was reclaimed and reused. Dropping the slab
+/// drops every occupied value and reclaims its backing.
+pub struct CompactSlab<'arena, T: CompactValue> {
+    storage: Option<ArenaAllocation<'arena, Slot<T>>>,
     free_head: u32,
     len: u32,
 }
 
-impl<'arena, T: Copy> CompactSlab<'arena, T> {
+impl<'arena, T: CompactValue> CompactSlab<'arena, T> {
     /// Allocate a slab and initialize its free-list links.
     pub fn with_capacity_in(capacity: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
         let capacity = u32::try_from(capacity).map_err(|_| CollectionError::CapacityOverflow)?;
         if capacity == 0 {
             return Ok(Self {
-                storage: OffsetSlice32::empty(),
+                storage: None,
                 free_head: NONE,
                 len: 0,
             });
         }
-        let storage = arena.alloc_uninit_slice::<Slot<T>>(capacity as usize)?;
+        let mut storage = arena.alloc_owned_slice::<Slot<T>>(capacity as usize)?;
         for index in 0..capacity {
             let next_free = if index + 1 == capacity {
                 NONE
             } else {
                 index + 1
             };
-            arena.write_uninit_at(
-                storage,
-                index as usize,
-                Slot {
-                    state: 0,
-                    payload: SlotPayload { next_free },
-                },
-            )?;
+            storage.push(Slot {
+                state: 0,
+                payload: SlotPayload { next_free },
+            })?;
         }
         Ok(Self {
-            storage,
+            storage: Some(storage),
             free_head: 0,
             len: 0,
         })
@@ -99,8 +134,8 @@ impl<'arena, T: Copy> CompactSlab<'arena, T> {
     }
 
     /// Return the total slot capacity.
-    pub const fn capacity(&self) -> usize {
-        self.storage.len()
+    pub fn capacity(&self) -> usize {
+        self.storage.as_ref().map_or(0, ArenaAllocation::capacity)
     }
 
     /// Return whether every slot is vacant.
@@ -114,32 +149,34 @@ impl<'arena, T: Copy> CompactSlab<'arena, T> {
         value: T,
         arena: &mut Arena<'arena, '_>,
     ) -> Result<Option<SlabHandle<'arena, T>>> {
-        if self.free_head == NONE {
+        let Some(storage) = &mut self.storage else {
             return Ok(None);
-        }
-        // SAFETY: every slot is initialized during construction and remains a
-        // valid Slot; mutation is exclusive through `arena`.
-        let slots = unsafe { arena.get_slice_mut_assume_init(self.storage, self.capacity())? };
+        };
+        arena.validate_owned(storage)?;
+        let owner_id = storage.allocation_id();
+        let slots = storage.as_mut_slice();
         loop {
             let index = self.free_head;
             if index == NONE {
                 return Ok(None);
             }
-            // SAFETY: vacant slots store an initialized `next_free` union arm.
-            let next = unsafe { slots[index as usize].payload.next_free };
-            let generation = slots[index as usize].state & GENERATION_MASK;
+            let slot = &mut slots[index as usize];
+            // SAFETY: vacant slots store an initialized next_free arm.
+            let next = unsafe { slot.payload.next_free };
+            let generation = slot.state & GENERATION_MASK;
             self.free_head = next;
             if generation == GENERATION_MASK {
-                // Retire this slot so a stale handle can never become valid
-                // after generation wraparound.
+                // Retire a slot before its generation would wrap.
                 continue;
             }
             let generation = generation + 1;
-            slots[index as usize].state = OCCUPIED | generation;
-            slots[index as usize].payload.value = MaybeUninit::new(value);
+            slot.payload = SlotPayload {
+                value: ManuallyDrop::new(value),
+            };
+            slot.state = OCCUPIED | generation;
             self.len += 1;
             return Ok(Some(SlabHandle {
-                owner_offset: self.storage.offset().as_u32(),
+                owner_id,
                 index,
                 generation,
                 marker: PhantomData,
@@ -150,36 +187,26 @@ impl<'arena, T: Copy> CompactSlab<'arena, T> {
 
     /// Borrow the value named by `handle`, rejecting stale or foreign handles.
     pub fn get<'view>(
-        &self,
+        &'view self,
         handle: SlabHandle<'arena, T>,
         arena: &'view Arena<'arena, '_>,
     ) -> Result<&'view T> {
         let slot = self.checked_slot(handle, arena)?;
-        // SAFETY: checked_slot confirms occupied state and matching generation;
-        // occupied slots initialize the value union arm before publishing it.
-        Ok(unsafe { slot.payload.value.assume_init_ref() })
+        // SAFETY: checked_slot confirms an occupied slot and matching handle.
+        Ok(unsafe { &*((&slot.payload.value as *const ManuallyDrop<T>).cast::<T>()) })
     }
 
     /// Mutably borrow the value named by `handle`.
     pub fn get_mut<'view>(
-        &self,
+        &'view mut self,
         handle: SlabHandle<'arena, T>,
         arena: &'view mut Arena<'arena, '_>,
     ) -> Result<&'view mut T> {
-        if handle.owner_offset != self.storage.offset().as_u32()
-            || handle.index >= self.capacity() as u32
-        {
-            return Err(CollectionError::StaleHandle);
-        }
-        // SAFETY: every slot is initialized and the exclusive arena borrow
-        // guarantees unique access to the occupied slot.
-        let slots = unsafe { arena.get_slice_mut_assume_init(self.storage, self.capacity())? };
-        let slot = &mut slots[handle.index as usize];
-        if slot.state & OCCUPIED == 0 || slot.state & GENERATION_MASK != handle.generation {
-            return Err(CollectionError::StaleHandle);
-        }
-        // SAFETY: occupied slots contain a valid initialized T value.
-        Ok(unsafe { slot.payload.value.assume_init_mut() })
+        self.validate_handle(handle, arena)?;
+        let storage = self.storage.as_mut().expect("validated slab has storage");
+        let slot = &mut storage.as_mut_slice()[handle.index as usize];
+        // SAFETY: the validated occupied slot is exclusively borrowed.
+        Ok(unsafe { &mut *((&mut slot.payload.value as *mut ManuallyDrop<T>).cast::<T>()) })
     }
 
     /// Remove a value and make its slot available for reuse.
@@ -188,51 +215,56 @@ impl<'arena, T: Copy> CompactSlab<'arena, T> {
         handle: SlabHandle<'arena, T>,
         arena: &mut Arena<'arena, '_>,
     ) -> Result<T> {
-        if handle.owner_offset != self.storage.offset().as_u32()
-            || handle.index >= self.capacity() as u32
-        {
-            return Err(CollectionError::StaleHandle);
-        }
-        // SAFETY: every slot is initialized during construction.
-        let slots = unsafe { arena.get_slice_mut_assume_init(self.storage, self.capacity())? };
+        self.validate_handle(handle, arena)?;
+        let storage = self.storage.as_mut().expect("validated slab has storage");
+        let slots = storage.as_mut_slice();
         let slot = &mut slots[handle.index as usize];
-        if slot.state & OCCUPIED == 0 || slot.state & GENERATION_MASK != handle.generation {
-            return Err(CollectionError::StaleHandle);
-        }
-        // SAFETY: the occupied state guarantees the value arm is initialized;
-        // T: Copy means reading it does not transfer a destructor obligation.
-        let value = unsafe { slot.payload.value.assume_init_read() };
-        let generation = slot.state & GENERATION_MASK;
-        slot.state = generation;
-        // SAFETY: after changing to vacant state, the free-list link arm is
-        // initialized before the slot is made reachable from free_head.
-        if generation == GENERATION_MASK {
-            slot.payload.next_free = NONE;
+        // SAFETY: the occupied state proves the value arm is initialized. The
+        // value is moved out and state changes before the slot is reused.
+        let value = unsafe { ManuallyDrop::take(&mut slot.payload.value) };
+        slot.state = handle.generation;
+        if handle.generation == GENERATION_MASK {
+            slot.payload = SlotPayload { next_free: NONE };
         } else {
-            slot.payload.next_free = self.free_head;
+            slot.payload = SlotPayload {
+                next_free: self.free_head,
+            };
             self.free_head = handle.index;
         }
         self.len -= 1;
         Ok(value)
     }
 
-    fn checked_slot<'view>(
+    fn validate_handle(
         &self,
         handle: SlabHandle<'arena, T>,
-        arena: &'view Arena<'arena, '_>,
-    ) -> Result<&'view Slot<T>> {
-        if handle.owner_offset != self.storage.offset().as_u32()
-            || handle.index >= self.capacity() as u32
-        {
+        arena: &Arena<'arena, '_>,
+    ) -> Result<()> {
+        let Some(storage) = &self.storage else {
+            return Err(CollectionError::StaleHandle);
+        };
+        arena.validate_owned(storage)?;
+        if handle.owner_id != storage.allocation_id() || handle.index >= storage.capacity() as u32 {
             return Err(CollectionError::StaleHandle);
         }
-        // SAFETY: every slot is initialized and shared access is sufficient
-        // because the returned value is only immutably borrowed.
-        let slots = unsafe { arena.get_slice_assume_init(self.storage, self.capacity())? };
-        let slot = &slots[handle.index as usize];
+        let slot = &storage.as_slice()[handle.index as usize];
         if slot.state & OCCUPIED == 0 || slot.state & GENERATION_MASK != handle.generation {
             return Err(CollectionError::StaleHandle);
         }
-        Ok(slot)
+        Ok(())
+    }
+
+    fn checked_slot<'view>(
+        &'view self,
+        handle: SlabHandle<'arena, T>,
+        arena: &'view Arena<'arena, '_>,
+    ) -> Result<&'view Slot<T>> {
+        self.validate_handle(handle, arena)?;
+        let storage = self.storage.as_ref().expect("validated slab has storage");
+        Ok(&storage.as_slice()[handle.index as usize])
     }
 }
+
+// SAFETY: moving the slab transfers its unique allocation token; occupied
+// values move with their slot metadata and are dropped by Slot::drop.
+unsafe impl<T: CompactValue> CompactValue for CompactSlab<'_, T> {}

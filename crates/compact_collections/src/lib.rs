@@ -1,9 +1,9 @@
 //! Compact ownership wrappers and collections for [`compact_core`] arenas.
 //!
-//! Values stored by the generic containers implement `Copy`. This keeps the
-//! arena's reset-at-scope-end model explicit and avoids silently skipping
-//! native destructors. Compact strings and byte collections manage only
-//! arena-relative byte allocations.
+//! Generic owning containers require [`compact_core::CompactValue`], an unsafe
+//! contract for values that can move between arena slots and be destroyed
+//! while their arena backing remains alive. Owning allocation tokens reclaim
+//! their storage on drop.
 
 mod bitvec;
 mod boxed;

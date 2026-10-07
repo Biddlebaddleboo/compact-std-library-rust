@@ -1,21 +1,26 @@
-//! Compact UTF-8 string with a twelve-byte inline representation.
+//! Compact UTF-8 string with a twelve-byte inline payload.
 
-use compact_core::{Arena, ByteRange32};
+use compact_core::{Arena, ArenaAllocation, CompactValue};
 
 use crate::{CollectionError, Result};
 
 const INLINE_CAPACITY: usize = 12;
-const HEAP_TAG: u32 = u32::MAX;
+
+enum StringRepr<'arena> {
+    Inline {
+        len: u8,
+        bytes: [u8; INLINE_CAPACITY],
+    },
+    Heap(ArenaAllocation<'arena, u8>),
+}
 
 /// An arena-backed UTF-8 string with twelve inline bytes.
 ///
-/// The representation occupies sixteen bytes: a four-byte mode/length header
-/// and twelve payload bytes. Inline strings allocate nothing. Long strings
-/// store an arena offset, length, and capacity in those payload bytes.
+/// Inline strings allocate nothing. Long strings own a reclaimable byte
+/// allocation; growth preserves the old string if replacement allocation
+/// fails, and dropping the string releases heap storage.
 pub struct CompactString<'arena> {
-    tag: u32,
-    payload: [u8; INLINE_CAPACITY],
-    marker: core::marker::PhantomData<fn(&'arena mut ()) -> &'arena mut ()>,
+    repr: StringRepr<'arena>,
 }
 
 impl<'arena> CompactString<'arena> {
@@ -27,31 +32,37 @@ impl<'arena> CompactString<'arena> {
     /// Construct an empty inline string without arena allocation.
     pub const fn empty() -> Self {
         Self {
-            tag: 0,
-            payload: [0; INLINE_CAPACITY],
-            marker: core::marker::PhantomData,
+            repr: StringRepr::Inline {
+                len: 0,
+                bytes: [0; INLINE_CAPACITY],
+            },
         }
     }
 
     /// Copy a UTF-8 string into compact arena storage.
     pub fn from_str_in(value: &str, arena: &mut Arena<'arena, '_>) -> Result<Self> {
         if value.len() <= INLINE_CAPACITY {
-            let mut result = Self::empty();
-            result.tag = value.len() as u32;
-            result.payload[..value.len()].copy_from_slice(value.as_bytes());
-            return Ok(result);
+            let mut bytes = [0; INLINE_CAPACITY];
+            bytes[..value.len()].copy_from_slice(value.as_bytes());
+            return Ok(Self {
+                repr: StringRepr::Inline {
+                    len: value.len() as u8,
+                    bytes,
+                },
+            });
         }
-        let range = arena.alloc_zeroed_bytes(value.len())?;
-        arena.get_bytes_mut(range)?[..value.len()].copy_from_slice(value.as_bytes());
-        Ok(Self::heap(range, value.len(), value.len()))
+        let mut allocation = arena.alloc_owned_slice::<u8>(value.len())?;
+        allocation.extend_copy(value.as_bytes())?;
+        Ok(Self {
+            repr: StringRepr::Heap(allocation),
+        })
     }
 
     /// Return the UTF-8 byte length.
     pub fn len(&self) -> usize {
-        if self.is_heap() {
-            self.heap_len()
-        } else {
-            self.tag as usize
+        match &self.repr {
+            StringRepr::Inline { len, .. } => *len as usize,
+            StringRepr::Heap(allocation) => allocation.len(),
         }
     }
 
@@ -62,20 +73,20 @@ impl<'arena> CompactString<'arena> {
 
     /// Return the current storage capacity in bytes.
     pub fn capacity(&self) -> usize {
-        if self.is_heap() {
-            self.heap_capacity()
-        } else {
-            INLINE_CAPACITY
+        match &self.repr {
+            StringRepr::Inline { .. } => INLINE_CAPACITY,
+            StringRepr::Heap(allocation) => allocation.capacity(),
         }
     }
 
     /// Borrow the exact initialized UTF-8 bytes.
     pub fn as_bytes<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<&'view [u8]> {
-        if self.is_heap() {
-            let range = self.heap_range();
-            Ok(&arena.get_bytes(range)?[..self.heap_len()])
-        } else {
-            Ok(&self.payload[..self.tag as usize])
+        match &self.repr {
+            StringRepr::Inline { len, bytes } => Ok(&bytes[..*len as usize]),
+            StringRepr::Heap(allocation) => {
+                arena.validate_owned(allocation)?;
+                Ok(allocation.as_slice())
+            }
         }
     }
 
@@ -94,31 +105,39 @@ impl<'arena> CompactString<'arena> {
             .checked_add(value.len())
             .ok_or(CollectionError::CapacityOverflow)?;
 
-        if !self.is_heap() && required <= INLINE_CAPACITY {
-            self.payload[old_len..required].copy_from_slice(value.as_bytes());
-            self.tag = required as u32;
-            return Ok(());
+        if let StringRepr::Inline { len, bytes } = &mut self.repr {
+            if required <= INLINE_CAPACITY {
+                bytes[old_len..required].copy_from_slice(value.as_bytes());
+                *len = required as u8;
+                return Ok(());
+            }
         }
 
-        if self.is_heap() && required <= self.heap_capacity() {
-            let range = self.heap_range();
-            arena.get_bytes_mut(range)?[old_len..required].copy_from_slice(value.as_bytes());
-            self.set_heap_len(required);
-            return Ok(());
+        if let StringRepr::Heap(allocation) = &mut self.repr {
+            arena.validate_owned(allocation)?;
+            if required <= allocation.capacity() {
+                allocation.extend_copy(value.as_bytes())?;
+                return Ok(());
+            }
+            let new_capacity = required.max(allocation.capacity().saturating_mul(2).max(16));
+            if arena.try_resize_owned(allocation, new_capacity)? {
+                allocation.extend_copy(value.as_bytes())?;
+                return Ok(());
+            }
         }
 
-        let old_capacity = self.capacity();
-        let new_capacity = required.max(old_capacity.saturating_mul(2).max(16));
-        let replacement = arena.alloc_zeroed_bytes(new_capacity)?;
-        if self.is_heap() {
-            // The replacement allocation is newer and disjoint from the
-            // existing string. Core performs the copy under one arena borrow.
-            arena.copy_bytes(self.heap_range(), replacement, old_len)?;
-        } else if old_len != 0 {
-            arena.get_bytes_mut(replacement)?[..old_len].copy_from_slice(&self.payload[..old_len]);
+        let new_capacity = required.max(self.capacity().saturating_mul(2).max(16));
+        let mut replacement = arena.alloc_owned_slice::<u8>(new_capacity)?;
+        match &self.repr {
+            StringRepr::Inline { len, bytes } => {
+                replacement.extend_copy(&bytes[..*len as usize])?;
+            }
+            StringRepr::Heap(allocation) => {
+                replacement.extend_copy(allocation.as_slice())?;
+            }
         }
-        arena.get_bytes_mut(replacement)?[old_len..required].copy_from_slice(value.as_bytes());
-        *self = Self::heap(replacement, required, new_capacity);
+        replacement.extend_copy(value.as_bytes())?;
+        self.repr = StringRepr::Heap(replacement);
         Ok(())
     }
 
@@ -128,9 +147,12 @@ impl<'arena> CompactString<'arena> {
         self.push_str_in(value.encode_utf8(&mut encoded), arena)
     }
 
-    /// Clear the string and return it to the empty inline representation.
+    /// Clear the string while retaining any heap allocation for reuse.
     pub fn clear(&mut self) {
-        *self = Self::empty();
+        match &mut self.repr {
+            StringRepr::Inline { len, .. } => *len = 0,
+            StringRepr::Heap(allocation) => allocation.truncate(0),
+        }
     }
 
     /// Truncate at a UTF-8 character boundary.
@@ -143,13 +165,43 @@ impl<'arena> CompactString<'arena> {
             return Err(CollectionError::Core(compact_core::Error::OutOfBounds));
         }
         if new_len <= INLINE_CAPACITY {
-            let mut inline = [0; INLINE_CAPACITY];
-            inline[..new_len].copy_from_slice(&value.as_bytes()[..new_len]);
-            self.payload = inline;
-            self.tag = new_len as u32;
+            let mut bytes = [0; INLINE_CAPACITY];
+            bytes[..new_len].copy_from_slice(&value.as_bytes()[..new_len]);
+            self.repr = StringRepr::Inline {
+                len: new_len as u8,
+                bytes,
+            };
             return Ok(());
         }
-        self.set_heap_len(new_len);
+        if let StringRepr::Heap(allocation) = &mut self.repr {
+            allocation.truncate(new_len);
+        }
+        Ok(())
+    }
+
+    /// Release unused heap capacity while retaining the string contents.
+    pub fn shrink_to_fit_in(&mut self, arena: &mut Arena<'arena, '_>) -> Result<()> {
+        if self.len() <= INLINE_CAPACITY {
+            if let StringRepr::Heap(allocation) = &self.repr {
+                arena.validate_owned(allocation)?;
+                let mut bytes = [0; INLINE_CAPACITY];
+                bytes[..allocation.len()].copy_from_slice(allocation.as_slice());
+                let len = allocation.len() as u8;
+                self.repr = StringRepr::Inline { len, bytes };
+            }
+            return Ok(());
+        }
+        let StringRepr::Heap(allocation) = &mut self.repr else {
+            return Ok(());
+        };
+        arena.validate_owned(allocation)?;
+        let len = allocation.len();
+        if arena.try_resize_owned(allocation, len)? {
+            return Ok(());
+        }
+        let mut replacement = arena.alloc_owned_slice::<u8>(len)?;
+        replacement.extend_copy(allocation.as_slice())?;
+        self.repr = StringRepr::Heap(replacement);
         Ok(())
     }
 
@@ -157,40 +209,8 @@ impl<'arena> CompactString<'arena> {
     pub fn eq_str(&self, other: &str, arena: &Arena<'arena, '_>) -> Result<bool> {
         Ok(self.as_str(arena)? == other)
     }
-
-    fn is_heap(&self) -> bool {
-        self.tag == HEAP_TAG
-    }
-
-    fn heap(range: ByteRange32<'arena>, len: usize, capacity: usize) -> Self {
-        let mut result = Self {
-            tag: HEAP_TAG,
-            payload: [0; INLINE_CAPACITY],
-            marker: core::marker::PhantomData,
-        };
-        result.payload[..4].copy_from_slice(&range.offset().to_ne_bytes());
-        result.payload[4..8].copy_from_slice(&(len as u32).to_ne_bytes());
-        result.payload[8..12].copy_from_slice(&(capacity as u32).to_ne_bytes());
-        result
-    }
-
-    fn heap_range(&self) -> ByteRange32<'arena> {
-        let offset = u32::from_ne_bytes(self.payload[..4].try_into().unwrap());
-        let capacity = self.heap_capacity() as u32;
-        // SAFETY: private heap metadata is written only from a valid
-        // zero-initialized byte allocation returned by the same arena.
-        unsafe { ByteRange32::from_raw_parts_unchecked(offset, capacity) }
-    }
-
-    fn heap_len(&self) -> usize {
-        u32::from_ne_bytes(self.payload[4..8].try_into().unwrap()) as usize
-    }
-
-    fn heap_capacity(&self) -> usize {
-        u32::from_ne_bytes(self.payload[8..12].try_into().unwrap()) as usize
-    }
-
-    fn set_heap_len(&mut self, len: usize) {
-        self.payload[4..8].copy_from_slice(&(len as u32).to_ne_bytes());
-    }
 }
+
+// SAFETY: the inline bytes move with the wrapper and heap storage is a unique
+// ArenaAllocation token whose bytes have no address-sensitive state.
+unsafe impl CompactValue for CompactString<'_> {}

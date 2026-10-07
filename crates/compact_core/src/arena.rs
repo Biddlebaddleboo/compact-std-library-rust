@@ -1,10 +1,15 @@
-//! Scoped, stable-address bump arena.
+//! Scoped, stable-address arena with reusable owned allocations.
 
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of, MaybeUninit};
+use core::ptr::NonNull;
 
+use crate::allocation::{self, ArenaState};
 use crate::native;
-use crate::{Error, Offset32, OffsetSlice32, Result, StableBacking, MAX_ARENA_BYTES};
+use crate::{
+    ArenaAllocation, CompactValue, Error, Offset32, OffsetSlice32, Result, StableBacking,
+    MAX_ARENA_BYTES,
+};
 
 /// Run `action` with a fresh arena over `backing`.
 ///
@@ -25,16 +30,17 @@ where
         return Err(Error::BackingTooLarge);
     }
 
+    let (state, _) = ArenaState::place(region)?;
     let mut arena = Arena {
         region,
-        cursor: 1,
+        state,
         brand: PhantomData,
         not_send_sync: PhantomData,
     };
     Ok(action(&mut arena))
 }
 
-/// A scoped monotonic arena over one stable backing region.
+/// A scoped arena over one stable backing region.
 ///
 /// Construct arenas with [`with_arena`]. The two lifetimes represent the
 /// generative reference brand and the backing borrow; callers normally infer
@@ -44,11 +50,19 @@ where
 /// mutation is non-atomic.
 pub struct Arena<'arena, 'memory> {
     region: &'memory mut [MaybeUninit<u8>],
-    cursor: usize,
+    state: NonNull<ArenaState>,
     brand: PhantomData<fn(&'arena mut ()) -> &'arena mut ()>,
     // V1 arenas are single-owner and intentionally do not imply thread-safe
     // access, even when the underlying byte allocation itself is Send/Sync.
     not_send_sync: PhantomData<*mut ()>,
+}
+
+impl Drop for Arena<'_, '_> {
+    fn drop(&mut self) {
+        // SAFETY: with_arena's generative callback prevents allocations from
+        // escaping; all owners are dropped before this state header is ended.
+        unsafe { core::ptr::drop_in_place(self.state.as_ptr()) };
+    }
 }
 
 impl<'arena, 'memory> Arena<'arena, 'memory> {
@@ -57,24 +71,93 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         self.region.len()
     }
 
-    /// Return the used prefix, including the reserved null byte and alignment
-    /// padding.
+    /// Return the allocator high-water prefix, including state and alignment
+    /// metadata. Releasing a tail allocation can reduce this value.
     pub fn used_bytes(&self) -> usize {
-        self.cursor
+        // SAFETY: the state object remains in the backing for the arena scope.
+        unsafe { self.state.as_ref() }.used_bytes()
     }
 
-    /// Return the number of bytes not yet consumed by allocations.
+    /// Return total tail space plus reusable free ranges.
     pub fn remaining_bytes(&self) -> usize {
-        self.capacity() - self.cursor
+        // SAFETY: the state object remains in the backing for the arena scope.
+        unsafe { self.state.as_ref() }.remaining_bytes()
+    }
+
+    /// Allocate uninitialized storage owned by one move-only compact value.
+    ///
+    /// The returned owner tracks its initialized prefix, runs element
+    /// destructors when dropped, and returns its block to the arena free list.
+    #[doc(hidden)]
+    pub fn alloc_owned_slice<T: CompactValue>(
+        &mut self,
+        capacity: usize,
+    ) -> Result<ArenaAllocation<'arena, T>> {
+        let compact_capacity = u32::try_from(capacity).map_err(|_| Error::OffsetOverflow)?;
+        let bytes = checked_slice_bytes::<T>(capacity)?;
+        let (offset, id) = allocation::allocate(
+            self.state,
+            bytes,
+            align_of::<T>(),
+            compact_capacity,
+            0,
+            true,
+        )?;
+        Ok(ArenaAllocation::new(self.state, offset, id))
+    }
+
+    /// Allocate and initialize one arena-owned value.
+    #[doc(hidden)]
+    pub fn alloc_owned_value<T: CompactValue>(
+        &mut self,
+        value: T,
+    ) -> Result<ArenaAllocation<'arena, T>> {
+        let mut allocation = self.alloc_owned_slice::<T>(1)?;
+        allocation.push(value)?;
+        Ok(allocation)
+    }
+
+    /// Check that an owning token was created by this arena.
+    #[doc(hidden)]
+    pub fn validate_owned<T: CompactValue>(
+        &self,
+        allocation: &ArenaAllocation<'arena, T>,
+    ) -> Result<()> {
+        if !allocation.belongs_to(self.state) {
+            return Err(Error::ForeignArena);
+        }
+        let byte_len = checked_slice_bytes::<T>(allocation.capacity())?;
+        self.checked_range::<T>(allocation.raw_offset(), byte_len)?;
+        Ok(())
+    }
+
+    /// Grow or shrink an owning allocation in place when adjacent storage
+    /// permits it. Returns `false` without changing the token when relocation
+    /// is required.
+    #[doc(hidden)]
+    pub fn try_resize_owned<T: CompactValue>(
+        &mut self,
+        allocation: &mut ArenaAllocation<'arena, T>,
+        capacity: usize,
+    ) -> Result<bool> {
+        self.validate_owned(allocation)?;
+        allocation::try_resize(self.state, allocation, capacity)
     }
 
     /// Inspect the used arena prefix without claiming that any byte is
-    /// initialized. Alignment padding and uninitialized allocations remain
-    /// represented as [`MaybeUninit<u8>`](MaybeUninit).
-    pub fn used_uninit_bytes(&self) -> &[MaybeUninit<u8>] {
+    /// initialized. Alignment padding, allocator metadata, and uninitialized
+    /// allocations remain represented as [`MaybeUninit<u8>`](MaybeUninit).
+    ///
+    /// # Safety
+    ///
+    /// While the returned slice is live, no operation may allocate, resize,
+    /// or release an arena allocation. These operations can update allocator
+    /// metadata inside the returned prefix.
+    pub unsafe fn used_uninit_bytes(&self) -> &[MaybeUninit<u8>] {
         // SAFETY: the prefix is within `region`; MaybeUninit permits every
-        // initialization state and the shared arena borrow prevents mutation.
-        unsafe { core::slice::from_raw_parts(self.region.as_ptr(), self.cursor) }
+        // initialization state. The caller promises not to mutate the prefix
+        // through allocator operations while this shared view is live.
+        unsafe { core::slice::from_raw_parts(self.region.as_ptr(), self.used_bytes()) }
     }
 
     /// Allocate and initialize an exact byte range from `bytes`.
@@ -341,18 +424,22 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         ))
     }
 
-    /// Reserve uninitialized storage for one `Copy` value.
+    /// Reserve uninitialized storage for one `Copy` value accessed through a
+    /// non-owning offset.
     ///
     /// The returned type is `MaybeUninit<T>` so it cannot be resolved as an
     /// initialized `T` until [`write_uninit`](Self::write_uninit) succeeds.
-    /// V1 accepts only `Copy` values, so discarding the arena never skips a
-    /// destructor.
+    /// Use [`alloc_owned_slice`](Self::alloc_owned_slice) for values with
+    /// destructor obligations.
     pub fn alloc_uninit<T: Copy>(&mut self) -> Result<Offset32<'arena, MaybeUninit<T>>> {
         let raw = self.allocate(size_of::<T>(), align_of::<T>())?;
         Ok(Offset32::new(raw))
     }
 
-    /// Store an initialized `Copy` value in the arena.
+    /// Store an initialized `Copy` value and return a non-owning offset.
+    ///
+    /// This API does not create a destructor owner. Values with destructor
+    /// obligations must use [`alloc_owned_value`](Self::alloc_owned_value).
     pub fn alloc_value<T: Copy>(&mut self, value: T) -> Result<Offset32<'arena, T>> {
         let slot = self.alloc_uninit::<T>()?;
         self.write_uninit(slot, value)
@@ -498,29 +585,9 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
     }
 
     fn allocate(&mut self, byte_len: usize, alignment: usize) -> Result<u32> {
-        if alignment == 0 || !alignment.is_power_of_two() {
-            return Err(Error::AlignmentError);
-        }
-        let base = self.region.as_mut_ptr() as usize;
-        let cursor_address = base.checked_add(self.cursor).ok_or(Error::OffsetOverflow)?;
-        let aligned_address = crate::checked_align_up(cursor_address, alignment)?;
-        let start = aligned_address
-            .checked_sub(base)
-            .ok_or(Error::OffsetOverflow)?;
-        let raw = u32::try_from(start).map_err(|_| Error::OffsetOverflow)?;
-        if raw == crate::NULL_OFFSET {
-            return Err(Error::InvalidOffset);
-        }
-        let reserved = byte_len.max(1);
-        let end = start.checked_add(reserved).ok_or(Error::OffsetOverflow)?;
-        if end > self.region.len() {
-            return Err(Error::AllocationExhausted);
-        }
-        if end as u64 > MAX_ARENA_BYTES {
-            return Err(Error::AllocationExhausted);
-        }
-        self.cursor = end;
-        Ok(raw)
+        let capacity = u32::try_from(byte_len).map_err(|_| Error::OffsetOverflow)?;
+        allocation::allocate(self.state, byte_len, alignment, capacity, capacity, false)
+            .map(|(offset, _)| offset)
     }
 
     fn checked_range<T>(&self, raw: u32, byte_len: usize) -> Result<usize> {
@@ -531,8 +598,11 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         let end = start
             .checked_add(byte_len.max(1))
             .ok_or(Error::OffsetOverflow)?;
-        if end > self.cursor || end > self.region.len() {
+        if end > self.used_bytes() || end > self.region.len() {
             return Err(Error::OutOfBounds);
+        }
+        if allocation::is_free(self.state, start, end) {
+            return Err(Error::InvalidOffset);
         }
         let address = (self.region.as_ptr() as usize)
             .checked_add(start)

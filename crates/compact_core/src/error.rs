@@ -25,6 +25,10 @@ pub enum Error {
     ValueDoesNotFit,
     /// An initialization operation does not match its allocated region.
     InitializationError,
+    /// An allocation owner was used with an arena other than its creator.
+    ForeignArena,
+    /// The arena-local allocation identity counter is exhausted.
+    AllocationIdExhausted,
 }
 
 /// Core result type.
@@ -34,7 +38,7 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::BackingTooLarge => "backing region exceeds the V1 arena limit",
-            Self::InvalidCapacity => "backing region must have at least two bytes",
+            Self::InvalidCapacity => "backing region cannot hold arena allocator state",
             Self::AllocationExhausted => "compact arena is exhausted",
             Self::OffsetOverflow => "compact arena offset arithmetic overflowed",
             Self::InvalidOffset => "invalid or null compact offset",
@@ -43,6 +47,8 @@ impl fmt::Display for Error {
             Self::InvalidBitRange => "packed bit range is invalid",
             Self::ValueDoesNotFit => "value does not fit in the packed field",
             Self::InitializationError => "initialization does not match the allocated region",
+            Self::ForeignArena => "allocation belongs to a different compact arena",
+            Self::AllocationIdExhausted => "compact arena allocation identity space is exhausted",
         };
         formatter.write_str(message)
     }

@@ -2,6 +2,8 @@
 
 use core::marker::PhantomData;
 
+use crate::CompactValue;
+
 /// An exact initialized byte range inside one arena.
 ///
 /// The descriptor occupies eight bytes: a 32-bit byte offset and a 32-bit
@@ -14,6 +16,10 @@ pub struct ByteRange32<'arena> {
     pub(crate) len: u32,
     marker: PhantomData<fn(&'arena mut ()) -> &'arena mut ()>,
 }
+
+// SAFETY: ByteRange32 is a fixed offset/length descriptor with no native
+// pointers and no destructor state.
+unsafe impl CompactValue for ByteRange32<'_> {}
 
 impl<'arena> ByteRange32<'arena> {
     pub(crate) const fn new(offset: u32, len: u32) -> Self {

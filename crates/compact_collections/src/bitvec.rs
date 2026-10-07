@@ -1,13 +1,12 @@
 //! Bit-packed boolean vector used by generated struct-of-arrays columns.
 
-use compact_core::{Arena, ByteRange32};
+use compact_core::{Arena, ArenaAllocation, CompactValue};
 
 use crate::{CollectionError, Result};
 
 /// A growable arena-backed boolean vector storing eight values per byte.
-#[repr(C)]
 pub struct CompactBitVec<'arena> {
-    bytes: ByteRange32<'arena>,
+    bytes: Option<ArenaAllocation<'arena, u8>>,
     len: u32,
     capacity: u32,
 }
@@ -16,7 +15,7 @@ impl<'arena> CompactBitVec<'arena> {
     /// Construct an empty bit vector without allocating storage.
     pub fn new_in(_arena: &Arena<'arena, '_>) -> Self {
         Self {
-            bytes: ByteRange32::empty(),
+            bytes: None,
             len: 0,
             capacity: 0,
         }
@@ -25,7 +24,12 @@ impl<'arena> CompactBitVec<'arena> {
     /// Allocate zeroed bits for at least `capacity` values.
     pub fn with_capacity_in(capacity: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
         let capacity = u32::try_from(capacity).map_err(|_| CollectionError::CapacityOverflow)?;
-        let bytes = arena.alloc_zeroed_bytes(bytes_for_bits(capacity as usize)?)?;
+        let byte_capacity = bytes_for_bits(capacity as usize)?;
+        let bytes = if byte_capacity == 0 {
+            None
+        } else {
+            Some(zeroed_bytes(byte_capacity, arena)?)
+        };
         Ok(Self {
             bytes,
             len: 0,
@@ -53,16 +57,20 @@ impl<'arena> CompactBitVec<'arena> {
         if index >= self.len() {
             return Ok(None);
         }
-        let byte = arena.get_bytes(self.bytes)?[index / 8];
+        let bytes = self.bytes.as_ref().expect("nonempty bit vector has bytes");
+        arena.validate_owned(bytes)?;
+        let byte = bytes.as_slice()[index / 8];
         Ok(Some(byte & (1 << (index % 8)) != 0))
     }
 
     /// Set one initialized bit by index.
-    pub fn set(&self, index: usize, value: bool, arena: &mut Arena<'arena, '_>) -> Result<()> {
+    pub fn set(&mut self, index: usize, value: bool, arena: &mut Arena<'arena, '_>) -> Result<()> {
         if index >= self.len() {
             return Err(CollectionError::Core(compact_core::Error::OutOfBounds));
         }
-        set_bit(arena.get_bytes_mut(self.bytes)?, index, value);
+        let bytes = self.bytes.as_mut().expect("nonempty bit vector has bytes");
+        arena.validate_owned(bytes)?;
+        set_bit(bytes.as_mut_slice(), index, value);
         Ok(())
     }
 
@@ -71,7 +79,13 @@ impl<'arena> CompactBitVec<'arena> {
         if self.len == self.capacity {
             self.reserve_in(1, arena)?;
         }
-        set_bit(arena.get_bytes_mut(self.bytes)?, self.len(), value);
+        let index = self.len();
+        let bytes = self
+            .bytes
+            .as_mut()
+            .expect("reserve_in allocates bit storage");
+        arena.validate_owned(bytes)?;
+        set_bit(bytes.as_mut_slice(), index, value);
         self.len += 1;
         Ok(())
     }
@@ -87,17 +101,34 @@ impl<'arena> CompactBitVec<'arena> {
             return Ok(());
         }
         let new_capacity = required.max(self.capacity.saturating_mul(2).max(8));
-        let replacement = arena.alloc_zeroed_bytes(bytes_for_bits(new_capacity as usize)?)?;
-        arena.copy_bytes(self.bytes, replacement, self.bytes.len())?;
-        self.bytes = replacement;
+        let new_byte_capacity = bytes_for_bits(new_capacity as usize)?;
+        if let Some(bytes) = &mut self.bytes {
+            arena.validate_owned(bytes)?;
+            if arena.try_resize_owned(bytes, new_byte_capacity)? {
+                while bytes.len() < new_byte_capacity {
+                    bytes.push(0)?;
+                }
+                self.capacity = new_capacity;
+                return Ok(());
+            }
+        }
+        let mut replacement = arena.alloc_owned_slice::<u8>(new_byte_capacity)?;
+        if let Some(bytes) = &self.bytes {
+            replacement.extend_copy(bytes.as_slice())?;
+        }
+        while replacement.len() < new_byte_capacity {
+            replacement.push(0)?;
+        }
+        self.bytes = Some(replacement);
         self.capacity = new_capacity;
         Ok(())
     }
 
     /// Drop all logical bits while retaining allocated capacity.
     pub fn clear(&mut self, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        if !self.bytes.is_empty() {
-            arena.get_bytes_mut(self.bytes)?.fill(0);
+        if let Some(bytes) = &mut self.bytes {
+            arena.validate_owned(bytes)?;
+            bytes.as_mut_slice().fill(0);
         }
         self.len = 0;
         Ok(())
@@ -107,6 +138,20 @@ impl<'arena> CompactBitVec<'arena> {
     pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len.min(u32::MAX as usize) as u32);
     }
+}
+
+// SAFETY: this wrapper contains only an owned u8 buffer and scalar metadata.
+unsafe impl CompactValue for CompactBitVec<'_> {}
+
+fn zeroed_bytes<'arena>(
+    capacity: usize,
+    arena: &mut Arena<'arena, '_>,
+) -> Result<ArenaAllocation<'arena, u8>> {
+    let mut bytes = arena.alloc_owned_slice::<u8>(capacity)?;
+    for _ in 0..capacity {
+        bytes.push(0)?;
+    }
+    Ok(bytes)
 }
 
 fn bytes_for_bits(bits: usize) -> Result<usize> {

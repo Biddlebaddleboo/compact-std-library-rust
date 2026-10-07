@@ -37,7 +37,7 @@ fn values_round_trip_mutate_and_align() {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Aligned(u8);
 
-    let mut backing = TestBacking::new(96);
+    let mut backing = TestBacking::new(256);
     with_arena(&mut backing, |arena| {
         let number = arena.alloc_value(17_u32).unwrap();
         assert_eq!(*arena.get(number).unwrap(), 17);
@@ -54,7 +54,7 @@ fn values_round_trip_mutate_and_align() {
 
 #[test]
 fn borrowed_copy_values_remain_bounded_by_their_referent() {
-    let mut backing = TestBacking::new(32);
+    let mut backing = TestBacking::new(128);
     let source = 73_u32;
     with_arena(&mut backing, |arena| {
         let borrowed = arena.alloc_value(&source).unwrap();
@@ -70,7 +70,7 @@ fn compact_offsets_can_be_stored_inside_other_arena_values() {
         target: Offset32<'arena, u8>,
     }
 
-    let mut backing = TestBacking::new(32);
+    let mut backing = TestBacking::new(128);
     with_arena(&mut backing, |arena| {
         let target = arena.alloc_value(42_u8).unwrap();
         let link = arena.alloc_value(Link { target }).unwrap();
@@ -82,7 +82,7 @@ fn compact_offsets_can_be_stored_inside_other_arena_values() {
 
 #[test]
 fn slices_are_zero_copy_and_support_exclusive_mutation() {
-    let mut backing = TestBacking::new(64);
+    let mut backing = TestBacking::new(256);
     let base = backing.bytes.as_mut_ptr().cast::<u8>() as usize;
     with_arena(&mut backing, |arena| {
         let source = [3_u16, 5, 8, 13];
@@ -102,7 +102,7 @@ fn slices_are_zero_copy_and_support_exclusive_mutation() {
 
 #[test]
 fn uninitialized_storage_requires_matching_initialization() {
-    let mut backing = TestBacking::new(48);
+    let mut backing = TestBacking::new(128);
     with_arena(&mut backing, |arena| {
         let slot = arena.alloc_uninit::<u32>().unwrap();
         let initialized = arena.write_uninit(slot, 99).unwrap();
@@ -121,7 +121,7 @@ fn uninitialized_storage_requires_matching_initialization() {
 
 #[test]
 fn null_invalid_and_exhausted_offsets_are_rejected() {
-    let mut backing = TestBacking::new(5);
+    let mut backing = TestBacking::new(crate::MIN_ARENA_BYTES);
     with_arena(&mut backing, |arena| {
         assert!(arena.get(Offset32::<u8>::null()).is_err());
         let value = arena.alloc_value(1_u8).unwrap();
@@ -143,7 +143,7 @@ fn zero_sized_allocations_get_distinct_non_null_offsets() {
     #[derive(Clone, Copy)]
     struct Empty;
 
-    let mut backing = TestBacking::new(8);
+    let mut backing = TestBacking::new(128);
     with_arena(&mut backing, |arena| {
         let first = arena.alloc_value(Empty).unwrap();
         let second = arena.alloc_value(Empty).unwrap();
@@ -161,15 +161,18 @@ fn smallest_usable_backing_fits_one_byte() {
     with_arena(&mut backing, |arena| {
         let only_value = arena.alloc_value(5_u8).unwrap();
         assert_eq!(*arena.get(only_value).unwrap(), 5);
-        assert_eq!(arena.remaining_bytes(), 0);
+        assert_eq!(
+            arena.used_bytes() + arena.remaining_bytes(),
+            arena.capacity()
+        );
     })
     .unwrap();
 }
 
 #[test]
 fn independent_arenas_have_independent_memory() {
-    let mut first = TestBacking::new(8);
-    let mut second = TestBacking::new(8);
+    let mut first = TestBacking::new(128);
+    let mut second = TestBacking::new(128);
     let first_value = with_arena(&mut first, |arena| {
         let offset = arena.alloc_value(10_u8).unwrap();
         *arena.get(offset).unwrap()
@@ -266,7 +269,7 @@ fn packed_operations_cover_each_word_and_preserve_neighbors() {
 
 #[test]
 fn initialized_byte_ranges_are_exact_zero_copy_views() {
-    let mut backing = TestBacking::new(64);
+    let mut backing = TestBacking::new(256);
     let base = backing.bytes.as_mut_ptr().cast::<u8>() as usize;
     with_arena(&mut backing, |arena| {
         let bytes = arena.alloc_bytes(b"abc\0tail").unwrap();
@@ -281,7 +284,75 @@ fn initialized_byte_ranges_are_exact_zero_copy_views() {
         arena.copy_bytes(bytes, copied, bytes.len()).unwrap();
         assert_eq!(arena.get_bytes(copied).unwrap(), b"Abc\0tail");
         assert_eq!(arena.get_bytes(ByteRange32::empty()).unwrap(), b"");
-        assert!(arena.used_uninit_bytes().len() >= arena.used_bytes());
+        // SAFETY: this view is immediately discarded before any allocator
+        // mutation or owner drop can occur.
+        assert!(unsafe { arena.used_uninit_bytes() }.len() >= arena.used_bytes());
+    })
+    .unwrap();
+}
+
+#[test]
+fn owned_allocation_release_reuses_ranges_and_contracts_the_tail() {
+    let mut backing = TestBacking::new(256);
+    with_arena(&mut backing, |arena| {
+        let baseline = arena.used_bytes();
+        let first = arena.alloc_owned_slice::<u8>(8).unwrap();
+        let middle = arena.alloc_owned_slice::<u8>(8).unwrap();
+        let last = arena.alloc_owned_slice::<u8>(8).unwrap();
+        let high_water = arena.used_bytes();
+
+        drop(middle);
+        assert_eq!(arena.used_bytes(), high_water);
+        let reused = arena.alloc_owned_slice::<u8>(8).unwrap();
+        assert_eq!(arena.used_bytes(), high_water);
+
+        drop(last);
+        let after_tail = arena.used_bytes();
+        drop(first);
+        drop(reused);
+        assert!(after_tail < high_water);
+        assert_eq!(arena.used_bytes(), baseline);
+    })
+    .unwrap();
+}
+
+#[test]
+fn released_adjacent_ranges_coalesce_for_a_larger_allocation() {
+    let mut backing = TestBacking::new(128);
+    with_arena(&mut backing, |arena| {
+        let first = arena.alloc_owned_slice::<u8>(4).unwrap();
+        let middle = arena.alloc_owned_slice::<u8>(4).unwrap();
+        let last = arena.alloc_owned_slice::<u8>(4).unwrap();
+        drop(last);
+        let before_coalesce = arena.used_bytes();
+        drop(middle);
+        assert!(arena.used_bytes() < before_coalesce);
+
+        let larger = arena.alloc_owned_slice::<u8>(32).unwrap();
+        assert_eq!(larger.capacity(), 32);
+        drop(larger);
+        drop(first);
+    })
+    .unwrap();
+}
+
+#[test]
+fn owned_allocations_extend_in_place_and_report_fragmentation() {
+    let mut backing = TestBacking::new(192);
+    with_arena(&mut backing, |arena| {
+        let mut tail = arena.alloc_owned_slice::<u8>(4).unwrap();
+        let before = arena.used_bytes();
+        assert!(arena.try_resize_owned(&mut tail, 8).unwrap());
+        assert_eq!(tail.capacity(), 8);
+        assert!(arena.used_bytes() >= before);
+
+        let mut first = arena.alloc_owned_slice::<u8>(4).unwrap();
+        let middle = arena.alloc_owned_slice::<u8>(4).unwrap();
+        let _last = arena.alloc_owned_slice::<u8>(4).unwrap();
+        drop(middle);
+        let old_capacity = first.capacity();
+        assert!(!arena.try_resize_owned(&mut first, 32).unwrap());
+        assert_eq!(first.capacity(), old_capacity);
     })
     .unwrap();
 }
@@ -310,4 +381,63 @@ fn byte_bit_helpers_cross_byte_boundaries_and_preserve_neighbors() {
         Err(Error::ValueDoesNotFit)
     );
     assert_eq!(crate::read_bits(&bytes, 23, 2), Err(Error::InvalidBitRange));
+}
+
+#[test]
+fn packed_fast_paths_match_reference_at_byte_and_word_boundaries() {
+    fn reference_read(bytes: &[u8], offset: usize, width: u8) -> u64 {
+        let mut value = 0;
+        for index in 0..width as usize {
+            if bytes[(offset + index) / 8] & (1 << ((offset + index) % 8)) != 0 {
+                value |= 1_u64 << index;
+            }
+        }
+        value
+    }
+
+    fn reference_write(bytes: &mut [u8], offset: usize, width: u8, value: u64) {
+        for index in 0..width as usize {
+            let position = offset + index;
+            let bit = 1 << (position % 8);
+            if value & (1_u64 << index) == 0 {
+                bytes[position / 8] &= !bit;
+            } else {
+                bytes[position / 8] |= bit;
+            }
+        }
+    }
+
+    let starts = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 71];
+    let original = [
+        0xA5_u8, 0x3C, 0xD2, 0x69, 0xF0, 0x1B, 0x87, 0x42, 0xE1, 0x55,
+    ];
+    for width in 0..=64 {
+        for start in starts {
+            if start + width as usize > original.len() * 8 {
+                continue;
+            }
+            let expected = reference_read(&original, start, width);
+            assert_eq!(crate::read_bits(&original, start, width), Ok(expected));
+
+            let mask = if width == 64 {
+                u64::MAX
+            } else if width == 0 {
+                0
+            } else {
+                (1_u64 << width) - 1
+            };
+            let value = 0xD6A5_39C7_81E2_4B0F & mask;
+            let mut expected_bytes = original;
+            reference_write(&mut expected_bytes, start, width, value);
+            let mut actual = original;
+            crate::write_bits(&mut actual, start, width, value).unwrap();
+            assert_eq!(actual, expected_bytes, "width={width}, start={start}");
+        }
+    }
+
+    let mut width64 = [0x5A_u8; 10];
+    crate::write_bits(&mut width64, 0, 64, u64::MAX).unwrap();
+    assert_eq!(crate::read_bits(&width64, 0, 64), Ok(u64::MAX));
+    crate::write_bits(&mut width64, 1, 64, 0x0123_4567_89AB_CDEF).unwrap();
+    assert_eq!(crate::read_bits(&width64, 1, 64), Ok(0x0123_4567_89AB_CDEF));
 }

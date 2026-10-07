@@ -1,163 +1,205 @@
-//! Contiguous arena-backed vector with compact `offset/len/capacity` metadata.
+//! Contiguous arena-backed vector with explicit ownership and reclamation.
 
-use core::mem::MaybeUninit;
 use core::slice;
 
-use compact_core::{Arena, OffsetSlice32};
+use compact_core::{Arena, ArenaAllocation, CompactValue};
 
 use crate::{CollectionError, Result};
 
 /// A contiguous arena-backed vector.
 ///
-/// The general metadata is twelve bytes: a four-byte storage offset, a
-/// four-byte initialized length, and a four-byte capacity. Growth doubles
-/// capacity, so old monotonic-arena buffers consume less than twice the final
-/// capacity in aggregate. Values must be `Copy`; native destructors are never
-/// silently skipped.
-#[repr(C)]
-pub struct CompactVec<'arena, T: Copy> {
-    storage: OffsetSlice32<'arena, MaybeUninit<T>>,
-    len: u32,
+/// The owner token stores its allocation identity in the arena header. The
+/// vector handle is larger than the original offset/length/capacity form so it
+/// can run destructors and return its buffer when dropped.
+pub struct CompactVec<'arena, T: CompactValue> {
+    storage: Option<ArenaAllocation<'arena, T>>,
 }
 
-impl<'arena, T: Copy> CompactVec<'arena, T> {
+impl<'arena, T: CompactValue> CompactVec<'arena, T> {
     /// Construct an empty vector tied to `arena` without allocating storage.
     pub fn new_in(_arena: &Arena<'arena, '_>) -> Self {
-        Self {
-            storage: OffsetSlice32::empty(),
-            len: 0,
-        }
+        Self { storage: None }
     }
 
     /// Allocate an empty vector with at least `capacity` element slots.
     pub fn with_capacity_in(capacity: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
-        let capacity = u32::try_from(capacity).map_err(|_| CollectionError::CapacityOverflow)?;
+        u32::try_from(capacity).map_err(|_| CollectionError::CapacityOverflow)?;
         let storage = if capacity == 0 {
-            OffsetSlice32::empty()
+            None
         } else {
-            arena.alloc_uninit_slice::<T>(capacity as usize)?
+            Some(arena.alloc_owned_slice::<T>(capacity)?)
         };
-        Ok(Self { storage, len: 0 })
+        Ok(Self { storage })
     }
 
     /// Return the number of initialized elements.
-    pub const fn len(&self) -> usize {
-        self.len as usize
+    pub fn len(&self) -> usize {
+        self.storage.as_ref().map_or(0, ArenaAllocation::len)
     }
 
     /// Return the allocated element capacity.
-    pub const fn capacity(&self) -> usize {
-        self.storage.len()
+    pub fn capacity(&self) -> usize {
+        self.storage.as_ref().map_or(0, ArenaAllocation::capacity)
     }
 
     /// Return whether the vector is empty.
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Ensure room for at least `additional` more elements.
+    ///
+    /// Allocation failure leaves the initialized value sequence unchanged.
     pub fn reserve_in(&mut self, additional: usize, arena: &mut Arena<'arena, '_>) -> Result<()> {
         let required = self
             .len()
             .checked_add(additional)
             .ok_or(CollectionError::CapacityOverflow)?;
         let required = u32::try_from(required).map_err(|_| CollectionError::CapacityOverflow)?;
-        if required as usize <= self.storage.len() {
+        if required as usize <= self.capacity() {
             return Ok(());
         }
 
-        let old_capacity = self.storage.len() as u32;
+        let old_capacity = self.capacity() as u32;
         let doubled = old_capacity.saturating_mul(2);
         let new_capacity = if old_capacity == 0 {
             required.max(4)
         } else {
             required.max(doubled)
-        };
-        let replacement = arena.alloc_uninit_slice::<T>(new_capacity as usize)?;
-        // SAFETY: `CompactVec` only increments len after initializing each
-        // inserted slot, and all mutation methods preserve that prefix. The
-        // new allocation has room and is not observed before the copy ends.
-        unsafe { arena.copy_slice_assume_init(self.storage, self.len(), replacement)? };
-        self.storage = replacement;
+        } as usize;
+
+        if let Some(storage) = &mut self.storage {
+            if arena.try_resize_owned(storage, new_capacity)? {
+                return Ok(());
+            }
+        }
+
+        let mut replacement = arena.alloc_owned_slice::<T>(new_capacity)?;
+        if let Some(storage) = &mut self.storage {
+            storage.move_into(&mut replacement)?;
+        }
+        self.storage = Some(replacement);
         Ok(())
     }
 
-    /// Append one `Copy` value, growing the compact allocation when needed.
+    /// Append one value, growing the compact allocation when needed.
     pub fn push_in(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<()> {
         self.reserve_in(1, arena)?;
-        let index = self.len();
-        arena.write_uninit_at(self.storage, index, value)?;
-        let next_len = index
-            .checked_add(1)
-            .ok_or(CollectionError::CapacityOverflow)?;
-        self.len = u32::try_from(next_len).map_err(|_| CollectionError::CapacityOverflow)?;
+        let storage = self
+            .storage
+            .as_mut()
+            .expect("reserve_in allocates storage for one element");
+        arena.validate_owned(storage)?;
+        storage.push(value)?;
         Ok(())
     }
 
     /// Remove and return the last value, if any.
     pub fn pop_in(&mut self, arena: &Arena<'arena, '_>) -> Result<Option<T>> {
-        if self.len == 0 {
+        let Some(storage) = &mut self.storage else {
             return Ok(None);
-        }
-        let index = self.len() - 1;
-        let value = self.as_slice(arena)?[index];
-        self.len -= 1;
-        Ok(Some(value))
+        };
+        arena.validate_owned(storage)?;
+        Ok(storage.pop())
     }
 
     /// Return an initialized element by index.
     pub fn get<'view>(
-        &self,
+        &'view self,
         index: usize,
         arena: &'view Arena<'arena, '_>,
     ) -> Result<Option<&'view T>> {
-        Ok(self.as_slice(arena)?.get(index))
+        if let Some(storage) = &self.storage {
+            arena.validate_owned(storage)?;
+            Ok(storage.get(index))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Mutably borrow an initialized element by index.
     pub fn get_mut<'view>(
-        &self,
+        &'view mut self,
         index: usize,
         arena: &'view mut Arena<'arena, '_>,
     ) -> Result<Option<&'view mut T>> {
-        Ok(self.as_mut_slice(arena)?.get_mut(index))
+        if let Some(storage) = &mut self.storage {
+            arena.validate_owned(storage)?;
+            Ok(storage.get_mut(index))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Borrow all initialized elements as a zero-copy native slice.
-    pub fn as_slice<'view>(&self, arena: &'view Arena<'arena, '_>) -> Result<&'view [T]> {
-        if self.len == 0 {
-            return Ok(&[]);
+    pub fn as_slice<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<&'view [T]> {
+        if let Some(storage) = &self.storage {
+            arena.validate_owned(storage)?;
+            Ok(storage.as_slice())
+        } else {
+            Ok(&[])
         }
-        // SAFETY: the private length is advanced only after a successful slot
-        // initialization, and is reduced before elements cease to be exposed.
-        Ok(unsafe { arena.get_slice_assume_init(self.storage, self.len())? })
     }
 
     /// Mutably borrow all initialized elements as a zero-copy native slice.
     pub fn as_mut_slice<'view>(
-        &self,
+        &'view mut self,
         arena: &'view mut Arena<'arena, '_>,
     ) -> Result<&'view mut [T]> {
-        if self.len == 0 {
-            return Ok(&mut []);
+        if let Some(storage) = &mut self.storage {
+            arena.validate_owned(storage)?;
+            Ok(storage.as_mut_slice())
+        } else {
+            Ok(&mut [])
         }
-        // SAFETY: the private length tracks initialized values, and the
-        // exclusive arena borrow prevents any competing references.
-        Ok(unsafe { arena.get_slice_mut_assume_init(self.storage, self.len())? })
     }
 
     /// Return an iterator over the initialized values.
-    pub fn iter<'view>(&self, arena: &'view Arena<'arena, '_>) -> Result<slice::Iter<'view, T>> {
+    pub fn iter<'view>(
+        &'view self,
+        arena: &'view Arena<'arena, '_>,
+    ) -> Result<slice::Iter<'view, T>> {
         Ok(self.as_slice(arena)?.iter())
     }
 
-    /// Reduce the initialized length without reclaiming monotonic arena bytes.
+    /// Drop every initialized value after `len`.
     pub fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len.min(u32::MAX as usize) as u32);
+        if let Some(storage) = &mut self.storage {
+            storage.truncate(len);
+        }
     }
 
-    /// Remove all elements without reclaiming the backing allocation.
+    /// Drop all values while retaining the backing allocation for reuse.
     pub fn clear(&mut self) {
-        self.len = 0;
+        self.truncate(0);
+    }
+
+    /// Reduce the buffer to the current length, releasing any unused tail.
+    pub fn shrink_to_fit_in(&mut self, arena: &mut Arena<'arena, '_>) -> Result<()> {
+        let Some(storage) = &mut self.storage else {
+            return Ok(());
+        };
+        arena.validate_owned(storage)?;
+        let len = storage.len();
+        if len == 0 {
+            self.storage = None;
+            return Ok(());
+        }
+        if arena.try_resize_owned(storage, len)? {
+            return Ok(());
+        }
+        let mut replacement = arena.alloc_owned_slice::<T>(len)?;
+        storage.move_into(&mut replacement)?;
+        self.storage = Some(replacement);
+        Ok(())
+    }
+
+    pub(crate) fn allocation_mut(&mut self) -> Option<&mut ArenaAllocation<'arena, T>> {
+        self.storage.as_mut()
     }
 }
+
+// SAFETY: moving this owner transfers its unique ArenaAllocation token; its
+// element invariants are governed by T: CompactValue and no address-sensitive
+// data is introduced by the vector wrapper.
+unsafe impl<T: CompactValue> CompactValue for CompactVec<'_, T> {}
