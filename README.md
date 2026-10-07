@@ -6,6 +6,10 @@ native interfaces continue to use ordinary native pointers.
 
 ## V2.4 contract
 
+The V2.4 architecture is frozen after its native comparison and validation
+pass. See [BENCHMARKS.md](BENCHMARKS.md) for results; substantial representation
+or allocator changes belong in V3.
+
 V2.4 uses one cage address space per process. Initialize it once with an
 explicit capacity before creating compact values:
 

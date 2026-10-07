@@ -1,5 +1,12 @@
 # V2.4 architecture
 
+## Freeze status
+
+The architecture is frozen after the native comparison and validation pass
+documented in [BENCHMARKS.md](BENCHMARKS.md). Substantial representation,
+pointer, owner/header, or allocator changes are scoped to V3. Correctness fixes
+and documentation maintenance remain allowed.
+
 V2.4 keeps a normal 64-bit Rust process and one stable process-wide cage.
 Native references, `usize`, libc, syscalls, and third-party dependencies keep
 the platform ABI. Retained cage addresses, owners, links, and descriptors use
