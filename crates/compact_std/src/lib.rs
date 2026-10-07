@@ -10,7 +10,8 @@ pub mod prelude;
 pub use compact_backend_std::{StdArena, StdBackendError, StdBacking};
 pub use compact_collections::{
     CollectionError, CompactBitVec, CompactBox, CompactEnum, CompactInterner, CompactOption,
-    CompactSlab, CompactSmallVec, CompactString, CompactVec, InternId, Result, SlabHandle,
+    CompactSlab, CompactSmallVec, CompactString, CompactStringWriter, CompactVec, InternId, Result,
+    SlabHandle,
 };
 pub use compact_core::{
     bits_required, checked_align_up, read_bits, smallest_word, validate_bit_range, write_bits,

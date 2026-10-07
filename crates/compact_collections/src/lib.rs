@@ -22,5 +22,5 @@ pub use error::{CollectionError, Result};
 pub use intern::{CompactInterner, InternId};
 pub use slab::{CompactSlab, SlabHandle};
 pub use small::CompactSmallVec;
-pub use string::CompactString;
+pub use string::{CompactString, CompactStringWriter};
 pub use vec::CompactVec;

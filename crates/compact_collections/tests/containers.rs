@@ -5,8 +5,17 @@ use compact_collections::{
 };
 use compact_core::CompactValue;
 use compact_core::Offset32;
+use std::borrow::{Borrow, BorrowMut};
 use std::cell::Cell;
+use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+
+fn hash_value(value: &impl Hash) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
 
 struct DropCounter(Rc<Cell<usize>>);
 
@@ -374,6 +383,95 @@ fn string_growth_and_clear_reclaim_or_reuse_heap_storage() {
         let text = CompactString::from_str_in("a long heap-backed string", arena).unwrap();
         drop(text);
         assert_eq!(arena.used_bytes(), tail_baseline);
+    })
+    .unwrap();
+}
+
+#[test]
+fn owner_backed_vector_string_and_box_traits_match_std() {
+    let native_values = std::vec![3_u32, 5, 8, 13];
+    StdArena::with_capacity(4096, |arena| {
+        let mut values = CompactVec::new_in(arena);
+        for value in &native_values {
+            values.push_in(*value, arena).unwrap();
+        }
+
+        assert_eq!(&*values, native_values.as_slice());
+        let as_ref: &[u32] = values.as_ref();
+        let borrowed: &[u32] = Borrow::borrow(&values);
+        assert_eq!(as_ref, native_values.as_slice());
+        assert_eq!(borrowed, native_values.as_slice());
+        assert_eq!(values[2], native_values[2]);
+        assert_eq!(values.as_slice(arena).unwrap(), native_values.as_slice());
+        assert_eq!(values, values);
+        assert_eq!(
+            values.partial_cmp(&values),
+            Some(core::cmp::Ordering::Equal)
+        );
+        assert_eq!(values.cmp(&values), core::cmp::Ordering::Equal);
+        assert_eq!(format!("{values:?}"), format!("{native_values:?}"));
+        assert_eq!(hash_value(&values), hash_value(&native_values));
+        assert_eq!(
+            (&values).into_iter().copied().collect::<std::vec::Vec<_>>(),
+            native_values
+        );
+
+        for value in &mut values {
+            *value += 1;
+        }
+        let mut incremented = native_values.clone();
+        for value in &mut incremented {
+            *value += 1;
+        }
+        let as_mut: &mut [u32] = values.as_mut();
+        as_mut[0] += 1;
+        let borrowed_mut: &mut [u32] = BorrowMut::borrow_mut(&mut values);
+        borrowed_mut[0] += 1;
+        values[1] += 1;
+        incremented[0] += 1;
+        incremented[0] += 1;
+        incremented[1] += 1;
+        assert_eq!(&*values, incremented.as_slice());
+
+        let mut boxed = CompactBox::new_in(41_u32, arena).unwrap();
+        *boxed += 1;
+        *boxed.as_mut() += 1;
+        let as_ref: &u32 = boxed.as_ref();
+        assert_eq!(*boxed, 43);
+        assert_eq!(*as_ref, *std::boxed::Box::new(43));
+        assert_eq!(boxed, boxed);
+        assert_eq!(boxed.partial_cmp(&boxed), Some(core::cmp::Ordering::Equal));
+        assert_eq!(boxed.cmp(&boxed), core::cmp::Ordering::Equal);
+        assert_eq!(
+            format!("{boxed:?}"),
+            format!("{:?}", std::boxed::Box::new(43))
+        );
+        assert_eq!(
+            hash_value(&boxed),
+            hash_value(&std::boxed::Box::new(43_u32))
+        );
+
+        let mut text = CompactString::from_str_in("héllo", arena).unwrap();
+        let as_ref: &str = text.as_ref();
+        let borrowed: &str = Borrow::borrow(&text);
+        assert_eq!(as_ref, "héllo");
+        assert_eq!(borrowed, "héllo");
+        assert_eq!(&*text, "héllo");
+        assert!(text == "héllo");
+        assert!(<CompactString as PartialEq<str>>::eq(&text, "héllo"));
+        assert_eq!(format!("{text}"), "héllo");
+        assert_eq!(format!("{text:?}"), format!("{:?}", String::from("héllo")));
+        assert_eq!(hash_value(&text), hash_value(&String::from("héllo")));
+        assert_eq!(text, text);
+
+        {
+            let mut writer = text.writer(arena);
+            write!(&mut writer, " compact/{}", 2).unwrap();
+        }
+        let native_text = String::from("héllo compact/2");
+        assert_eq!(&*text, native_text);
+        assert_eq!(text.as_str(arena).unwrap(), native_text);
+        assert!(text > CompactString::from_str_in("héllo", arena).unwrap());
     })
     .unwrap();
 }

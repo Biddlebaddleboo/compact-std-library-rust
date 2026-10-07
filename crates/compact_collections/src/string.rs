@@ -1,6 +1,10 @@
 //! Compact UTF-8 string with a twelve-byte inline payload.
 
 use compact_core::{Arena, ArenaAllocation, CompactValue};
+use core::borrow::Borrow;
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::ops::Deref;
 
 use crate::{CollectionError, Result};
 
@@ -208,6 +212,115 @@ impl<'arena> CompactString<'arena> {
     /// Compare with an ordinary native string.
     pub fn eq_str(&self, other: &str, arena: &Arena<'arena, '_>) -> Result<bool> {
         Ok(self.as_str(arena)? == other)
+    }
+
+    /// Create a formatting writer that grows this string through `arena`.
+    pub fn writer<'view, 'backing>(
+        &'view mut self,
+        arena: &'view mut Arena<'arena, 'backing>,
+    ) -> CompactStringWriter<'view, 'arena, 'backing> {
+        CompactStringWriter { text: self, arena }
+    }
+}
+
+/// A formatting adapter that appends to a [`CompactString`] using an explicit
+/// arena for any required growth.
+pub struct CompactStringWriter<'view, 'arena, 'backing> {
+    text: &'view mut CompactString<'arena>,
+    arena: &'view mut Arena<'arena, 'backing>,
+}
+
+impl CompactStringWriter<'_, '_, '_> {
+    /// Append UTF-8 text and preserve the arena allocation error.
+    pub fn write_str_in(&mut self, value: &str) -> Result<()> {
+        self.text.push_str_in(value, self.arena)
+    }
+
+    /// Append one Unicode scalar value and preserve the arena allocation error.
+    pub fn write_char_in(&mut self, value: char) -> Result<()> {
+        self.text.push_char_in(value, self.arena)
+    }
+}
+
+impl fmt::Write for CompactStringWriter<'_, '_, '_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.write_str_in(value).map_err(|_| fmt::Error)
+    }
+}
+
+impl Deref for CompactString<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        let bytes = match &self.repr {
+            StringRepr::Inline { len, bytes } => &bytes[..*len as usize],
+            StringRepr::Heap(allocation) => allocation.as_slice(),
+        };
+        // SAFETY: all constructors accept `str`, append preserves UTF-8, and
+        // truncation checks character boundaries before changing the prefix.
+        unsafe { core::str::from_utf8_unchecked(bytes) }
+    }
+}
+
+impl AsRef<str> for CompactString<'_> {
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl Borrow<str> for CompactString<'_> {
+    fn borrow(&self) -> &str {
+        self
+    }
+}
+
+impl fmt::Display for CompactString<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, formatter)
+    }
+}
+
+impl fmt::Debug for CompactString<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, formatter)
+    }
+}
+
+impl PartialEq for CompactString<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deref() == other.deref()
+    }
+}
+
+impl Eq for CompactString<'_> {}
+
+impl PartialEq<str> for CompactString<'_> {
+    fn eq(&self, other: &str) -> bool {
+        self.deref() == other
+    }
+}
+
+impl PartialEq<&str> for CompactString<'_> {
+    fn eq(&self, other: &&str) -> bool {
+        self.deref() == *other
+    }
+}
+
+impl PartialOrd for CompactString<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CompactString<'_> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.deref().cmp(other.deref())
+    }
+}
+
+impl Hash for CompactString<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.deref().hash(state);
     }
 }
 

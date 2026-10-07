@@ -1,5 +1,9 @@
 //! Contiguous arena-backed vector with explicit ownership and reclamation.
 
+use core::borrow::{Borrow, BorrowMut};
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::ops::{Deref, DerefMut, Index, IndexMut};
 use core::slice;
 
 use compact_core::{Arena, ArenaAllocation, CompactValue};
@@ -196,6 +200,116 @@ impl<'arena, T: CompactValue> CompactVec<'arena, T> {
 
     pub(crate) fn allocation_mut(&mut self) -> Option<&mut ArenaAllocation<'arena, T>> {
         self.storage.as_mut()
+    }
+}
+
+impl<T: CompactValue> Deref for CompactVec<'_, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.storage.as_ref().map_or(&[], ArenaAllocation::as_slice)
+    }
+}
+
+impl<T: CompactValue> DerefMut for CompactVec<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.storage
+            .as_mut()
+            .map_or(&mut [], ArenaAllocation::as_mut_slice)
+    }
+}
+
+impl<T: CompactValue> AsRef<[T]> for CompactVec<'_, T> {
+    fn as_ref(&self) -> &[T] {
+        self
+    }
+}
+
+impl<T: CompactValue> AsMut<[T]> for CompactVec<'_, T> {
+    fn as_mut(&mut self) -> &mut [T] {
+        self
+    }
+}
+
+impl<T: CompactValue> Borrow<[T]> for CompactVec<'_, T> {
+    fn borrow(&self) -> &[T] {
+        self
+    }
+}
+
+impl<T: CompactValue> BorrowMut<[T]> for CompactVec<'_, T> {
+    fn borrow_mut(&mut self) -> &mut [T] {
+        self
+    }
+}
+
+impl<T: CompactValue, I> Index<I> for CompactVec<'_, T>
+where
+    [T]: Index<I>,
+{
+    type Output = <[T] as Index<I>>::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        <[T] as Index<I>>::index(self, index)
+    }
+}
+
+impl<T: CompactValue, I> IndexMut<I> for CompactVec<'_, T>
+where
+    [T]: IndexMut<I>,
+{
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        <[T] as IndexMut<I>>::index_mut(self, index)
+    }
+}
+
+impl<'view, 'arena, T: CompactValue> IntoIterator for &'view CompactVec<'arena, T> {
+    type Item = &'view T;
+    type IntoIter = slice::Iter<'view, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref().iter()
+    }
+}
+
+impl<'view, 'arena, T: CompactValue> IntoIterator for &'view mut CompactVec<'arena, T> {
+    type Item = &'view mut T;
+    type IntoIter = slice::IterMut<'view, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref_mut().iter_mut()
+    }
+}
+
+impl<T: CompactValue + fmt::Debug> fmt::Debug for CompactVec<'_, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.deref().iter()).finish()
+    }
+}
+
+impl<T: CompactValue + PartialEq> PartialEq for CompactVec<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deref() == other.deref()
+    }
+}
+
+impl<T: CompactValue + Eq> Eq for CompactVec<'_, T> {}
+
+impl<T: CompactValue + PartialOrd> PartialOrd for CompactVec<'_, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.deref().partial_cmp(other.deref())
+    }
+}
+
+impl<T: CompactValue + Ord> Ord for CompactVec<'_, T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.deref().cmp(other.deref())
+    }
+}
+
+impl<T: CompactValue + Hash> Hash for CompactVec<'_, T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.deref().hash(state);
     }
 }
 

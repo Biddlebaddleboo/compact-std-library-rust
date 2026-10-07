@@ -1,6 +1,9 @@
 //! Compact single-value and nullable-reference wrappers.
 
 use compact_core::{Arena, ArenaAllocation, CompactValue, Offset32};
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::ops::{Deref, DerefMut};
 
 use crate::Result;
 
@@ -32,6 +35,70 @@ impl<'arena, T: CompactValue> CompactBox<'arena, T> {
     ) -> Result<&'view mut T> {
         arena.validate_owned(&self.allocation)?;
         Ok(&mut self.allocation.as_mut_slice()[0])
+    }
+}
+
+impl<T: CompactValue> Deref for CompactBox<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.allocation
+            .as_slice()
+            .first()
+            .expect("CompactBox always owns one initialized value")
+    }
+}
+
+impl<T: CompactValue> DerefMut for CompactBox<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.allocation
+            .as_mut_slice()
+            .first_mut()
+            .expect("CompactBox always owns one initialized value")
+    }
+}
+
+impl<T: CompactValue> AsRef<T> for CompactBox<'_, T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+impl<T: CompactValue> AsMut<T> for CompactBox<'_, T> {
+    fn as_mut(&mut self) -> &mut T {
+        self
+    }
+}
+
+impl<T: CompactValue + fmt::Debug> fmt::Debug for CompactBox<'_, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, formatter)
+    }
+}
+
+impl<T: CompactValue + PartialEq> PartialEq for CompactBox<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: CompactValue + Eq> Eq for CompactBox<'_, T> {}
+
+impl<T: CompactValue + PartialOrd> PartialOrd for CompactBox<'_, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+
+impl<T: CompactValue + Ord> Ord for CompactBox<'_, T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<T: CompactValue + Hash> Hash for CompactBox<'_, T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
     }
 }
 
