@@ -147,6 +147,15 @@ capacity or return to inline representation.
 Initialized values stay in inline storage until promotion. Promotion allocates
 first and then moves each initialized value into arena storage.
 
+### CompactBytes
+
+`CompactBytes` keeps twenty bytes inline. This uses the same 24-byte wrapper
+size as 12- and 16-byte candidates on the measured 64-bit target; a 24-byte
+inline payload increased the wrapper to 32 bytes. Longer payloads use one
+reclaimable `ArenaAllocation<u8>`. The benchmark shows heap-backed compact
+buffers can be slower than native `Vec<u8>` for short-lived payloads, so they
+are intended where inline payloads or arena ownership are useful.
+
 ### CompactSlab
 
 A slab combines slot generations with the owning allocation identity. A handle

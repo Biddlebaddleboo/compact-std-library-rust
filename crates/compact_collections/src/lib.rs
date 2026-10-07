@@ -7,6 +7,7 @@
 
 mod bitvec;
 mod boxed;
+mod compact_bytes;
 mod enum_value;
 mod error;
 mod intern;
@@ -17,6 +18,7 @@ mod vec;
 
 pub use bitvec::CompactBitVec;
 pub use boxed::{CompactBox, CompactOption};
+pub use compact_bytes::{CompactBytes, COMPACT_BYTES_INLINE_CAPACITY};
 pub use enum_value::CompactEnum;
 pub use error::{CollectionError, Result};
 pub use intern::{CompactInterner, InternId};

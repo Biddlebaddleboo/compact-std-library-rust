@@ -3,7 +3,13 @@ use std::mem::size_of;
 use std::time::Instant;
 
 use compact_std::prelude::*;
-use compact_std::{read_bits, write_bits, Result as CompactResult};
+use compact_std::{read_bits, write_bits, ArenaAllocation, CompactBytes, Result as CompactResult};
+
+#[allow(dead_code)]
+enum ByteLayoutCandidate<const INLINE: usize> {
+    Inline { len: u8, bytes: [u8; INLINE] },
+    Heap(ArenaAllocation<'static, u8>),
+}
 
 #[compact]
 struct BenchFields {
@@ -54,6 +60,46 @@ fn validate_reference_range(bytes_len: usize, offset: usize, width: u8) {
         .checked_add(width as usize)
         .expect("benchmark bit range fits");
     assert!(end <= total_bits);
+}
+
+fn benchmark_compact_bytes() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
+    println!(
+        "byte wrapper sizes: inline 12={} 16={} 20={} 24={} selected CompactBytes={}",
+        size_of::<ByteLayoutCandidate<12>>(),
+        size_of::<ByteLayoutCandidate<16>>(),
+        size_of::<ByteLayoutCandidate<20>>(),
+        size_of::<ByteLayoutCandidate<24>>(),
+        size_of::<CompactBytes<'static>>(),
+    );
+
+    let payloads: [(&str, &[u8]); 5] = [
+        ("8 bytes", &[0x31; 8]),
+        ("16 bytes", &[0x42; 16]),
+        ("20 bytes", &[0x53; 20]),
+        ("24 bytes", &[0x64; 24]),
+        ("64 bytes", &[0x75; 64]),
+    ];
+    const ITERATIONS: usize = 20_000;
+    StdArena::with_capacity(1024 * 1024, |arena| -> CompactResult<()> {
+        for (name, payload) in payloads {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let bytes = CompactBytes::from_slice_in(black_box(payload), arena)?;
+                black_box(bytes.as_slice());
+            }
+            let compact_time = started.elapsed();
+
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let bytes = black_box(payload).to_vec();
+                black_box(&bytes);
+            }
+            let native_time = started.elapsed();
+            println!("byte payload {name:>8}: compact={compact_time:?}; Vec={native_time:?}");
+        }
+        Ok(())
+    })??;
+    Ok(())
 }
 
 fn benchmark_field(name: &str, offset: usize, width: u8, iterations: usize) {
@@ -113,6 +159,7 @@ fn main() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     ] {
         benchmark_field(name, offset, width, ITERATIONS);
     }
+    benchmark_compact_bytes()?;
 
     StdArena::with_capacity(4096, |arena| -> CompactResult<()> {
         let logical = BenchFields {

@@ -152,7 +152,8 @@ values without duplicating ownership. `pop`, `truncate`, `clear`, and drop
 preserve ordinary destructor ownership.
 
 `CompactString` stores up to twelve UTF-8 bytes inline and owns reclaimable
-arena bytes after promotion.
+arena bytes after promotion. `CompactBytes` stores up to twenty arbitrary
+bytes inline and owns reclaimable arena storage for longer payloads.
 
 `CompactSmallVec<T, N>` stores up to `N` values inline before promotion.
 

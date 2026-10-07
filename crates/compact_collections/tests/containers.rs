@@ -1,7 +1,7 @@
 use compact_backend_std::StdArena;
 use compact_collections::{
-    CollectionError, CompactBitVec, CompactBox, CompactInterner, CompactOption, CompactSlab,
-    CompactSmallVec, CompactString, CompactVec, InternId,
+    CollectionError, CompactBitVec, CompactBox, CompactBytes, CompactInterner, CompactOption,
+    CompactSlab, CompactSmallVec, CompactString, CompactVec, InternId,
 };
 use compact_core::CompactValue;
 use compact_core::Offset32;
@@ -109,6 +109,81 @@ fn nested_scratch_scopes_host_temporary_compact_collections() {
             })
             .unwrap();
         assert_eq!(arena.used_bytes(), outer_used);
+    })
+    .unwrap();
+}
+
+#[test]
+fn compact_bytes_promotes_retains_capacity_and_returns_inline() {
+    StdArena::with_capacity(512, |arena| {
+        let baseline = arena.used_bytes();
+        let mut bytes = CompactBytes::new_in(arena);
+        assert_eq!(bytes.capacity(), 20);
+        bytes
+            .extend_from_slice_in(b"0123456789abcdefghij", arena)
+            .unwrap();
+        assert_eq!(arena.used_bytes(), baseline);
+        bytes.push(b'!', arena).unwrap();
+        assert!(bytes.capacity() >= 21);
+        assert_eq!(bytes.as_slice(), b"0123456789abcdefghij!");
+
+        let heap_capacity = bytes.capacity();
+        bytes.truncate(7);
+        assert_eq!(bytes.as_slice(), b"0123456");
+        bytes.clear();
+        assert_eq!(bytes.capacity(), heap_capacity);
+        bytes.extend_from_slice_in(b"reuse", arena).unwrap();
+        assert_eq!(bytes.as_slice(), b"reuse");
+
+        bytes.reserve(25, arena).unwrap();
+        bytes.extend_from_slice(&[9; 25], arena).unwrap();
+        bytes.truncate(24);
+        bytes.shrink_to_fit(arena).unwrap();
+        assert_eq!(bytes.capacity(), 24);
+        bytes.truncate(7);
+        bytes.shrink_to_fit_in(arena).unwrap();
+        assert_eq!(bytes.capacity(), 20);
+        assert_eq!(arena.used_bytes(), baseline);
+    })
+    .unwrap();
+}
+
+#[test]
+fn compact_bytes_split_and_traits_match_byte_slices() {
+    StdArena::with_capacity(512, |arena| {
+        let mut expected = (0_u8..40).collect::<std::vec::Vec<_>>();
+        let mut bytes = CompactBytes::from_slice(&expected, arena).unwrap();
+        assert_eq!(bytes.as_slice(), expected.as_slice());
+        assert_eq!(bytes.as_ref(), expected.as_slice());
+        assert_eq!(bytes[3], 3);
+        bytes[3] = 99;
+        expected[3] = 99;
+
+        let right = bytes.split_off(10, arena).unwrap();
+        assert_eq!(bytes.as_slice(), &expected[..10]);
+        assert_eq!(right.as_slice(), &expected[10..]);
+        assert_eq!(
+            bytes.split_off_in(bytes.len() + 1, arena).unwrap_err(),
+            CollectionError::Core(compact_core::Error::OutOfBounds)
+        );
+        let all = bytes.split_off_in(0, arena).unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(all.as_slice().len(), 10);
+    })
+    .unwrap();
+}
+
+#[test]
+fn compact_bytes_growth_failure_preserves_contents() {
+    StdArena::with_capacity(compact_core::MIN_ARENA_BYTES, |arena| {
+        let mut bytes = CompactBytes::from_slice_in(b"kept inline", arena).unwrap();
+        let old = bytes.as_slice().to_vec();
+        let error = bytes.extend_from_slice_in(&[0xAA; 128], arena).unwrap_err();
+        assert!(matches!(
+            error,
+            CollectionError::Core(compact_core::Error::AllocationExhausted)
+        ));
+        assert_eq!(bytes.as_slice(), old);
     })
     .unwrap();
 }
