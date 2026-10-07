@@ -11,6 +11,7 @@ mod compact_bytes;
 mod deque;
 mod enum_value;
 mod error;
+mod hash_map;
 mod intern;
 mod slab;
 mod small;
@@ -23,6 +24,9 @@ pub use compact_bytes::{CompactBytes, COMPACT_BYTES_INLINE_CAPACITY};
 pub use deque::{CompactRing, CompactVecDeque, CompactVecDequeIter};
 pub use enum_value::CompactEnum;
 pub use error::{CollectionError, Result};
+pub use hash_map::{
+    CompactHashMap, CompactHashMapEntry, CompactHashMapIter, CompactHashMapIterMut, CompactHashSet,
+};
 pub use intern::{CompactInterner, InternId};
 pub use slab::{CompactSlab, SlabHandle};
 pub use small::CompactSmallVec;

@@ -170,6 +170,20 @@ removes and drops the oldest entry before writing into that slot. If the
 removed entry's destructor panics, the entry remains removed and the new value
 is not inserted.
 
+### CompactHashMap and CompactHashSet
+
+The open-addressed map owns separate control-byte and entry allocations.
+Control bytes distinguish empty slots, live entries, and tombstones. A 7/8
+maximum load keeps at least one empty slot available for bounded probing.
+Removal publishes a tombstone before moving the pair out; insertion fully
+initializes a pair before publishing its occupied state.
+
+Growth and shrinking allocate a replacement table and calculate every new
+slot before moving any pair. Hashing can panic during that planning pass, so
+the old table stays intact until all hashes succeed. The std facade defaults
+to `RandomState`; callers can supply any `BuildHasher`. `CompactHashSet` wraps
+the map with unit values.
+
 ### CompactSlab
 
 A slab combines slot generations with the owning allocation identity. A handle

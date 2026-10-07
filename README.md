@@ -165,6 +165,24 @@ handles remain invalid after slot or allocation reuse.
 
 `CompactInterner` uses a linear scan intended for small intern sets.
 
+`CompactHashMap<K, V>` and `CompactHashSet<T>` use arena-owned open-addressed
+tables. Their default hasher is randomized; custom `BuildHasher` values are
+supported. Operations that can allocate, such as insertion, reserve, and
+shrink, take the arena explicitly. Lookup and iteration validate the owning
+arena before returning borrowed values.
+
+```rust
+use compact_std::prelude::*;
+
+StdArena::with_capacity(16 * 1024, |arena| {
+    let mut counts = HashMap::new();
+    counts.insert(42_u32, 1_u32, arena)?;
+    counts.insert(42, 2, arena)?;
+    assert_eq!(counts.get(&42, arena)?, Some(&2));
+    Ok::<_, CollectionError>(())
+})??;
+```
+
 Borrowed `&[T]`, `&[u8]`, and `&str` views remain tied to the wrapper and
 arena borrow.
 

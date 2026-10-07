@@ -174,3 +174,10 @@ Before changing unsafe runtime code, verify:
 6. every returned reference is bounded by the real arena and owner lifetime;
 7. failure before commit leaves prior logical state valid;
 8. backing storage remains stable while any branded object exists.
+
+The compact hash map keeps its entry allocation in `MaybeUninit` slots and
+uses control bytes as the sole live-entry state. `iter_mut` uses a raw base
+pointer to yield disjoint mutable values; it advances monotonically, yields
+each occupied slot once, and keeps an exclusive borrow marker for the map's
+full lifetime. Rehash planning may call user hashing code, so all destination
+slots are computed before any old entry moves.
