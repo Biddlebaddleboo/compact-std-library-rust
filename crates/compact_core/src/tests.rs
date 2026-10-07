@@ -1,8 +1,9 @@
 use core::mem::{align_of, MaybeUninit};
 
 use crate::{
-    bits_required, checked_align_up, smallest_word, with_arena, BitField, ByteRange32, Error,
-    Offset32, PackedWord, StableBacking, StorageWord,
+    bits_required, checked_align_up, smallest_word, with_arena, with_arena_attached,
+    with_arena_persistent, BitField, ByteRange32, Error, Offset32, PackedWord, StableBacking,
+    StorageWord,
 };
 
 struct TestBacking {
@@ -29,6 +30,57 @@ unsafe impl StableBacking for TestBacking {
 fn offsets_are_four_bytes_for_representative_types() {
     assert_eq!(core::mem::size_of::<Offset32<'static, u8>>(), 4);
     assert_eq!(core::mem::size_of::<Offset32<'static, u64>>(), 4);
+}
+
+#[test]
+fn persistent_arena_reattaches_without_resetting_allocator_state() {
+    let mut backing = TestBacking::new(512);
+    let (root, used_after_first_access) = with_arena_persistent(&mut backing, |arena| {
+        let root = arena.alloc_value(41_u32).unwrap();
+        (root.as_u32(), arena.used_bytes())
+    })
+    .unwrap();
+
+    // SAFETY: this is the exact backing initialized above; no other arena is
+    // attached and the backing remains at the same address.
+    let used_after_second_access = unsafe {
+        with_arena_attached(&mut backing, |arena| {
+            // SAFETY: `root` was returned by `alloc_value` in this persistent
+            // backing and has not been released or overwritten.
+            let root: Offset32<'_, u32> = Offset32::from_persistent_raw_unchecked(root);
+            assert_eq!(*arena.get(root).unwrap(), 41);
+            assert_eq!(arena.used_bytes(), used_after_first_access);
+            arena.alloc_value(73_u64).unwrap();
+            arena.used_bytes()
+        })
+    }
+    .unwrap();
+    assert!(used_after_second_access > used_after_first_access);
+
+    // SAFETY: the same backing remains alive and only one attachment is active.
+    unsafe {
+        with_arena_attached(&mut backing, |arena| {
+            assert_eq!(arena.used_bytes(), used_after_second_access);
+        })
+    }
+    .unwrap();
+}
+
+#[test]
+fn persistent_arena_rejects_a_corrupted_header() {
+    let mut backing = TestBacking::new(256);
+    with_arena_persistent(&mut backing, |arena| {
+        arena.alloc_value(1_u8).unwrap();
+    })
+    .unwrap();
+    // SAFETY: persistent initialization wrote the full header, including byte 0.
+    let first = unsafe { backing.bytes[0].assume_init() };
+    backing.bytes[0] = MaybeUninit::new(first ^ 0x80);
+
+    // SAFETY: this is still the same initialized backing, with only its header
+    // deliberately corrupted to exercise attach-time validation.
+    let error = unsafe { with_arena_attached(&mut backing, |_| ()) }.unwrap_err();
+    assert_eq!(error, Error::InitializationError);
 }
 
 #[test]

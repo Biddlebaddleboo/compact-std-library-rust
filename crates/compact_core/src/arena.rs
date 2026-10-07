@@ -34,6 +34,76 @@ where
     let mut arena = Arena {
         region,
         state,
+        drop_state: true,
+        brand: PhantomData,
+        not_send_sync: PhantomData,
+    };
+    Ok(action(&mut arena))
+}
+
+/// Initialize an arena in `backing` and preserve its allocator state after
+/// `action` returns so a trusted owner can attach again later.
+///
+/// The callback's higher-ranked arena lifetime prevents branded handles and
+/// references from escaping. Persistent values must use non-owning compact
+/// descriptors whose destructor behavior is handled by their owner.
+pub fn with_arena_persistent<'memory, B, R, F>(backing: &'memory mut B, action: F) -> Result<R>
+where
+    B: StableBacking + ?Sized,
+    F: for<'arena> FnOnce(&mut Arena<'arena, 'memory>) -> R,
+{
+    let region = backing.bytes_mut();
+    if region.len() < crate::MIN_ARENA_BYTES {
+        return Err(Error::InvalidCapacity);
+    }
+    if region.len() as u64 > MAX_ARENA_BYTES {
+        return Err(Error::BackingTooLarge);
+    }
+
+    let (state, _) = ArenaState::place_persistent(region)?;
+    let mut arena = Arena {
+        region,
+        state,
+        drop_state: false,
+        brand: PhantomData,
+        not_send_sync: PhantomData,
+    };
+    Ok(action(&mut arena))
+}
+
+/// Attach to allocator state previously initialized by
+/// [`with_arena_persistent`].
+///
+/// # Safety
+///
+/// `backing` must be the exact stable allocation previously passed to
+/// `with_arena_persistent`. Its allocation must not have moved or been
+/// overwritten, and no other arena may currently be attached to it. Arena
+/// accesses may update its allocator state between attachments. The header
+/// and allocator links are validated before access, but this function cannot
+/// prove that an arbitrary initialized byte region originated from this
+/// allocator. Invalid or ABI-incompatible state returns
+/// [`Error::InitializationError`].
+pub unsafe fn with_arena_attached<'memory, B, R, F>(backing: &'memory mut B, action: F) -> Result<R>
+where
+    B: StableBacking + ?Sized,
+    F: for<'arena> FnOnce(&mut Arena<'arena, 'memory>) -> R,
+{
+    let region = backing.bytes_mut();
+    if region.len() < crate::MIN_ARENA_BYTES {
+        return Err(Error::InvalidCapacity);
+    }
+    if region.len() as u64 > MAX_ARENA_BYTES {
+        return Err(Error::BackingTooLarge);
+    }
+
+    // SAFETY: the caller guarantees the bytes contain an initialized state
+    // from this exact stable backing; attach checks its header and links.
+    let (state, _) = ArenaState::attach_persistent(region)?;
+    let mut arena = Arena {
+        region,
+        state,
+        drop_state: false,
         brand: PhantomData,
         not_send_sync: PhantomData,
     };
@@ -51,17 +121,20 @@ where
 pub struct Arena<'arena, 'memory> {
     region: &'memory mut [MaybeUninit<u8>],
     state: NonNull<ArenaState>,
+    drop_state: bool,
     brand: PhantomData<fn(&'arena mut ()) -> &'arena mut ()>,
-    // V1 arenas are single-owner and intentionally do not imply thread-safe
+    // Arenas are single-owner and intentionally do not imply thread-safe
     // access, even when the underlying byte allocation itself is Send/Sync.
     not_send_sync: PhantomData<*mut ()>,
 }
 
 impl Drop for Arena<'_, '_> {
     fn drop(&mut self) {
-        // SAFETY: with_arena's generative callback prevents allocations from
-        // escaping; all owners are dropped before this state header is ended.
-        unsafe { core::ptr::drop_in_place(self.state.as_ptr()) };
+        if self.drop_state {
+            // SAFETY: `with_arena`'s generative callback prevents allocations
+            // from escaping; all owners are dropped before this state ends.
+            unsafe { core::ptr::drop_in_place(self.state.as_ptr()) };
+        }
     }
 }
 

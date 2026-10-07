@@ -63,6 +63,23 @@ format. Packed numeric storage uses target-native byte order.
 Arenas and owning compact allocations are intentionally single-owner and are
 not a cross-thread ownership mechanism.
 
+## Persistent in-process stores
+
+`CompactStore<T>` owns a stable backing and preserves allocator state across
+callbacks. Its root is restricted to `Copy + CompactValue + 'static` values, so
+the store never erases a destructor obligation or keeps an arena-branded value
+inside itself. Each access rebrands a checked root handle for that callback:
+
+```rust
+let mut store = CompactStore::<u32>::build(4096, |arena| arena.alloc_value(41))?;
+let value = store.with(|arena, root| root.get(arena).map(|value| *value))??;
+assert_eq!(value, 41);
+```
+
+`with_mut` supports controlled updates and further arena allocations. The
+store is an in-process owner; dropping it releases the complete backing. Raw
+arena bytes are still not a durable or cross-process format.
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for allocator and representation
 details, and [SAFETY.md](SAFETY.md) for the unsafe and lifetime contracts.
 

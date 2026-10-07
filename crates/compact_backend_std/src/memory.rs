@@ -4,7 +4,10 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::mem::MaybeUninit;
 
-use compact_core::{with_arena, Arena, Error as CoreError, Result as CoreResult, StableBacking};
+use compact_core::{
+    with_arena, with_arena_attached, with_arena_persistent, Arena, Error as CoreError,
+    Result as CoreResult, StableBacking,
+};
 
 /// An owned, fixed-size standard-library backing allocation.
 ///
@@ -13,6 +16,7 @@ use compact_core::{with_arena, Arena, Error as CoreError, Result as CoreResult, 
 /// allocation remains at the same address until the owner is dropped.
 pub struct StdBacking {
     memory: Vec<MaybeUninit<u8>>,
+    persistent_initialized: bool,
 }
 
 impl StdBacking {
@@ -34,7 +38,10 @@ impl StdBacking {
         // elements above; set_len only exposes that reserved region and does
         // not claim the bytes contain initialized u8 values.
         unsafe { memory.set_len(capacity) };
-        Ok(Self { memory })
+        Ok(Self {
+            memory,
+            persistent_initialized: false,
+        })
     }
 
     /// Return the fixed usable capacity in bytes.
@@ -47,7 +54,28 @@ impl StdBacking {
     where
         F: for<'arena, 'memory> FnOnce(&mut Arena<'arena, 'memory>) -> R,
     {
+        self.persistent_initialized = false;
         with_arena(self, action)
+    }
+
+    /// Initialize or reattach the persistent allocator state in this backing.
+    ///
+    /// Unlike [`with_arena`](Self::with_arena), this keeps non-owning compact
+    /// data and allocator metadata available between callback invocations.
+    /// The higher-ranked callback prevents arena-branded borrows from escaping.
+    pub(crate) fn with_persistent_arena<R, F>(&mut self, action: F) -> CoreResult<R>
+    where
+        F: for<'arena, 'memory> FnOnce(&mut Arena<'arena, 'memory>) -> R,
+    {
+        if self.persistent_initialized {
+            // SAFETY: only this private fixed backing can set the flag, and its
+            // allocation is never resized or exposed while attached.
+            unsafe { with_arena_attached(self, action) }
+        } else {
+            let result = with_arena_persistent(self, action)?;
+            self.persistent_initialized = true;
+            Ok(result)
+        }
     }
 }
 

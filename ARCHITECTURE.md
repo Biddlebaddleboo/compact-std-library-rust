@@ -31,6 +31,21 @@ identity.
 
 The minimum usable backing is `MIN_ARENA_BYTES`.
 
+### Persistent `CompactStore`
+
+`CompactStore` owns a fixed `StdBacking` and initializes a separate persistent
+header containing a magic value, ABI version, capacity, and validity marker.
+Every callback validates this header and the allocator free list before
+reattaching. Ordinary `with_arena` scopes keep their existing fresh-state
+layout and behavior.
+
+The store keeps only a private raw root offset. `with` and `with_mut` create a
+freshly branded `RootHandle` after reattachment and validate it before calling
+user code. The initial `StoreRoot` contract is limited to `Copy +
+CompactValue + 'static`, so roots have no destructor to skip when their
+generative lifetime is erased. Arena-branded references and handles cannot
+escape either callback. Dropping the store releases the whole backing.
+
 ## Allocation
 
 New tail allocations use a bump-style path. Released allocations become

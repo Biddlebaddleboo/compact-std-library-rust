@@ -6,11 +6,13 @@
 //! after the callback.
 
 mod memory;
+mod store;
 
 pub use compact_core::{
-    bits_required, checked_align_up, smallest_word, validate_bit_range, Arena, BitField,
-    CompactAbiVersion, Error as CoreError, Offset32, OffsetSlice32, PackedWord,
-    Result as CoreResult, StableBacking, StorageWord, ABI_VERSION, MAX_ARENA_BYTES,
-    MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
+    bits_required, checked_align_up, smallest_word, validate_bit_range, with_arena_attached,
+    with_arena_persistent, Arena, BitField, CompactAbiVersion, Error as CoreError, Offset32,
+    OffsetSlice32, PackedWord, Result as CoreResult, StableBacking, StorageWord, ABI_VERSION,
+    MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
 };
 pub use memory::{StdArena, StdBackendError, StdBacking};
+pub use store::{CompactStore, RootHandle, StoreRoot};

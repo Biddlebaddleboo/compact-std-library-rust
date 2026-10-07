@@ -23,7 +23,7 @@ pub enum Error {
     InvalidBitRange,
     /// A value has set bits outside the selected packed field.
     ValueDoesNotFit,
-    /// An initialization operation does not match its allocated region.
+    /// Initialization does not match its region or persistent state is invalid.
     InitializationError,
     /// An allocation owner was used with an arena other than its creator.
     ForeignArena,

@@ -24,7 +24,7 @@ pub use abi::{
     OFFSET_WIDTH_BYTES,
 };
 pub use allocation::{ArenaAllocation, CompactValue};
-pub use arena::{with_arena, Arena};
+pub use arena::{with_arena, with_arena_attached, with_arena_persistent, Arena};
 pub use backing::StableBacking;
 pub use bytes::ByteRange32;
 pub use error::{Error, Result};

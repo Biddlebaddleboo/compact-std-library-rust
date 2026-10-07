@@ -7,7 +7,9 @@
 
 pub mod prelude;
 
-pub use compact_backend_std::{StdArena, StdBackendError, StdBacking};
+pub use compact_backend_std::{
+    CompactStore, RootHandle, StdArena, StdBackendError, StdBacking, StoreRoot,
+};
 pub use compact_collections::{
     CollectionError, CompactBitVec, CompactBox, CompactEnum, CompactInterner, CompactOption,
     CompactSlab, CompactSmallVec, CompactString, CompactStringWriter, CompactVec, InternId, Result,

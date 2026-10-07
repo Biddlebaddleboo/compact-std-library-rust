@@ -128,6 +128,18 @@ bytes are not a stable disk, IPC, network, or cross-process ABI.
 
 Serialize logical values into a dedicated external format instead.
 
+`CompactStore` is an in-process owner, not a persistent-file API. Its root
+contract currently requires `Copy + CompactValue + 'static`, which excludes
+destructors and borrowed arena references. The store privately retains a raw
+offset and rebrands it only after reattaching to the same stable backing,
+validating the allocator header, and resolving the initialized root. The
+callback lifetime prevents a root reference or branded handle from escaping.
+
+`Offset32::from_persistent_raw_unchecked` is unsafe because callers must prove
+that the offset still names an initialized value in the same persistent
+backing and that its storage has not been released or reused. It must never be
+used to interpret arbitrary bytes or data from another backing.
+
 ## Macro safety boundary
 
 `arena!` is intentionally conservative. If it cannot prove that a receiver is

@@ -1,0 +1,41 @@
+error: lifetime may not live long enough
+ --> tests/ui/store_reference_escape.rs:6:29
+  |
+6 |         .with(|arena, root| root.get(arena).unwrap())
+  |                -----      - ^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+  |                |          |
+  |                |          return type of closure is &'2 u32
+  |                has type `&'1 Arena<'_, '_>`
+  |
+help: dereference the return value
+  |
+6 |         .with(|arena, root| *root.get(arena).unwrap())
+  |                             +
+
+error: lifetime may not live long enough
+ --> tests/ui/store_reference_escape.rs:6:29
+  |
+6 |         .with(|arena, root| root.get(arena).unwrap())
+  |                -----      - ^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'2`
+  |                |          |
+  |                |          return type of closure is &'2 u32
+  |                has type `&Arena<'3, '_>`
+  |
+help: dereference the return value
+  |
+6 |         .with(|arena, root| *root.get(arena).unwrap())
+  |                             +
+
+error: lifetime may not live long enough
+ --> tests/ui/store_reference_escape.rs:6:29
+  |
+6 |         .with(|arena, root| root.get(arena).unwrap())
+  |                -----      - ^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'4` must outlive `'2`
+  |                |          |
+  |                |          return type of closure is &'2 u32
+  |                has type `&Arena<'_, '4>`
+  |
+help: dereference the return value
+  |
+6 |         .with(|arena, root| *root.get(arena).unwrap())
+  |                             +

@@ -75,6 +75,21 @@ impl<'arena, T> Offset32<'arena, T> {
     pub const unsafe fn from_raw_unchecked(raw: u32) -> Self {
         Self::new(raw)
     }
+
+    /// Rebrand an offset that remains live in a persistent arena backing.
+    ///
+    /// This is intended for owners that detach and later reattach to the same
+    /// allocator state, such as `CompactStore`.
+    ///
+    /// # Safety
+    ///
+    /// Unless `raw` is [`NULL_OFFSET`](crate::NULL_OFFSET), it must point to an
+    /// initialized `T` in the same persistent backing currently used by the
+    /// arena. The allocation must not have been released or reused between
+    /// arena attachments, and the backing must be the one that created it.
+    pub const unsafe fn from_persistent_raw_unchecked(raw: u32) -> Self {
+        Self::new(raw)
+    }
 }
 
 /// A compact offset plus the element count for a contiguous typed allocation.
