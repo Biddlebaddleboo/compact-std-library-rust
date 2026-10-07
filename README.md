@@ -113,9 +113,13 @@ StdArena::with_capacity(4096, |arena| -> Result<()> {
 inside its lexical block. It does not install global or thread-local ambient
 state.
 
-Native `vec![]` is rejected inside `arena!` because it would allocate a
-native `Vec`. Use `Vec::new()` plus `push`, or call explicit `*_in`
-methods when the macro cannot prove a receiver is compact.
+`arena!` rewrites `vec![]`, list, and repeat forms to compact vectors. It also
+rewrites known compact owners' `.clone()`, compact strings' `.to_string()`,
+and iterator `.collect::<...>()` calls whose target is a compact facade type.
+These constructors and conversions propagate allocation errors with `?`.
+Explicit `std::vec!` and native collection targets remain native. When a
+receiver or target type is ambiguous, use an explicit compact type annotation
+or the corresponding arena-aware API.
 
 ### `arena!` binding rules
 
@@ -134,9 +138,10 @@ values.push(1)?;
 If control flow makes a receiver ambiguous, use an explicit type annotation or
 the corresponding `*_in(..., arena)` API.
 
-Read-only closure captures can use supported compact values. Moving or mutating
-captured compact owners through macro sugar is rejected; use explicit `*_in`
-APIs instead.
+Read-only closure captures can use supported compact values. Allocation-bearing
+macro rewrites inside closures are rejected so closure traits and arena
+borrowing stay explicit; use `format_in!`, `FromIteratorIn`, `CloneIn`, and
+other explicit arena-aware APIs there.
 
 Unknown macro token streams are not rewritten.
 

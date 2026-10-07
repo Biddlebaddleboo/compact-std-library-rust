@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::parse::{Parse, ParseStream, Parser};
 use syn::punctuated::Punctuated;
@@ -23,6 +23,23 @@ impl Parse for ArenaInput {
             return Err(input.error("unexpected tokens after arena block"));
         }
         Ok(Self { arena, block })
+    }
+}
+
+struct RepeatVecArgs {
+    value: Expr,
+    count: Expr,
+}
+
+impl Parse for RepeatVecArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let value = input.parse()?;
+        input.parse::<Token![;]>()?;
+        let count = input.parse()?;
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after vec! repeat count"));
+        }
+        Ok(Self { value, count })
     }
 }
 
@@ -55,12 +72,33 @@ enum LocalKind {
     Vec,
     String,
     Box,
+    Bytes,
+    VecDeque,
+    SmallVec,
+    HashMap,
+    HashSet,
+    Ring,
+    OsString,
+    PathBuf,
     Tuple(Vec<LocalKind>),
 }
 
 impl LocalKind {
     fn is_compact(&self) -> bool {
-        matches!(self, Self::Vec | Self::String | Self::Box)
+        matches!(
+            self,
+            Self::Vec
+                | Self::String
+                | Self::Box
+                | Self::Bytes
+                | Self::VecDeque
+                | Self::SmallVec
+                | Self::HashMap
+                | Self::HashSet
+                | Self::Ring
+                | Self::OsString
+                | Self::PathBuf
+        )
     }
 
     fn owns_compact_value(&self) -> bool {
@@ -159,8 +197,20 @@ impl VisitMut for ArenaRewrite {
                 return;
             }
             Expr::MethodCall(call) => {
+                if let Some(rewritten) = self.rewrite_arena_method(call) {
+                    *expression = rewritten;
+                    self.visit_expr_mut(expression);
+                    return;
+                }
                 self.rewrite_method_call(call);
                 visit_mut::visit_expr_method_call_mut(self, call);
+                return;
+            }
+            Expr::Macro(expression_macro) if is_vec_macro(&expression_macro.mac.path) => {
+                let tokens = expression_macro.mac.tokens.clone();
+                if let Some(rewritten) = self.rewrite_vec_macro(tokens, expression_macro) {
+                    *expression = rewritten;
+                }
                 return;
             }
             Expr::Macro(expression_macro) if is_format_macro(&expression_macro.mac.path) => {
@@ -177,13 +227,6 @@ impl VisitMut for ArenaRewrite {
     }
 
     fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
-        if mac.path.is_ident("vec") {
-            self.errors.push(syn::Error::new_spanned(
-                mac,
-                "vec! allocates a native Vec; use Vec::new() and push compact values inside arena!",
-            ));
-            return;
-        }
         let name = mac
             .path
             .segments
@@ -211,6 +254,139 @@ impl VisitMut for ArenaRewrite {
 }
 
 impl ArenaRewrite {
+    fn rewrite_vec_macro(
+        &mut self,
+        tokens: TokenStream,
+        expression_macro: &syn::ExprMacro,
+    ) -> Option<Expr> {
+        if !self.closure_boundaries.is_empty() {
+            self.errors.push(syn::Error::new_spanned(
+                expression_macro,
+                "arena! cannot rewrite vec! inside a closure; construct the compact vector explicitly inside the closure",
+            ));
+            return None;
+        }
+
+        if let Ok(mut repeated) = syn::parse2::<RepeatVecArgs>(tokens.clone()) {
+            self.classify_expr(&repeated.value, true);
+            self.visit_expr_mut(&mut repeated.value);
+            self.visit_expr_mut(&mut repeated.count);
+
+            let value_ident = Ident::new("__compact_vec_value", Span::mixed_site());
+            let count_ident = Ident::new("__compact_vec_count", Span::mixed_site());
+            let vector_ident = Ident::new("__compact_vec_output", Span::mixed_site());
+            let clone_ident = Ident::new("__compact_vec_clone", Span::mixed_site());
+            let value = repeated.value;
+            let count = repeated.count;
+            let arena = &self.arena;
+            return Some(syn::parse_quote!({
+                let #value_ident = #value;
+                let #count_ident: usize = #count;
+                let mut #vector_ident = ::compact_std::CompactVec::with_capacity_in(
+                    #count_ident,
+                    #arena,
+                )?;
+                if #count_ident > 0 {
+                    #vector_ident.push_in(#value_ident, #arena)?;
+                    for _ in 1..#count_ident {
+                        let #clone_ident = ::compact_std::__private::collections::CloneIn::clone_in(
+                            #vector_ident
+                                .get(0, #arena)?
+                                .expect("repeated vec! has an initial element"),
+                            #arena,
+                        )?;
+                        #vector_ident.push_in(#clone_ident, #arena)?;
+                    }
+                }
+                #vector_ident
+            }));
+        }
+
+        let parser = Punctuated::<Expr, Token![,]>::parse_terminated;
+        let mut values = match parser.parse2(tokens) {
+            Ok(values) => values,
+            Err(error) => {
+                self.errors.push(error);
+                return None;
+            }
+        };
+        for value in &values {
+            self.classify_expr(value, true);
+        }
+        for value in &mut values {
+            self.visit_expr_mut(value);
+        }
+        let arena = &self.arena;
+        Some(syn::parse_quote!(
+            <::compact_std::CompactVec<'_, _> as
+                ::compact_std::__private::collections::FromIteratorIn<'_, _>>::from_iter_in(
+                    [#values],
+                    #arena,
+                )?
+        ))
+    }
+
+    fn rewrite_arena_method(&mut self, call: &ExprMethodCall) -> Option<Expr> {
+        if !call.args.is_empty() {
+            return None;
+        }
+        if call.method == "collect"
+            && collect_target(call).is_some_and(|target| classify_type(target).is_compact())
+        {
+            if !self.closure_boundaries.is_empty() {
+                self.errors.push(syn::Error::new_spanned(
+                    call,
+                    "arena! cannot allocate while rewriting `collect()` inside a closure; call FromIteratorIn explicitly there",
+                ));
+                return Some(Expr::MethodCall(call.clone()));
+            }
+            let target = collect_target(call)?;
+            let iterator = call.receiver.as_ref();
+            let arena = &self.arena;
+            return Some(syn::parse_quote!(
+                <#target as ::compact_std::__private::collections::FromIteratorIn<'_, _>>::from_iter_in(
+                    #iterator,
+                    #arena,
+                )?
+            ));
+        }
+        let kind = self.classify_expr(&call.receiver, false);
+        let method = call.method.to_string();
+        let rewrite = match (kind, method.as_str()) {
+            (LocalKind::String, "to_string") => Some("to_string"),
+            (kind, "clone") if kind.is_compact() => Some("clone"),
+            _ => None,
+        }?;
+
+        if !self.closure_boundaries.is_empty() {
+            self.errors.push(syn::Error::new_spanned(
+                call,
+                format!(
+                    "arena! cannot allocate while rewriting `{method}()` inside a closure; call the explicit arena-aware API there"
+                ),
+            ));
+            return Some(Expr::MethodCall(call.clone()));
+        }
+
+        let arena = &self.arena;
+        let receiver_expr = call.receiver.as_ref();
+        match rewrite {
+            "to_string" => Some(syn::parse_quote!(
+                ::compact_std::__private::collections::ToCompactStringIn::to_compact_string_in(
+                    &(#receiver_expr),
+                    #arena,
+                )?
+            )),
+            "clone" => Some(syn::parse_quote!(
+                ::compact_std::__private::collections::CloneIn::clone_in(
+                    &(#receiver_expr),
+                    #arena,
+                )?
+            )),
+            _ => None,
+        }
+    }
+
     fn rewrite_format_macro(&mut self, expression_macro: &mut syn::ExprMacro) {
         if !self.closure_boundaries.is_empty() {
             self.errors.push(syn::Error::new_spanned(
@@ -468,6 +644,27 @@ impl ArenaRewrite {
                     }
                 }
                 kind
+            }
+            Expr::MethodCall(call) => match call.method.to_string().as_str() {
+                "clone" => {
+                    let kind = self.classify_expr(&call.receiver, false);
+                    if kind.is_compact() {
+                        kind
+                    } else {
+                        LocalKind::Unknown
+                    }
+                }
+                "to_string" if self.classify_expr(&call.receiver, false) == LocalKind::String => {
+                    LocalKind::String
+                }
+                "collect" => collect_target(call)
+                    .map(classify_type)
+                    .filter(LocalKind::is_compact)
+                    .unwrap_or(LocalKind::Unknown),
+                _ => LocalKind::Unknown,
+            },
+            Expr::Macro(expression_macro) if is_vec_macro(&expression_macro.mac.path) => {
+                LocalKind::Vec
             }
             Expr::Macro(expression_macro) if is_format_macro(&expression_macro.mac.path) => {
                 LocalKind::String
@@ -731,6 +928,28 @@ fn is_format_macro(path: &Path) -> bool {
         || matches!(names.as_slice(), [root, name] if (root == "std" || root == "alloc") && name == "format")
 }
 
+fn is_vec_macro(path: &Path) -> bool {
+    let names: Vec<_> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    matches!(names.as_slice(), [name] if name == "vec")
+}
+
+fn collect_target(call: &ExprMethodCall) -> Option<&Type> {
+    if call.method != "collect" || !call.args.is_empty() {
+        return None;
+    }
+    let arguments = call.turbofish.as_ref()?;
+    let mut types = arguments.args.iter().filter_map(|argument| match argument {
+        syn::GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    let target = types.next()?;
+    types.next().is_none().then_some(target)
+}
+
 fn classify_block_tail(rewrite: &mut ArenaRewrite, block: &Block, consume: bool) -> LocalKind {
     match block.stmts.last() {
         Some(syn::Stmt::Expr(expression, None)) => rewrite.classify_expr(expression, consume),
@@ -798,11 +1017,26 @@ fn classify_type_path(path: &Path) -> LocalKind {
     if is_std_type_path(&names) {
         return LocalKind::KnownNonCompact;
     }
+    if names.len() > 1
+        && !(names.first().is_some_and(|name| name == "compact_std")
+            && (names.len() == 2
+                || (names.len() == 3 && names.get(1).is_some_and(|name| name == "prelude"))))
+    {
+        return LocalKind::KnownNonCompact;
+    }
     match last {
         "Vec" | "CompactVec" => LocalKind::Vec,
         "String" | "CompactString" => LocalKind::String,
         "Box" | "CompactBox" => LocalKind::Box,
-        "Option" | "Result" | "HashMap" | "HashSet" => LocalKind::KnownNonCompact,
+        "CompactBytes" => LocalKind::Bytes,
+        "CompactVecDeque" => LocalKind::VecDeque,
+        "CompactSmallVec" => LocalKind::SmallVec,
+        "HashMap" | "CompactHashMap" => LocalKind::HashMap,
+        "HashSet" | "CompactHashSet" => LocalKind::HashSet,
+        "CompactRing" => LocalKind::Ring,
+        "OsString" | "CompactOsString" => LocalKind::OsString,
+        "PathBuf" | "CompactPathBuf" => LocalKind::PathBuf,
+        "Option" | "Result" => LocalKind::KnownNonCompact,
         _ => LocalKind::Unknown,
     }
 }
@@ -811,7 +1045,11 @@ fn is_std_type_path(names: &[String]) -> bool {
     names.starts_with(&["std".to_owned(), "vec".to_owned()])
         || names.starts_with(&["std".to_owned(), "string".to_owned()])
         || names.starts_with(&["std".to_owned(), "boxed".to_owned()])
-        || names.starts_with(&["::std".to_owned()])
+        || names.starts_with(&["std".to_owned(), "collections".to_owned()])
+        || names.starts_with(&["alloc".to_owned(), "vec".to_owned()])
+        || names.starts_with(&["alloc".to_owned(), "string".to_owned()])
+        || names.starts_with(&["alloc".to_owned(), "boxed".to_owned()])
+        || names.starts_with(&["alloc".to_owned(), "collections".to_owned()])
 }
 
 fn classify_constructor(expression: &ExprCall) -> LocalKind {
@@ -829,6 +1067,15 @@ fn classify_constructor(expression: &ExprCall) -> LocalKind {
             "new" | "with_capacity" | "new_in" | "with_capacity_in"
         ) | ("String", "new" | "from" | "new_in" | "from_str_in")
             | ("Box", "new" | "new_in")
+            | (
+                "OsString",
+                "new" | "from" | "from_os_str" | "from_os_string" | "new_in"
+            )
+            | ("PathBuf", "new" | "from" | "from_path" | "new_in")
+            | (
+                "HashMap" | "HashSet",
+                "new" | "with_hasher" | "with_capacity" | "with_capacity_and_hasher"
+            )
     );
     if !recognized {
         LocalKind::Unknown
@@ -837,6 +1084,10 @@ fn classify_constructor(expression: &ExprCall) -> LocalKind {
             "Vec" => LocalKind::Vec,
             "String" => LocalKind::String,
             "Box" => LocalKind::Box,
+            "OsString" => LocalKind::OsString,
+            "PathBuf" => LocalKind::PathBuf,
+            "HashMap" => LocalKind::HashMap,
+            "HashSet" => LocalKind::HashSet,
             _ => LocalKind::Unknown,
         }
     } else {
@@ -859,6 +1110,10 @@ fn constructor_owner(path: &Path) -> Option<(&'static str, bool)> {
         "Vec" | "CompactVec" => "Vec",
         "String" | "CompactString" => "String",
         "Box" | "CompactBox" => "Box",
+        "OsString" | "CompactOsString" => "OsString",
+        "PathBuf" | "CompactPathBuf" => "PathBuf",
+        "HashMap" | "CompactHashMap" => "HashMap",
+        "HashSet" | "CompactHashSet" => "HashSet",
         _ => return None,
     };
     let prefix: Vec<_> = segments
@@ -871,11 +1126,27 @@ fn constructor_owner(path: &Path) -> Option<(&'static str, bool)> {
         [root, alias] if root == "compact_std" => {
             matches!(
                 alias.as_str(),
-                "Vec" | "String" | "Box" | "CompactVec" | "CompactString" | "CompactBox"
+                "Vec"
+                    | "String"
+                    | "Box"
+                    | "CompactVec"
+                    | "CompactString"
+                    | "CompactBox"
+                    | "OsString"
+                    | "PathBuf"
+                    | "CompactOsString"
+                    | "CompactPathBuf"
+                    | "HashMap"
+                    | "HashSet"
+                    | "CompactHashMap"
+                    | "CompactHashSet"
             )
         }
         [root, module, alias] if root == "compact_std" && module == "prelude" => {
-            matches!(alias.as_str(), "Vec" | "String" | "Box")
+            matches!(
+                alias.as_str(),
+                "Vec" | "String" | "Box" | "HashMap" | "HashSet" | "OsString" | "PathBuf"
+            )
         }
         [root, module, alias] if root == "std" || root == "alloc" => false,
         _ => false,
@@ -898,6 +1169,14 @@ fn rewrite_constructor(call: &ExprCall, arena: &Ident) -> Option<Expr> {
         ("String", "new", 0) => "new_in",
         ("String", "from", 1) => "from_str_in",
         ("Box", "new", 1) => "new_in",
+        ("OsString", "new", 0) | ("PathBuf", "new", 0) => "new_in",
+        ("OsString", "from", 1) => "from",
+        ("OsString", "from_os_str", 1) => "from_os_str",
+        ("OsString", "from_os_string", 1) => "from_os_string",
+        ("PathBuf", "from", 1) => "from",
+        ("PathBuf", "from_path", 1) => "from_path",
+        ("HashMap" | "HashSet", "with_capacity", 1) => "with_capacity",
+        ("HashMap" | "HashSet", "with_capacity_and_hasher", 2) => "with_capacity_and_hasher",
         _ => return None,
     };
     let mut rewritten_path = path.clone();

@@ -111,7 +111,7 @@ impl<'arena, T: CompactValue> CompactVec<'arena, T> {
     pub fn get<'view>(
         &'view self,
         index: usize,
-        arena: &'view Arena<'arena, '_>,
+        arena: &Arena<'arena, '_>,
     ) -> Result<Option<&'view T>> {
         if let Some(storage) = &self.storage {
             arena.validate_owned(storage)?;

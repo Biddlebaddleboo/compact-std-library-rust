@@ -47,9 +47,11 @@ pub fn compact(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// Binding analysis is conservative. Helper-returned compact values may need an
 /// explicit compact type annotation. Ambiguous receivers and moving or
 /// mutating closure captures require explicit `*_in(..., arena)` APIs.
-/// Native `vec![]` is rejected inside `arena!`. `format!` inside closures
-/// must be written as `format_in!(arena, ...)?` so mutable arena capture stays
-/// explicit.
+/// `vec!`, known compact-owner `.clone()`, compact-string `.to_string()`, and
+/// explicitly typed compact `.collect()` calls are rewritten through the
+/// arena-aware collection traits. Allocation-bearing rewrites propagate
+/// errors with `?`. Allocation-bearing sugar inside closures must use explicit
+/// arena-aware APIs so mutable arena capture stays visible.
 #[proc_macro]
 pub fn arena(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as arena::ArenaInput);

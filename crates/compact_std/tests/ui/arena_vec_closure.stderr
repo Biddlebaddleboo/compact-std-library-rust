@@ -1,0 +1,5 @@
+error: arena! cannot rewrite vec! inside a closure; construct the compact vector explicitly inside the closure
+ --> tests/ui/arena_vec_closure.rs:8:39
+  |
+8 |                 let _make_values = || vec![1_u32, 2, 3];
+  |                                       ^^^^^^^^^^^^^^^^^
