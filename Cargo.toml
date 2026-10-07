@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/compact_core",
+    "crates/compact_backend_std",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/Biddlebaddleboo/compact-std-library-rust"
+rust-version = "1.81"
