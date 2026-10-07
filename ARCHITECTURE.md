@@ -122,6 +122,11 @@ compact values into that arena; the ordinary `Clone` trait is reserved for
 operations that do not need hidden allocation context. `ToCompactStringIn`
 formats through a compact writer and returns arena errors directly.
 
+`format_in!` writes `fmt::Arguments` to `CompactStringWriter`. The writer
+records the original arena error behind `fmt::Error`, then returns that error
+to the caller while leaving any completed UTF-8 prefix valid. `arena!` rewrites
+recognized `format!` calls to this fallible path.
+
 ### CompactVec
 
 `CompactVec<T>` owns one optional `ArenaAllocation<T>`.

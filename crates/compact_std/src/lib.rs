@@ -10,6 +10,7 @@ pub mod prelude;
 pub use compact_backend_std::{
     CompactStore, RootHandle, StdArena, StdBackendError, StdBacking, StoreRoot,
 };
+pub use compact_collections::format_in;
 pub use compact_collections::{
     CloneIn, CollectionError, CompactBitVec, CompactBox, CompactBytes, CompactComponent,
     CompactComponentKind, CompactComponents, CompactEnum, CompactHashMap, CompactHashMapEntry,

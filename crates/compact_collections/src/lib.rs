@@ -39,3 +39,35 @@ pub use slab::{CompactSlab, SlabHandle};
 pub use small::CompactSmallVec;
 pub use string::{CompactString, CompactStringWriter};
 pub use vec::CompactVec;
+
+/// Implementation details referenced by exported macros.
+#[doc(hidden)]
+pub mod __private {
+    use compact_core::Arena;
+    use core::fmt;
+
+    use crate::{CompactString, Result};
+
+    /// Format directly into a compact string with an explicit arena.
+    pub fn format_args_in<'arena>(
+        arena: &mut Arena<'arena, '_>,
+        arguments: fmt::Arguments<'_>,
+    ) -> Result<CompactString<'arena>> {
+        let mut text = CompactString::empty();
+        text.writer(arena).write_fmt_in(arguments)?;
+        Ok(text)
+    }
+}
+
+/// Format a value into arena-backed UTF-8 storage.
+///
+/// The result is fallible because the compact string grows through `arena`.
+#[macro_export]
+macro_rules! format_in {
+    ($arena:expr, $($argument:tt)*) => {
+        $crate::__private::format_args_in(
+            $arena,
+            ::core::format_args!($($argument)*),
+        )
+    };
+}

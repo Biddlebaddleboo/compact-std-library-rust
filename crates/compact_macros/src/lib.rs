@@ -40,13 +40,16 @@ pub fn compact(attributes: TokenStream, input: TokenStream) -> TokenStream {
 ///
 /// The named arena must already be an `&mut compact_core::Arena`. Supported
 /// constructors include `Vec::new`, `Vec::with_capacity`, `String::new`,
-/// `String::from`, and `Box::new`; supported local compact methods receive
+/// `String::from`, and `Box::new`; standard `format!` calls are rewritten to
+/// fallible arena-backed formatting. Supported local compact methods receive
 /// the arena argument at the rewritten call site.
 ///
 /// Binding analysis is conservative. Helper-returned compact values may need an
 /// explicit compact type annotation. Ambiguous receivers and moving or
 /// mutating closure captures require explicit `*_in(..., arena)` APIs.
-/// Native `vec![]` is rejected inside `arena!`.
+/// Native `vec![]` is rejected inside `arena!`. `format!` inside closures
+/// must be written as `format_in!(arena, ...)?` so mutable arena capture stays
+/// explicit.
 #[proc_macro]
 pub fn arena(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as arena::ArenaInput);

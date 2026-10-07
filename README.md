@@ -181,6 +181,11 @@ operations explicit. `ToCompactStringIn` formats through
 `CompactStringWriter`, preserving arena exhaustion as a collection error.
 These traits are the primitive operations used by `arena!` syntax lowering.
 
+`format_in!(arena, ...)` returns `Result<CompactString>` and writes UTF-8
+directly into compact storage. It preserves a valid prefix if the arena runs
+out of space. Inside `arena!`, recognized `format!(...)` calls lower to this
+fallible form.
+
 ```rust
 use compact_std::prelude::*;
 

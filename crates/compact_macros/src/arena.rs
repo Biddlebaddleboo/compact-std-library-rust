@@ -163,6 +163,10 @@ impl VisitMut for ArenaRewrite {
                 visit_mut::visit_expr_method_call_mut(self, call);
                 return;
             }
+            Expr::Macro(expression_macro) if is_format_macro(&expression_macro.mac.path) => {
+                self.rewrite_format_macro(expression_macro);
+                return;
+            }
             Expr::Path(path) => {
                 self.visit_path_use(path);
                 return;
@@ -207,6 +211,32 @@ impl VisitMut for ArenaRewrite {
 }
 
 impl ArenaRewrite {
+    fn rewrite_format_macro(&mut self, expression_macro: &mut syn::ExprMacro) {
+        if !self.closure_boundaries.is_empty() {
+            self.errors.push(syn::Error::new_spanned(
+                expression_macro,
+                "arena! cannot rewrite format! inside a closure; call format_in!(arena, ...) explicitly",
+            ));
+            return;
+        }
+
+        let parser = Punctuated::<Expr, Token![,]>::parse_terminated;
+        let mut arguments = match parser.parse2(expression_macro.mac.tokens.clone()) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                self.errors.push(error);
+                return;
+            }
+        };
+        for argument in &mut arguments {
+            self.visit_expr_mut(argument);
+        }
+
+        let arena = &self.arena;
+        expression_macro.mac.path = syn::parse_quote!(::compact_std::format_in);
+        expression_macro.mac.tokens = quote!(#arena, #arguments);
+    }
+
     fn visit_local_binding(&mut self, local: &mut syn::Local) {
         let mut kind = local
             .init
@@ -438,6 +468,9 @@ impl ArenaRewrite {
                     }
                 }
                 kind
+            }
+            Expr::Macro(expression_macro) if is_format_macro(&expression_macro.mac.path) => {
+                LocalKind::String
             }
             Expr::Path(path) => {
                 let Some(name) = self.path_local_name(path) else {
@@ -686,6 +719,16 @@ impl ArenaRewrite {
             .last()
             .is_some_and(|(boundary, _)| depth < *boundary)
     }
+}
+
+fn is_format_macro(path: &Path) -> bool {
+    let names: Vec<_> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    matches!(names.as_slice(), [name] if name == "format")
+        || matches!(names.as_slice(), [root, name] if (root == "std" || root == "alloc") && name == "format")
 }
 
 fn classify_block_tail(rewrite: &mut ArenaRewrite, block: &Block, consume: bool) -> LocalKind {

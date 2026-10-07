@@ -1,7 +1,7 @@
 //! Common imports for compact arena applications.
 
 pub use crate::{
-    arena, compact, Arena, Box, CloneIn, CollectionError, CompactBitVec, CompactBytes,
+    arena, compact, format_in, Arena, Box, CloneIn, CollectionError, CompactBitVec, CompactBytes,
     CompactComponent, CompactComponentKind, CompactComponents, CompactEnum, CompactHashMap,
     CompactHashMapEntry, CompactHashMapIter, CompactHashMapIterMut, CompactHashSet,
     CompactInterner, CompactOption, CompactOsStr, CompactOsString, CompactPath, CompactPathBuf,

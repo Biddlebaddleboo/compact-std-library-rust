@@ -38,3 +38,31 @@ fn compact_os_and_path_aliases_are_available_from_the_prelude() {
     .unwrap()
     .unwrap();
 }
+
+#[test]
+fn format_in_and_arena_format_rewriting_produce_compact_strings() {
+    StdArena::with_capacity(4096, |arena| -> Result<()> {
+        let direct = format_in!(arena, "job={} status={}", 17_u32, "ready")?;
+        assert_eq!(direct.as_str(arena)?, "job=17 status=ready");
+
+        let rewritten = arena!(arena, {
+            let name = String::from("worker")?;
+            let message = format!("hello {name}")?;
+            assert_eq!(message.as_str(arena)?, "hello worker");
+            Ok::<_, CollectionError>(message)
+        })?;
+        assert_eq!(rewritten.as_str(arena)?, "hello worker");
+        Ok(())
+    })
+    .unwrap()
+    .unwrap();
+}
+
+#[test]
+fn format_in_returns_arena_exhaustion() {
+    StdArena::with_capacity(compact_std::MIN_ARENA_BYTES, |arena| {
+        let result = format_in!(arena, "{}", "x".repeat(128));
+        assert!(result.is_err());
+    })
+    .unwrap();
+}
