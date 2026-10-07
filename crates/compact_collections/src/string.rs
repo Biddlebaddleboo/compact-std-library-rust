@@ -303,6 +303,12 @@ impl fmt::Display for CompactString<'_> {
     }
 }
 
+impl Default for CompactString<'_> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 impl fmt::Debug for CompactString<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, formatter)

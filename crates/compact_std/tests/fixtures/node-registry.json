@@ -1,0 +1,6 @@
+{
+  "nodes": {
+    "gateway": 17,
+    "worker": 23
+  }
+}

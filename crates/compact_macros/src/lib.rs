@@ -5,6 +5,7 @@ extern crate proc_macro;
 
 mod arena;
 mod compact;
+mod compact_deserialize;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, Item};
@@ -34,6 +35,15 @@ pub fn compact(attributes: TokenStream, input: TokenStream) -> TokenStream {
         )),
     };
     result.unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+/// Derive direct arena-backed Serde deserialization for compact field types.
+#[proc_macro_derive(CompactDeserialize, attributes(serde))]
+pub fn compact_deserialize(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    compact_deserialize::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
 /// Rewrite supported compact constructors and methods inside one lexical block.

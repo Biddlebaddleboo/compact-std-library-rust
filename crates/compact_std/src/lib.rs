@@ -26,7 +26,15 @@ pub use compact_core::{
     Error as CoreError, Offset32, OffsetSlice32, PackedWord, StableBacking, StorageWord,
     ABI_VERSION, MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
 };
+#[cfg(feature = "serde")]
+pub use compact_macros::CompactDeserialize;
 pub use compact_macros::{arena, compact};
+#[cfg(feature = "json")]
+pub use compact_serde::json;
+#[cfg(feature = "toml")]
+pub use compact_serde::toml;
+#[cfg(feature = "serde")]
+pub use compact_serde::{CompactDeserialize, CompactDeserializeSeed};
 
 /// Compact aliases mirroring common standard-library type names.
 pub type Box<'arena, T> = CompactBox<'arena, T>;
@@ -52,4 +60,7 @@ pub mod __private {
     pub use compact_collections as collections;
     /// Public core contracts used by generated code.
     pub use compact_core as core;
+    /// Direct compact Serde contracts used by generated implementations.
+    #[cfg(feature = "serde")]
+    pub use compact_serde as serde;
 }

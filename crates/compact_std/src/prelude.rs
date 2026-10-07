@@ -10,4 +10,7 @@ pub use crate::{
     FromIteratorIn, HashMap, HashSet, InternId, OsString, PathBuf, Result, RootHandle, SlabHandle,
     StdArena, StdBacking, StoreRoot, String, ToCompactStringIn, Vec, COMPACT_BYTES_INLINE_CAPACITY,
 };
+
+#[cfg(feature = "serde")]
+pub use crate::{CompactDeserialize, CompactDeserializeSeed};
 pub use compact_core::{ArenaAllocation, Offset32, OffsetSlice32};

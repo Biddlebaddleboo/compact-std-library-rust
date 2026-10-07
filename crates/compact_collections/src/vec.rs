@@ -243,6 +243,12 @@ impl<T: CompactValue> BorrowMut<[T]> for CompactVec<'_, T> {
     }
 }
 
+impl<T: CompactValue> Default for CompactVec<'_, T> {
+    fn default() -> Self {
+        Self { storage: None }
+    }
+}
+
 impl<T: CompactValue, I> Index<I> for CompactVec<'_, T>
 where
     [T]: Index<I>,

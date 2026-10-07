@@ -38,6 +38,7 @@ may change without changing documented V2.1.0 source syntax or behavior.
   `core`.
 - `compact_backend_std` provides stable backing memory using `std`.
 - `compact_collections` provides arena-owned compact collections and handles.
+- `compact_serde` provides direct arena-aware Serde deserialization.
 - `compact_macros` provides `#[compact]` and lexical `arena!` rewriting.
 - `compact_std` is the std-backed convenience facade that re-exports the
   runtime, collections, macros, and prelude.
@@ -180,6 +181,30 @@ arena before returning borrowed values.
 wide units without converting through UTF-8. Their borrowed `CompactOsStr` and
 `CompactPath` views stay tied to the compact owner; mutating and joining paths
 take the arena and report allocation errors.
+
+## Direct Serde deserialization
+
+Enable `serde` for `CompactDeserialize` and its derive, `json` for JSON helpers,
+and `toml` for TOML helpers:
+
+```toml
+compact_std = { version = "2.1.0", features = ["json", "toml"] }
+```
+
+The visitors use `DeserializeSeed` to build compact strings, bytes, vectors,
+deques, maps, sets, paths, and OS strings directly in the supplied arena.
+Scalar values, `Option`, and tuples are supported as nested values. For
+example, `compact_std::json::from_slice_in::<MyConfig<'_>>(bytes, arena)`
+returns the compact configuration or a parse/allocation error.
+
+`#[derive(CompactDeserialize)]` supports named structs and unit enums. The
+supported attributes are `rename`, `rename_all`, `default` (including a
+function path), `deny_unknown_fields`, `skip`, and `skip_deserializing` on
+struct fields; enum variants support `rename` and container `rename_all`.
+Unsupported Serde attributes and unsupported enum payloads produce compile
+errors. Path and OS string inputs use the format's UTF-8 string representation.
+The JSON and TOML modules are optional features, so applications can use the
+core Serde traits without pulling in either parser.
 
 `FromIteratorIn`, `ExtendIn`, and `CloneIn` make allocation-aware collection
 operations explicit. `ToCompactStringIn` formats through
