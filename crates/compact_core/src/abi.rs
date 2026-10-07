@@ -1,12 +1,13 @@
-//! Compact ABI V1 representation rules.
+//! V2.1.0 compact representation rules.
 //!
-//! V1 uses byte offsets, LSB-first bit numbering within packed numeric words,
-//! and each target's native byte order for the in-memory bytes of those words.
-//! The four-byte offset representation and its byte unit are the stable V1
-//! source/ABI rules. Packed values are runtime memory, not a persistent or
-//! cross-process file format; their byte order is not fixed across targets.
-//! Arena alignment is established from the actual base address plus a checked
-//! byte offset. No `repr(packed)` layout is required.
+//! Compact references use 32-bit byte offsets. Packed fields use LSB-first bit
+//! numbering, and multi-byte packed words use the target's native byte order.
+//! The four-byte offset representation and byte unit are stable V2.1.0
+//! contract rules.
+//!
+//! Arena bytes are runtime memory, not a persistent or cross-process file
+//! format. Arena alignment is established from the actual base address plus a
+//! checked byte offset. No `repr(packed)` layout is required.
 
 /// The compact ABI version understood by this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14,12 +15,12 @@
 pub struct CompactAbiVersion {
     /// Major representation version.
     pub major: u16,
-    /// Minor compatible extension version.
+    /// Minor representation version.
     pub minor: u16,
 }
 
-/// Version marker for compact ABI V1.
-pub const ABI_V1: CompactAbiVersion = CompactAbiVersion { major: 1, minor: 0 };
+/// Current supported compact ABI version.
+pub const ABI_VERSION: CompactAbiVersion = CompactAbiVersion { major: 2, minor: 1 };
 
 /// Maximum logical span of one compact arena: 2^32 bytes.
 pub const MAX_ARENA_BYTES: u64 = 1_u64 << 32;

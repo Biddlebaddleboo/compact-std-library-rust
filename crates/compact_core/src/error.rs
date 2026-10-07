@@ -5,7 +5,7 @@ use core::fmt;
 /// Errors returned by compact memory operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
-    /// A backing region is larger than the V1 4 GiB address domain.
+    /// A backing region is larger than the compact 4 GiB address domain.
     BackingTooLarge,
     /// The backing region has no usable bytes.
     InvalidCapacity,
@@ -37,7 +37,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::BackingTooLarge => "backing region exceeds the V1 arena limit",
+            Self::BackingTooLarge => "backing region exceeds the compact arena limit",
             Self::InvalidCapacity => "backing region cannot hold arena allocator state",
             Self::AllocationExhausted => "compact arena is exhausted",
             Self::OffsetOverflow => "compact arena offset arithmetic overflowed",

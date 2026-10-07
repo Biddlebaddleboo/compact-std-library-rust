@@ -2,32 +2,69 @@
 
 `compact_std` provides familiar Rust collection APIs over a scoped compact
 arena. Storage uses 32-bit byte offsets; application code keeps ordinary Rust
-control flow and opts into compact layouts with procedural macros. The project
-does not replace Rust's standard library or process allocator.
+control flow and opts into compact layouts with procedural macros.
+
+## Supported contract
+
+**V2.1.0 is the only supported contract.**
+
+The documented V2.1.0 source surface is the compatibility baseline for future
+2.x releases. Valid code that uses documented V2.1.0 APIs and syntax should
+continue to compile and preserve documented behavior across 2.x releases.
+
+A future release may reject previously accepted code when doing so is required
+to fix memory unsafety, a security defect, or behavior that contradicted the
+documented V2.1.0 contract.
+
+The stable source contract includes:
+
+- `arena!` syntax and its documented rewriting behavior;
+- facade names such as `Vec`, `String`, and `Box`;
+- documented collection methods and explicit `*_in` APIs;
+- documented `#[compact]` and `#[compact(soa)]` syntax;
+- `Offset32<T>` as a four-byte, 32-bit byte offset;
+- offset zero as the null sentinel;
+- the one-arena logical address limit of 2^32 bytes;
+- documented error and ownership behavior.
+
+Internal representation is not a source-compatibility promise. Allocation
+headers, owner-token sizes, collection handle sizes, free-list structure,
+allocator policy, macro-analysis internals, and packed-access implementation
+may change without changing documented V2.1.0 source syntax or behavior.
 
 ## Workspace crates
 
-- `compact_core` is the backend-independent `no_std` runtime. It owns the V1
-  ABI, checked allocations, offset views, initialized byte ranges, and packed
-  bit access.
-- `compact_backend_std` provides fixed stable memory backed by `std`.
-- `compact_collections` provides `CompactBox`, `CompactVec`, `CompactString`,
-  `CompactBitVec`, slabs, nullable offsets, and interning.
+- `compact_core` is the backend-independent `#![no_std]` runtime using only
+  `core`.
+- `compact_backend_std` provides stable backing memory using `std`.
+- `compact_collections` provides arena-owned compact collections and handles.
 - `compact_macros` provides `#[compact]` and lexical `arena!` rewriting.
-- `compact_std` re-exports the runtime, collections, macros, and prelude.
+- `compact_std` is the std-backed convenience facade that re-exports the
+  runtime, collections, macros, and prelude.
 
-One arena addresses at most 2^32 bytes. Offset zero remains the null sentinel,
-`Offset32<T>` remains four bytes, and the core stays backend-independent. A
-reusable free-range list coalesces released blocks and extends tail allocations
-in place where possible. Allocation headers occupy sixteen bytes in the arena;
-free ranges store an eight-byte link in their released payload.
+`compact_macros` is a procedural-macro crate and therefore uses `std` on the
+compiler host. `compact_std` is intentionally a std-backed facade. Only
+`compact_core` currently guarantees a target-side `no_std` contract.
 
-Owning containers accept values implementing the unsafe `CompactValue`
-contract. Implementors must be safely movable between slots, must not depend
-on their address, and must be destructible while the backing remains alive.
-Primitive values and generated compact handles are supported directly. Custom
-types need an explicit `unsafe impl CompactValue` after checking that contract.
-Owning wrappers run destructors and release their allocation when dropped.
+## Memory model
+
+One arena addresses at most 2^32 bytes. `Offset32<T>` is exactly four bytes,
+and offset zero is reserved as the null sentinel. Compact references resolve
+relative to the arena backing rather than storing native pointers.
+
+The arena owns reusable allocation state. Released blocks are coalesced and can
+be reused; tail allocations can grow in place where capacity permits. Owning
+containers run destructors and release their allocation when dropped.
+
+Arena memory is an in-process runtime representation. It is **not** a
+persistent file format, IPC format, network format, or cross-target binary
+format. Packed numeric storage uses target-native byte order.
+
+Arenas and owning compact allocations are intentionally single-owner and are
+not a cross-thread ownership mechanism.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for allocator and representation
+details, and [SAFETY.md](SAFETY.md) for the unsafe and lifetime contracts.
 
 ## Regular Rust style
 
@@ -49,25 +86,80 @@ StdArena::with_capacity(4096, |arena| -> Result<()> {
 })??;
 ```
 
-`arena!` rewrites supported constructors and arena-dependent methods only
-inside its block. It does not install ambient state. `vec![]` is rejected in
-an arena block because it would allocate a native `Vec`; use `Vec::new()` and
-`push` instead.
+`arena!` rewrites supported compact constructors and arena-dependent methods
+inside its lexical block. It does not install global or thread-local ambient
+state.
 
-`CompactVec<T>` stores a sixteen-byte owner token; length and capacity live in
-its arena allocation header. Geometric growth moves non-`Copy` values safely,
-and old buffers are reclaimed or extended in place. `pop`, `truncate`, `clear`,
-and drop preserve ordinary destructor ownership. `CompactSmallVec<T, N>` keeps
-up to `N` values inline, then moves them into an arena vector. `CompactString`
-keeps its twelve-byte inline payload and owns a reclaimable byte buffer after
-promotion; its handle is twenty-four bytes. `CompactSlab` drops every occupied
-value and uses an allocation identity in addition to slot generations so a
-handle cannot become valid after its slab's storage is reused. Borrowed
-`&[T]`, `&[u8]`, and `&str` views are tied to both their wrapper and arena.
+Native `vec![]` is rejected inside `arena!` because it would allocate a
+native `Vec`. Use `Vec::new()` plus `push`, or call explicit `*_in`
+methods when the macro cannot prove a receiver is compact.
 
-Packed field reads and writes use byte-span scalar paths for fields spanning
-up to eight bytes, with a reference fallback for the nine-byte 64-bit edge
-case.
+### `arena!` binding rules
+
+The macro tracks lexical bindings, moves, shadowing, tuple destructuring,
+reassignment, branches, loops, and supported closure reads conservatively.
+
+A procedural macro cannot infer arbitrary helper-function return types. When a
+helper returns a compact collection, provide an explicit compact type
+annotation:
+
+```rust
+let mut values: Vec<'_, u32> = make_values(arena)?;
+values.push(1)?;
+```
+
+If control flow makes a receiver ambiguous, use an explicit type annotation or
+the corresponding `*_in(..., arena)` API.
+
+Read-only closure captures can use supported compact values. Moving or mutating
+captured compact owners through macro sugar is rejected; use explicit `*_in`
+APIs instead.
+
+Unknown macro token streams are not rewritten.
+
+## Collections
+
+Generic owning collections accept values implementing the unsafe
+`CompactValue` contract. Primitive values, supported tuples/arrays/options,
+generated compact handles, and compact owner wrappers implement it directly.
+
+`CompactVec<T>` owns a reclaimable contiguous allocation. Growth first tries
+in-place resize, otherwise allocates replacement storage and moves initialized
+values without duplicating ownership. `pop`, `truncate`, `clear`, and drop
+preserve ordinary destructor ownership.
+
+`CompactString` stores up to twelve UTF-8 bytes inline and owns reclaimable
+arena bytes after promotion.
+
+`CompactSmallVec<T, N>` stores up to `N` values inline before promotion.
+
+`CompactSlab` combines allocation identity with slot generations so stale
+handles remain invalid after slot or allocation reuse.
+
+`CompactInterner` uses a linear scan intended for small intern sets.
+
+Borrowed `&[T]`, `&[u8]`, and `&str` views remain tied to the wrapper and
+arena borrow.
+
+## `CompactValue` safety
+
+Custom types may implement:
+
+```rust
+unsafe impl CompactValue for MyType {}
+```
+
+only when the type satisfies the complete safety contract. In particular, a
+compact value must remain valid when moved between arena slots, must not depend
+on its own address or require pinning, and must be safe to destroy while the
+arena backing remains alive.
+
+An incorrect implementation can cause undefined behavior. Address-sensitive,
+self-referential, or incorrectly-lifetimed pointer/reference types must not be
+declared compact-safe merely because their fields happen to be movable.
+
+See [SAFETY.md](SAFETY.md) before implementing `CompactValue` for a custom
+type.
 
 ## Generated compact layouts
 
@@ -86,24 +178,33 @@ struct Job {
 ```
 
 `Job` remains a native logical struct. `job.compact_in(arena)` returns a
-`JobCompact` handle with checked getters and setters. Booleans and explicitly
-bounded unsigned integers are packed LSB-first. String payloads are copied to
-arena bytes and borrowed back as `&str`. `#[hot]` and `#[cold]` fields receive
-separate arena ranges. Fieldless enums receive compact discriminant wrappers
-and can also be fields in other generated layouts.
+generated compact handle with checked getters and setters.
+
+Booleans and explicitly bounded unsigned integers are packed LSB-first.
+`String` payloads are copied into arena storage and borrowed back as `&str`.
+`#[hot]` and `#[cold]` fields receive separate arena ranges. Fieldless enums
+receive compact discriminant wrappers and can be fields in generated layouts.
 
 `#[compact(soa)]` additionally generates a scalar-column collection; boolean
-columns use a bit vector. The current macro supports named, non-generic structs
-whose fields are `bool`, fixed-width integer scalars, `String`, or an enum
-implementing the generated `CompactEnum` contract. SoA currently supports only
-`Copy` scalar fields. Unsupported pointers, references, generic layouts, and
-payload enums produce compile errors. Bounds must be const
-expressions; signed bounded fields need an explicit minimum and are not yet
-supported.
+columns use a compact bit vector.
 
-The compact interner is optional and linearly scans compact range descriptors,
-avoiding a separate hash table for small sets. `CompactSlab` uses generation-
-checked handles and retires a slot before its generation can wrap.
+The supported struct surface is named, non-generic structs whose fields are
+`bool`, fixed-width integer scalars, `String`, or a fieldless enum
+implementing the generated `CompactEnum` contract. SoA supports `Copy`
+scalar fields. Unsupported pointers, references, generic layouts, payload
+enums, and unsupported bounds produce compile errors.
+
+## Allocation accounting
+
+`Arena::used_bytes()` reports the current high-water prefix of the backing.
+It may decrease when released tail allocations contract the arena. Free holes
+inside that prefix can already be reusable.
+
+`Arena::remaining_bytes()` includes both unused tail capacity and reusable
+free ranges.
+
+Allocation failure is explicit and does not silently fall back to the native
+heap.
 
 ## Validation
 
@@ -113,10 +214,12 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check -p compact_core --no-default-features
+cargo run --manifest-path fixtures/consumer/Cargo.toml
 cargo run --manifest-path fixtures/regular_rust_style/Cargo.toml
 cargo run --manifest-path fixtures/macro_layouts/Cargo.toml
+cargo run --manifest-path fixtures/arena_tracking/Cargo.toml
 ```
 
-`fixtures/consumer` checks low-level imports; `fixtures/regular_rust_style` and
-`fixtures/macro_layouts` exercise the facade and generated layouts. Macro
-compile-fail diagnostics live under `crates/compact_std/tests/ui`.
+Macro compile-fail diagnostics live under `crates/compact_std/tests/ui`.
+Release-mode benchmark instructions and current measurements are recorded in
+[BENCHMARKS.md](BENCHMARKS.md).

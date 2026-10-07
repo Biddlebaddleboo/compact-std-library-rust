@@ -8,9 +8,9 @@ use crate::{CollectionError, Result};
 
 /// A contiguous arena-backed vector.
 ///
-/// The owner token stores its allocation identity in the arena header. The
-/// vector handle is larger than the original offset/length/capacity form so it
-/// can run destructors and return its buffer when dropped.
+/// The vector owns a unique arena-allocation token. Dropping the vector runs
+/// element destructors for the initialized prefix and returns the buffer to the
+/// arena's reusable allocator.
 pub struct CompactVec<'arena, T: CompactValue> {
     storage: Option<ArenaAllocation<'arena, T>>,
 }

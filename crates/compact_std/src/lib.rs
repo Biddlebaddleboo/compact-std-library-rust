@@ -1,8 +1,9 @@
-//! A single-dependency facade for compact arena programming.
+//! A single-dependency facade for V2.1.0 compact arena programming.
 //!
-//! The familiar collection names are aliases for arena-aware types. Their
-//! methods accept an explicit arena or can be shortened locally with
-//! [`arena!`]. No global arena context is installed.
+//! V2.1.0 is the supported contract. Familiar collection names are aliases for
+//! arena-aware types. Their methods accept an explicit arena or can be
+//! shortened locally with [`arena!`]. No global or thread-local arena context
+//! is installed.
 
 pub mod prelude;
 
@@ -14,8 +15,8 @@ pub use compact_collections::{
 pub use compact_core::{
     bits_required, checked_align_up, read_bits, smallest_word, validate_bit_range, write_bits,
     Arena, ArenaAllocation, BitField, ByteRange32, CompactAbiVersion, CompactValue,
-    Error as CoreError, Offset32, OffsetSlice32, PackedWord, StableBacking, StorageWord, ABI_V1,
-    MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
+    Error as CoreError, Offset32, OffsetSlice32, PackedWord, StableBacking, StorageWord,
+    ABI_VERSION, MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
 };
 pub use compact_macros::{arena, compact};
 

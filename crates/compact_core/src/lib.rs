@@ -3,8 +3,10 @@
 #![deny(missing_docs)]
 //! Backend-independent compact memory primitives.
 //!
-//! The core crate owns the V1 ABI and uses only `core`. Use [`with_arena`] to
-//! create a scoped arena over a backend-provided stable memory region.
+//! V2.1.0 is the supported contract. The core crate uses only `core` and
+//! provides scoped arenas, four-byte offsets, owned arena allocations, and
+//! packed-field primitives. Use [`with_arena`] to create a scoped arena over a
+//! backend-provided stable memory region.
 
 mod abi;
 mod allocation;
@@ -18,7 +20,8 @@ mod offset;
 mod packed;
 
 pub use abi::{
-    CompactAbiVersion, ABI_V1, MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
+    CompactAbiVersion, ABI_VERSION, MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET,
+    OFFSET_WIDTH_BYTES,
 };
 pub use allocation::{ArenaAllocation, CompactValue};
 pub use arena::{with_arena, Arena};

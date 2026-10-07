@@ -1,4 +1,5 @@
-//! Procedural macros for compact arena layouts and lexical constructor sugar.
+//! Procedural macros for V2.1.0 compact arena layouts and lexical constructor
+//! rewriting.
 
 extern crate proc_macro;
 
@@ -13,10 +14,14 @@ use syn::{parse_macro_input, Item};
 ///
 /// Supported struct fields are booleans, fixed-width integer scalars,
 /// `String`, and fieldless enums also annotated with `#[compact]`. Add
-/// `#[max = CONST_EXPR]` to a nonnegative integer field to pack
-/// its proven `0..=max` range. `#[hot]` and `#[cold]` fields are placed in
-/// separate arena allocations. `#[compact(soa)]` additionally generates a
+/// `#[max = CONST_EXPR]` to a nonnegative integer field to pack its proven
+/// `0..=max` range. `#[hot]` and `#[cold]` fields are placed in separate
+/// arena allocations. `#[compact(soa)]` additionally generates a
 /// primitive-column SoA collection.
+///
+/// Named, non-generic structs are the supported struct surface. Unsupported
+/// pointers, references, generic layouts, payload enums, and unsupported
+/// bounds produce compile errors.
 #[proc_macro_attribute]
 pub fn compact(attributes: TokenStream, input: TokenStream) -> TokenStream {
     let item = parse_macro_input!(input as Item);
@@ -34,9 +39,14 @@ pub fn compact(attributes: TokenStream, input: TokenStream) -> TokenStream {
 /// Rewrite supported compact constructors and methods inside one lexical block.
 ///
 /// The named arena must already be an `&mut compact_core::Arena`. Supported
-/// constructors are `Vec::new`, `Vec::with_capacity`, `String::new`,
-/// `String::from`, and `Box::new`; methods on local compact vectors/strings get
-/// the arena argument supplied at the call site.
+/// constructors include `Vec::new`, `Vec::with_capacity`, `String::new`,
+/// `String::from`, and `Box::new`; supported local compact methods receive
+/// the arena argument at the rewritten call site.
+///
+/// Binding analysis is conservative. Helper-returned compact values may need an
+/// explicit compact type annotation. Ambiguous receivers and moving or
+/// mutating closure captures require explicit `*_in(..., arena)` APIs.
+/// Native `vec![]` is rejected inside `arena!`.
 #[proc_macro]
 pub fn arena(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as arena::ArenaInput);
