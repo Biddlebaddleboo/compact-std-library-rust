@@ -1,13 +1,4 @@
-//! V2.2.0 compact runtime ABI rules.
-//!
-//! Compact references use 32-bit byte offsets. Packed fields use LSB-first bit
-//! numbering, and multi-byte packed words use the target's native byte order.
-//! The four-byte offset representation and byte unit remain frozen V2.1.0
-//! source contract rules.
-//!
-//! Arena bytes are runtime memory, not a persistent or cross-process file
-//! format. Arena alignment is established from the actual base address plus a
-//! checked byte offset. No `repr(packed)` layout is required.
+//! V2.3 compact cage representation rules.
 
 /// The compact runtime ABI version understood by this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,21 +10,17 @@ pub struct CompactAbiVersion {
     pub minor: u16,
 }
 
-/// Current supported compact runtime ABI version.
-pub const ABI_VERSION: CompactAbiVersion = CompactAbiVersion { major: 2, minor: 2 };
+/// Current compact runtime ABI version.
+pub const ABI_VERSION: CompactAbiVersion = CompactAbiVersion { major: 2, minor: 3 };
 
-/// Maximum logical span of one compact arena: 2^32 bytes.
-pub const MAX_ARENA_BYTES: u64 = 1_u64 << 32;
+/// Maximum logical span of the process cage.
+pub const MAX_CAGE_BYTES: u64 = 1_u64 << 32;
 
-/// Smallest backing that can hold allocator state and one byte allocation.
-pub const MIN_ARENA_BYTES: usize = 60;
+/// Smallest supported process cage.
+pub const MIN_CAGE_BYTES: usize = 64;
 
-/// Width in bytes of an [`Offset32`](crate::Offset32) payload.
+/// Width in bytes of a compact offset payload.
 pub const OFFSET_WIDTH_BYTES: usize = 4;
 
 /// Reserved raw offset representing no allocation.
-///
-/// Offset zero is reserved, so the first arena allocation starts at a positive
-/// byte offset. An arena may still have a logical capacity of exactly 2^32
-/// bytes; its last addressable byte then has offset `u32::MAX`.
 pub const NULL_OFFSET: u32 = 0;

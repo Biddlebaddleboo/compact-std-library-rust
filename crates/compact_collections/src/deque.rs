@@ -1,23 +1,21 @@
-//! Arena-backed circular queues and bounded logging rings.
+//! Cage-backed double-ended queue and bounded ring.
 
-use compact_core::{Arena, ArenaAllocation, CompactValue};
+use compact_backend_std::{CageAllocation, CompactRuntime};
+use compact_core::{CompactValue, Error};
 use core::mem::MaybeUninit;
 use core::slice;
 
 use crate::{CollectionError, Result};
 
-/// A double-ended queue backed by one circular arena allocation.
-///
-/// Logical order is tracked by `head` and `len`; physical storage uses
-/// uninitialized slots so wrapping does not impose a contiguous prefix.
-pub struct CompactVecDeque<'arena, T: CompactValue> {
-    storage: Option<ArenaAllocation<'arena, MaybeUninit<T>>>,
-    head: usize,
-    len: usize,
+/// A compact double-ended queue with one owner, head, and length.
+pub struct CompactVecDeque<T: CompactValue> {
+    storage: Option<CageAllocation<MaybeUninit<T>>>,
+    head: u32,
+    len: u32,
 }
 
-impl<'arena, T: CompactValue> CompactVecDeque<'arena, T> {
-    /// Construct an empty deque without allocating arena storage.
+impl<T: CompactValue> CompactVecDeque<T> {
+    /// Construct an empty deque.
     pub const fn new() -> Self {
         Self {
             storage: None,
@@ -25,19 +23,13 @@ impl<'arena, T: CompactValue> CompactVecDeque<'arena, T> {
             len: 0,
         }
     }
-
-    /// Construct an empty deque tied to `arena` without allocating storage.
-    pub fn new_in(_arena: &Arena<'arena, '_>) -> Self {
-        Self::new()
-    }
-
-    /// Construct a deque with room for at least `capacity` elements.
-    pub fn with_capacity_in(capacity: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
+    /// Allocate a deque with at least `capacity` slots.
+    pub fn with_capacity(capacity: usize) -> Result<Self> {
         let capacity = u32::try_from(capacity).map_err(|_| CollectionError::CapacityOverflow)?;
         let storage = if capacity == 0 {
             None
         } else {
-            Some(allocate_slots(capacity as usize, arena)?)
+            Some(CompactRuntime::alloc_owned_slice(capacity as usize)?)
         };
         Ok(Self {
             storage,
@@ -45,597 +37,351 @@ impl<'arena, T: CompactValue> CompactVecDeque<'arena, T> {
             len: 0,
         })
     }
-
-    /// Construct a deque with room for at least `capacity` elements.
-    pub fn with_capacity(capacity: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
-        Self::with_capacity_in(capacity, arena)
-    }
-
-    /// Return the number of initialized elements.
+    /// Return the number of stored values.
     pub const fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
-
-    /// Return the number of element slots.
+    /// Return allocated slot capacity.
     pub fn capacity(&self) -> usize {
-        self.storage.as_ref().map_or(0, ArenaAllocation::capacity)
+        self.storage.as_ref().map_or(0, |s| s.capacity())
     }
-
-    /// Return whether the deque contains no elements.
+    /// Return whether the deque is empty.
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Borrow the front element.
-    pub fn front<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<Option<&'view T>> {
-        self.get(0, arena)
+    fn physical(&self, logical: usize) -> usize {
+        ((self.head as u64 + logical as u64) % self.capacity() as u64) as usize
+    }
+    fn value_at(&self, physical: usize) -> &T {
+        let slot = &self
+            .storage
+            .as_ref()
+            .expect("nonempty deque has storage")
+            .uninit_capacity()[physical];
+        // SAFETY: every logical deque slot contains an initialized nested value.
+        unsafe { slot.assume_init_ref().assume_init_ref() }
+    }
+    fn value_at_mut(&mut self, physical: usize) -> &mut T {
+        let slot = &mut self
+            .storage
+            .as_mut()
+            .expect("nonempty deque has storage")
+            .uninit_capacity_mut()[physical];
+        // SAFETY: every logical deque slot contains one uniquely borrowed value.
+        unsafe { slot.assume_init_mut().assume_init_mut() }
+    }
+    fn write_at(&mut self, physical: usize, value: T) {
+        let slot = &mut self
+            .storage
+            .as_mut()
+            .expect("deque storage exists")
+            .uninit_capacity_mut()[physical];
+        slot.write(MaybeUninit::new(value));
+    }
+    fn take_at(&mut self, physical: usize) -> T {
+        let slot = &mut self
+            .storage
+            .as_mut()
+            .expect("deque storage exists")
+            .uninit_capacity_mut()[physical];
+        // SAFETY: slot was initialized once and is removed from the logical range before return.
+        unsafe { slot.assume_init_read().assume_init_read() }
     }
 
-    /// Mutably borrow the front element.
-    pub fn front_mut<'view>(
-        &'view mut self,
-        arena: &'view mut Arena<'arena, '_>,
-    ) -> Result<Option<&'view mut T>> {
-        self.get_mut(0, arena)
-    }
-
-    /// Borrow the back element.
-    pub fn back<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<Option<&'view T>> {
-        self.len
-            .checked_sub(1)
-            .map_or(Ok(None), |index| self.get(index, arena))
-    }
-
-    /// Mutably borrow the back element.
-    pub fn back_mut<'view>(
-        &'view mut self,
-        arena: &'view mut Arena<'arena, '_>,
-    ) -> Result<Option<&'view mut T>> {
-        self.len
-            .checked_sub(1)
-            .map_or(Ok(None), |index| self.get_mut(index, arena))
-    }
-
-    /// Borrow the element at logical index `index`.
-    pub fn get<'view>(
-        &'view self,
-        index: usize,
-        arena: &'view Arena<'arena, '_>,
-    ) -> Result<Option<&'view T>> {
-        if index >= self.len {
-            return Ok(None);
+    /// Return the front value.
+    pub fn front(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.value_at(self.head as usize))
         }
-        let storage = self.storage.as_ref().expect("nonempty deque has storage");
-        arena.validate_owned(storage)?;
-        let physical = physical_index(self.head, index, storage.capacity());
-        // SAFETY: `index < len` identifies an initialized logical entry; the
-        // owner remains immutably borrowed for the returned reference.
-        Ok(Some(unsafe {
-            storage.as_slice()[physical].assume_init_ref()
-        }))
     }
-
-    /// Mutably borrow the element at logical index `index`.
-    pub fn get_mut<'view>(
-        &'view mut self,
-        index: usize,
-        arena: &'view mut Arena<'arena, '_>,
-    ) -> Result<Option<&'view mut T>> {
-        if index >= self.len {
-            return Ok(None);
+    /// Mutably borrow the front value.
+    pub fn front_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.value_at_mut(self.head as usize))
         }
-        let storage = self.storage.as_mut().expect("nonempty deque has storage");
-        arena.validate_owned(storage)?;
-        let physical = physical_index(self.head, index, storage.capacity());
-        // SAFETY: `index < len` identifies a uniquely initialized slot; the
-        // mutable owner borrow excludes any other access to it.
-        Ok(Some(unsafe {
-            storage.as_mut_slice()[physical].assume_init_mut()
-        }))
     }
-
-    /// Append an element at the back, growing when needed.
-    pub fn push_back_in(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        self.reserve_in(1, arena)?;
-        let storage = self.storage.as_mut().expect("reserve allocates one slot");
-        arena.validate_owned(storage)?;
-        let capacity = storage.capacity();
-        let physical = physical_index(self.head, self.len, capacity);
-        storage.as_mut_slice()[physical].write(value);
+    /// Return the back value.
+    pub fn back(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.value_at(self.physical(self.len() - 1)))
+        }
+    }
+    /// Mutably borrow the back value.
+    pub fn back_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            None
+        } else {
+            let at = self.physical(self.len() - 1);
+            Some(self.value_at_mut(at))
+        }
+    }
+    /// Return a logical element by index.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len() {
+            None
+        } else {
+            Some(self.value_at(self.physical(index)))
+        }
+    }
+    /// Mutably borrow a logical element by index.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len() {
+            None
+        } else {
+            let at = self.physical(index);
+            Some(self.value_at_mut(at))
+        }
+    }
+    /// Append a value at the back.
+    pub fn push_back(&mut self, value: T) -> Result<()> {
+        self.reserve(1)?;
+        let at = self.physical(self.len());
+        self.write_at(at, value);
         self.len += 1;
         Ok(())
     }
-
-    /// Append an element at the back, growing when needed.
-    pub fn push_back(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        self.push_back_in(value, arena)
-    }
-
-    /// Insert an element at the front, growing when needed.
-    pub fn push_front_in(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        self.reserve_in(1, arena)?;
-        let storage = self.storage.as_mut().expect("reserve allocates one slot");
-        arena.validate_owned(storage)?;
-        let capacity = storage.capacity();
-        let new_head = if self.head == 0 {
-            capacity - 1
+    /// Append a value at the front.
+    pub fn push_front(&mut self, value: T) -> Result<()> {
+        self.reserve(1)?;
+        self.head = if self.len == 0 {
+            0
         } else {
-            self.head - 1
+            ((self.head as u64 + self.capacity() as u64 - 1) % self.capacity() as u64) as u32
         };
-        storage.as_mut_slice()[new_head].write(value);
-        self.head = new_head;
+        self.write_at(self.head as usize, value);
         self.len += 1;
         Ok(())
     }
-
-    /// Insert an element at the front, growing when needed.
-    pub fn push_front(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        self.push_front_in(value, arena)
-    }
-
-    /// Remove and return the front element.
-    pub fn pop_front_in(&mut self, arena: &Arena<'arena, '_>) -> Result<Option<T>> {
+    /// Remove and return the front value.
+    pub fn pop_front(&mut self) -> Option<T> {
         if self.len == 0 {
-            return Ok(None);
+            return None;
         }
-        let storage = self.storage.as_mut().expect("nonempty deque has storage");
-        arena.validate_owned(storage)?;
-        Ok(Some(self.pop_front_unchecked()))
-    }
-
-    /// Remove and return the front element.
-    pub fn pop_front(&mut self, arena: &Arena<'arena, '_>) -> Result<Option<T>> {
-        self.pop_front_in(arena)
-    }
-
-    /// Remove and return the back element.
-    pub fn pop_back_in(&mut self, arena: &Arena<'arena, '_>) -> Result<Option<T>> {
-        if self.len == 0 {
-            return Ok(None);
-        }
-        let storage = self.storage.as_mut().expect("nonempty deque has storage");
-        arena.validate_owned(storage)?;
-        Ok(Some(self.pop_back_unchecked()))
-    }
-
-    /// Remove and return the back element.
-    pub fn pop_back(&mut self, arena: &Arena<'arena, '_>) -> Result<Option<T>> {
-        self.pop_back_in(arena)
-    }
-
-    /// Return an iterator over elements in logical order.
-    pub fn iter<'view>(
-        &'view self,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<CompactVecDequeIter<'view, T>> {
-        let slots = if let Some(storage) = &self.storage {
-            arena.validate_owned(storage)?;
-            storage.as_slice()
+        let at = self.head as usize;
+        self.head = if self.len == 1 {
+            0
         } else {
-            &[]
+            ((self.head as u64 + 1) % self.capacity() as u64) as u32
         };
-        Ok(CompactVecDequeIter {
-            slots,
-            head: self.head,
-            capacity: self.capacity(),
+        self.len -= 1;
+        Some(self.take_at(at))
+    }
+    /// Remove and return the back value.
+    pub fn pop_back(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let at = self.physical(self.len() - 1);
+        self.len -= 1;
+        if self.len == 0 {
+            self.head = 0;
+        }
+        Some(self.take_at(at))
+    }
+    /// Return an iterator over logical order.
+    pub fn iter(&self) -> CompactVecDequeIter<'_, T> {
+        CompactVecDequeIter {
+            deque: self,
             front: 0,
-            back: self.len,
-        })
-    }
-
-    /// Return a mutable iterator in logical order.
-    pub fn iter_mut<'view>(
-        &'view mut self,
-        arena: &mut Arena<'arena, '_>,
-    ) -> Result<slice::IterMut<'view, T>> {
-        Ok(self.make_contiguous(arena)?.iter_mut())
-    }
-
-    /// Drop elements after `len` while retaining the allocation.
-    pub fn truncate(&mut self, len: usize) {
-        while self.len > len {
-            let value = self.pop_back_unchecked();
-            drop(value);
+            back: self.len(),
         }
     }
-
-    /// Drop all elements while retaining the allocation.
+    /// Ensure room for at least `additional` values.
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
+        let required = self
+            .len()
+            .checked_add(additional)
+            .ok_or(CollectionError::CapacityOverflow)?;
+        let required =
+            u32::try_from(required).map_err(|_| CollectionError::CapacityOverflow)? as usize;
+        if required <= self.capacity() {
+            return Ok(());
+        }
+        let cap = required.max(self.capacity().saturating_mul(2).max(4));
+        let mut replacement = CompactRuntime::alloc_owned_slice::<MaybeUninit<T>>(cap)?;
+        let slots = replacement.uninit_capacity_mut();
+        // Allocate first. Moving values below cannot fail.
+        let old_len = self.len();
+        for (index, slot) in slots.iter_mut().take(old_len).enumerate() {
+            let value = self.take_at(self.physical(index));
+            slot.write(MaybeUninit::new(value));
+        }
+        self.len = 0;
+        self.storage = Some(replacement);
+        self.head = 0;
+        self.len = old_len as u32;
+        Ok(())
+    }
+    /// Drop values after the requested logical length.
+    pub fn truncate(&mut self, len: usize) {
+        while self.len() > len {
+            drop(self.pop_back());
+        }
+    }
+    /// Drop all values while retaining capacity.
     pub fn clear(&mut self) {
         self.truncate(0);
     }
-
-    /// Ensure room for at least `additional` more elements.
-    pub fn reserve_in(&mut self, additional: usize, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        let required = self
-            .len
-            .checked_add(additional)
-            .ok_or(CollectionError::CapacityOverflow)?;
-        let required = u32::try_from(required).map_err(|_| CollectionError::CapacityOverflow)?;
-        let old_capacity = self.capacity();
-        if required as usize <= old_capacity {
-            return Ok(());
+    /// Return the values as one contiguous mutable slice, rotating if needed.
+    pub fn make_contiguous(&mut self) -> Result<&mut [T]> {
+        if self.len == 0 {
+            return Ok(&mut []);
         }
-        let new_capacity = if old_capacity == 0 {
-            (required as usize).max(4)
-        } else {
-            (required as usize).max((old_capacity as u32).saturating_mul(2) as usize)
-        };
-
-        if let Some(storage) = &mut self.storage {
-            arena.validate_owned(storage)?;
-            self.make_contiguous_unchecked();
-            let storage = self.storage.as_mut().expect("storage was present");
-            if arena.try_resize_owned(storage, new_capacity)? {
-                for _ in old_capacity..new_capacity {
-                    storage
-                        .push(MaybeUninit::uninit())
-                        .expect("resized allocation has the requested capacity");
-                }
-                return Ok(());
-            }
+        if self.head as usize + self.len() <= self.capacity() {
+            let start = self.head as usize;
+            let end = start + self.len();
+            let slots = self.storage.as_mut().unwrap().uninit_capacity_mut();
+            let ptr = slots[start..end]
+                .as_mut_ptr()
+                .cast::<MaybeUninit<T>>()
+                .cast::<T>();
+            // SAFETY: this is the initialized logical range in storage.
+            return Ok(unsafe { slice::from_raw_parts_mut(ptr, self.len()) });
         }
-
-        let mut replacement = allocate_slots(new_capacity, arena)?;
-        if let Some(storage) = &mut self.storage {
-            let source = storage.as_slice();
-            let destination = replacement.as_mut_slice();
-            for index in 0..self.len {
-                // SAFETY: the deque was made contiguous and every logical
-                // value occupies the initialized prefix `[0..len]`.
-                let value = unsafe { source[index].assume_init_read() };
-                destination[index].write(value);
-            }
+        let mut replacement = CompactRuntime::alloc_owned_slice::<MaybeUninit<T>>(self.len())?;
+        let len = self.len();
+        let slots = replacement.uninit_capacity_mut();
+        for (index, slot) in slots.iter_mut().take(len).enumerate() {
+            let value = self.take_at(self.physical(index));
+            slot.write(MaybeUninit::new(value));
         }
         self.storage = Some(replacement);
         self.head = 0;
-        Ok(())
+        let outer = self.storage.as_mut().unwrap().uninit_capacity_mut();
+        let ptr = outer.as_mut_ptr().cast::<MaybeUninit<T>>().cast::<T>();
+        // SAFETY: values were moved into the first `len` contiguous slots.
+        Ok(unsafe { slice::from_raw_parts_mut(ptr, len) })
     }
+}
 
-    /// Ensure room for at least `additional` more elements.
-    pub fn reserve(&mut self, additional: usize, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        self.reserve_in(additional, arena)
+impl<T: CompactValue> Default for CompactVecDeque<T> {
+    fn default() -> Self {
+        Self::new()
     }
-
-    /// Reduce capacity to the current length.
-    pub fn shrink_to_fit_in(&mut self, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        if let Some(storage) = &self.storage {
-            arena.validate_owned(storage)?;
-        }
-        if self.len == 0 {
-            self.storage = None;
-            self.head = 0;
-            return Ok(());
-        }
-        self.make_contiguous_unchecked();
-        let old_capacity = self.capacity();
-        let len = self.len;
-        let storage = self.storage.as_mut().expect("nonempty deque has storage");
-        storage.truncate(len);
-        match arena.try_resize_owned(storage, len) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                restore_slot_prefix(storage, old_capacity);
-                let mut replacement = allocate_slots(len, arena)?;
-                let source = storage.as_slice();
-                let destination = replacement.as_mut_slice();
-                for index in 0..len {
-                    // SAFETY: the deque is contiguous and the logical prefix
-                    // remains initialized while it is moved to replacement.
-                    let value = unsafe { source[index].assume_init_read() };
-                    destination[index].write(value);
-                }
-                self.storage = Some(replacement);
-                Ok(())
-            }
-            Err(error) => {
-                restore_slot_prefix(storage, old_capacity);
-                Err(error.into())
+}
+struct DequeDropGuard<T: CompactValue> {
+    deque: *mut CompactVecDeque<T>,
+    armed: bool,
+}
+impl<T: CompactValue> Drop for DequeDropGuard<T> {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: created from an exclusive borrow during the deque destructor.
+            let deque = unsafe { &mut *self.deque };
+            while let Some(value) = deque.pop_front() {
+                drop(value);
             }
         }
     }
-
-    /// Reduce capacity to the current length.
-    pub fn shrink_to_fit(&mut self, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        self.shrink_to_fit_in(arena)
-    }
-
-    /// Rearrange wrapped entries into one contiguous initialized slice.
-    pub fn make_contiguous<'view>(
-        &'view mut self,
-        arena: &mut Arena<'arena, '_>,
-    ) -> Result<&'view mut [T]> {
-        if let Some(storage) = &self.storage {
-            arena.validate_owned(storage)?;
-        }
-        self.make_contiguous_unchecked();
-        let Some(storage) = &mut self.storage else {
-            return Ok(&mut []);
-        };
-        let slots = storage.as_mut_slice();
-        // SAFETY: after reordering, exactly the first `len` slots contain live
-        // T values, each with the same alignment and layout as MaybeUninit<T>.
-        Ok(unsafe { slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<T>(), self.len) })
-    }
-
-    /// Retain only elements for which `keep` returns true.
-    ///
-    /// Each removal is committed before its destructor runs. If the predicate
-    /// or a destructor panics, the remaining deque still has valid ownership.
-    pub fn retain<F>(&mut self, arena: &mut Arena<'arena, '_>, mut keep: F) -> Result<()>
-    where
-        F: FnMut(&T) -> bool,
-    {
-        if let Some(storage) = &self.storage {
-            arena.validate_owned(storage)?;
-        }
-        let mut index = 0;
-        while index < self.len {
-            let physical = physical_index(self.head, index, self.capacity());
-            let should_keep = {
-                let storage = self.storage.as_ref().expect("nonempty deque has storage");
-                // SAFETY: `index < len` identifies an initialized slot.
-                keep(unsafe { storage.as_slice()[physical].assume_init_ref() })
-            };
-            if should_keep {
-                index += 1;
-            } else {
-                let removed = self.remove_at(index);
-                drop(removed);
-            }
-        }
-        Ok(())
-    }
-
-    fn make_contiguous_unchecked(&mut self) {
-        if self.head == 0 || self.len == 0 {
-            return;
-        }
-        let storage = self.storage.as_mut().expect("nonempty deque has storage");
-        storage.as_mut_slice().rotate_left(self.head);
-        self.head = 0;
-    }
-
-    fn pop_front_unchecked(&mut self) -> T {
-        let storage = self.storage.as_mut().expect("nonempty deque has storage");
-        let physical = self.head;
-        let capacity = storage.capacity();
-        self.len -= 1;
-        self.head = if self.len == 0 || physical + 1 == capacity {
-            0
-        } else {
-            physical + 1
-        };
-        // SAFETY: the front slot was initialized and has been removed from the
-        // logical deque before ownership is returned to the caller.
-        unsafe { storage.as_mut_slice()[physical].assume_init_read() }
-    }
-
-    fn pop_back_unchecked(&mut self) -> T {
-        let storage = self.storage.as_mut().expect("nonempty deque has storage");
-        let physical = physical_index(self.head, self.len - 1, storage.capacity());
-        self.len -= 1;
-        if self.len == 0 {
-            self.head = 0;
-        }
-        // SAFETY: the back slot was initialized and has been removed from the
-        // logical deque before ownership is returned to the caller.
-        unsafe { storage.as_mut_slice()[physical].assume_init_read() }
-    }
-
-    fn remove_at(&mut self, index: usize) -> T {
-        self.make_contiguous_unchecked();
-        let len = self.len;
-        let storage = self.storage.as_mut().expect("nonempty deque has storage");
-        let slots = storage.as_mut_slice();
-        // SAFETY: index is in the initialized logical prefix.
-        let removed = unsafe { slots[index].assume_init_read() };
-        for source in index + 1..len {
-            // SAFETY: each source is initialized and each previous slot was
-            // made uninitialized by the preceding read.
-            let value = unsafe { slots[source].assume_init_read() };
-            slots[source - 1].write(value);
-        }
-        self.len -= 1;
-        self.head = 0;
-        removed
-    }
-
-    fn drop_remaining(&mut self) {
+}
+impl<T: CompactValue> Drop for CompactVecDeque<T> {
+    fn drop(&mut self) {
         let mut guard = DequeDropGuard {
             deque: self,
             armed: true,
         };
-        while self.len > 0 {
-            let value = self.pop_back_unchecked();
+        while let Some(value) = self.pop_front() {
             drop(value);
         }
         guard.armed = false;
     }
 }
+// SAFETY: the wrapper owns only cage offsets and Rust scalar metadata.
+unsafe impl<T: CompactValue> CompactValue for CompactVecDeque<T> {}
 
-impl<T: CompactValue> Default for CompactVecDeque<'_, T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: CompactValue> Drop for CompactVecDeque<'_, T> {
-    fn drop(&mut self) {
-        self.drop_remaining();
-    }
-}
-
-struct DequeDropGuard<'arena, T: CompactValue> {
-    deque: *mut CompactVecDeque<'arena, T>,
-    armed: bool,
-}
-
-impl<T: CompactValue> Drop for DequeDropGuard<'_, T> {
-    fn drop(&mut self) {
-        if self.armed {
-            // SAFETY: the pointer is derived from the exclusively borrowed
-            // deque at drop start and is used only to finish panic cleanup.
-            unsafe { (*self.deque).drop_remaining() };
-        }
-    }
-}
-
-// SAFETY: this iterator only exposes the initialized logical range; each
-// yielded shared reference is tied to its immutable borrow of the deque.
-/// A double-ended iterator over a [`CompactVecDeque`]'s logical entries.
-pub struct CompactVecDequeIter<'view, T> {
-    slots: &'view [MaybeUninit<T>],
-    head: usize,
-    capacity: usize,
+/// Double-ended iterator over a compact deque.
+pub struct CompactVecDequeIter<'a, T: CompactValue> {
+    deque: &'a CompactVecDeque<T>,
     front: usize,
     back: usize,
 }
-
-impl<'view, T> Iterator for CompactVecDequeIter<'view, T> {
-    type Item = &'view T;
-
+impl<'a, T: CompactValue> Iterator for CompactVecDequeIter<'a, T> {
+    type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
         if self.front == self.back {
             return None;
         }
-        let physical = physical_index(self.head, self.front, self.capacity);
+        let index = self.front;
         self.front += 1;
-        // SAFETY: the logical iterator range contains only initialized slots.
-        Some(unsafe { self.slots[physical].assume_init_ref() })
+        self.deque.get(index)
     }
-
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.back - self.front;
-        (remaining, Some(remaining))
+        let n = self.back - self.front;
+        (n, Some(n))
     }
 }
-
-impl<T> DoubleEndedIterator for CompactVecDequeIter<'_, T> {
+impl<T: CompactValue> DoubleEndedIterator for CompactVecDequeIter<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.front == self.back {
             return None;
         }
         self.back -= 1;
-        let physical = physical_index(self.head, self.back, self.capacity);
-        // SAFETY: the logical iterator range contains only initialized slots.
-        Some(unsafe { self.slots[physical].assume_init_ref() })
+        self.deque.get(self.back)
     }
 }
+impl<T: CompactValue> ExactSizeIterator for CompactVecDequeIter<'_, T> {}
+impl<T: CompactValue> core::iter::FusedIterator for CompactVecDequeIter<'_, T> {}
 
-impl<T> ExactSizeIterator for CompactVecDequeIter<'_, T> {}
-impl<T> core::iter::FusedIterator for CompactVecDequeIter<'_, T> {}
-
-// SAFETY: the deque owns its storage and moves values according to T's
-// CompactValue contract; its drop implementation destroys all logical entries.
-unsafe impl<T: CompactValue> CompactValue for CompactVecDeque<'_, T> {}
-
-/// A fixed-capacity ring that evicts and drops the oldest entry before reuse.
-pub struct CompactRing<'arena, T: CompactValue> {
-    deque: CompactVecDeque<'arena, T>,
-    maximum_len: usize,
+/// Fixed-capacity FIFO ring that evicts the oldest item when full.
+pub struct CompactRing<T: CompactValue> {
+    values: CompactVecDeque<T>,
+    maximum_len: u32,
 }
-
-impl<'arena, T: CompactValue> CompactRing<'arena, T> {
-    /// Construct a bounded ring whose capacity is `maximum_len`.
-    pub fn with_capacity_in(maximum_len: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
-        if maximum_len == 0 {
-            return Err(CollectionError::Core(compact_core::Error::InvalidCapacity));
-        }
-        let deque = CompactVecDeque::with_capacity_in(maximum_len, arena)?;
-        Ok(Self { deque, maximum_len })
+impl<T: CompactValue> CompactRing<T> {
+    /// Create a bounded ring.
+    pub fn with_capacity(maximum_len: usize) -> Result<Self> {
+        let maximum_len =
+            u32::try_from(maximum_len).map_err(|_| CollectionError::CapacityOverflow)?;
+        Ok(Self {
+            values: CompactVecDeque::with_capacity(maximum_len as usize)?,
+            maximum_len,
+        })
     }
-
-    /// Construct a bounded ring whose capacity is `maximum_len`.
-    pub fn with_capacity(maximum_len: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
-        Self::with_capacity_in(maximum_len, arena)
-    }
-
-    /// Return the number of retained entries.
+    /// Return the number of values.
     pub fn len(&self) -> usize {
-        self.deque.len()
+        self.values.len()
     }
-
-    /// Return the maximum number of retained entries.
+    /// Return the fixed capacity.
     pub const fn capacity(&self) -> usize {
-        self.maximum_len
+        self.maximum_len as usize
     }
-
-    /// Return whether the ring contains no entries.
+    /// Return whether the ring is empty.
     pub fn is_empty(&self) -> bool {
-        self.deque.is_empty()
+        self.values.is_empty()
     }
-
-    /// Borrow the oldest retained entry.
-    pub fn front<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<Option<&'view T>> {
-        self.deque.front(arena)
+    /// Return the oldest value.
+    pub fn front(&self) -> Option<&T> {
+        self.values.front()
     }
-
-    /// Append an entry, dropping the oldest entry first when the ring is full.
-    pub fn push_back_in(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        if self.deque.len() == self.maximum_len {
-            let evicted = self
-                .deque
-                .pop_front_in(arena)?
-                .expect("full ring has a front entry");
-            drop(evicted);
+    /// Append a value, dropping the oldest value when full.
+    pub fn push_back(&mut self, value: T) -> Result<()> {
+        if self.maximum_len == 0 {
+            return Err(CollectionError::Core(Error::AllocationExhausted));
         }
-        self.deque.push_back_in(value, arena)
+        if self.len() == self.capacity() {
+            drop(self.values.pop_front());
+        }
+        self.values.push_back(value)
     }
-
-    /// Append an entry, dropping the oldest entry first when the ring is full.
-    pub fn push_back(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        self.push_back_in(value, arena)
+    /// Remove the oldest value.
+    pub fn pop_front(&mut self) -> Option<T> {
+        self.values.pop_front()
     }
-
-    /// Remove and return the oldest entry.
-    pub fn pop_front(&mut self, arena: &Arena<'arena, '_>) -> Result<Option<T>> {
-        self.deque.pop_front_in(arena)
+    /// Iterate over values oldest to newest.
+    pub fn iter(&self) -> CompactVecDequeIter<'_, T> {
+        self.values.iter()
     }
-
-    /// Return an iterator over retained entries from oldest to newest.
-    pub fn iter<'view>(
-        &'view self,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<CompactVecDequeIter<'view, T>> {
-        self.deque.iter(arena)
-    }
-
-    /// Drop all retained entries while keeping the ring allocation for reuse.
+    /// Clear the ring.
     pub fn clear(&mut self) {
-        self.deque.clear();
+        self.values.clear();
     }
 }
-
-// SAFETY: CompactRing delegates ownership and destruction to its deque.
-unsafe impl<T: CompactValue> CompactValue for CompactRing<'_, T> {}
-
-fn allocate_slots<'arena, T: CompactValue>(
-    capacity: usize,
-    arena: &mut Arena<'arena, '_>,
-) -> Result<ArenaAllocation<'arena, MaybeUninit<T>>> {
-    let mut storage = arena.alloc_owned_slice::<MaybeUninit<T>>(capacity)?;
-    for _ in 0..capacity {
-        storage.push(MaybeUninit::uninit())?;
-    }
-    Ok(storage)
-}
-
-fn restore_slot_prefix<T: CompactValue>(
-    storage: &mut ArenaAllocation<'_, MaybeUninit<T>>,
-    capacity: usize,
-) {
-    while storage.len() < capacity {
-        storage
-            .push(MaybeUninit::uninit())
-            .expect("existing allocation retains its former slot capacity");
-    }
-}
-
-fn physical_index(head: usize, logical: usize, capacity: usize) -> usize {
-    let until_wrap = capacity - head;
-    if logical >= until_wrap {
-        logical - until_wrap
-    } else {
-        head + logical
-    }
-}
+// SAFETY: the ring owns a compact deque and a scalar capacity.
+unsafe impl<T: CompactValue> CompactValue for CompactRing<T> {}

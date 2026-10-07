@@ -5,7 +5,7 @@ use core::fmt;
 /// Errors returned by compact collection operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionError {
-    /// A checked arena operation failed.
+    /// A checked cage operation failed.
     Core(compact_core::Error),
     /// A requested length or capacity cannot fit compact metadata.
     CapacityOverflow,

@@ -1,5 +1,0 @@
-error: arena! cannot rewrite format! inside a closure; call format_in!(arena, ...) explicitly
- --> tests/ui/arena_format_closure.rs:6:35
-  |
-6 |             let make_message = || format!("inside closure");
-  |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^

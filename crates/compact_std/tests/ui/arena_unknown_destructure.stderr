@@ -1,5 +1,0 @@
-error: arena! cannot prove `left` is a compact collection; add an explicit compact type annotation or call the corresponding `*_in(..., arena)` API
-  --> tests/ui/arena_unknown_destructure.rs:19:13
-   |
-19 |             left.push(1)?;
-   |             ^^^^^^^^^^^^

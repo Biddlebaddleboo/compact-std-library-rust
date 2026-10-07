@@ -1,5 +1,0 @@
-error: arena! cannot prove `values` is a compact collection; add an explicit compact type annotation or call the corresponding `*_in(..., arena)` API
-  --> tests/ui/arena_unknown_helper.rs:13:13
-   |
-13 |             values.push(1)?;
-   |             ^^^^^^^^^^^^^^

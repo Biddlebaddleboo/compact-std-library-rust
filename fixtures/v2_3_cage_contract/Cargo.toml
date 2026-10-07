@@ -1,0 +1,10 @@
+[package]
+name = "v2_3_cage_contract"
+version = "2.3.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+compact_std = { path = "../../crates/compact_std", features = ["json", "toml"] }

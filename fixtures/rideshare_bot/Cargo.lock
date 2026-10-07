@@ -4,33 +4,34 @@ version = 4
 
 [[package]]
 name = "compact_backend_std"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "compact_core",
 ]
 
 [[package]]
 name = "compact_collections"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
+ "compact_backend_std",
  "compact_core",
 ]
 
 [[package]]
 name = "compact_core"
-version = "2.2.0"
+version = "2.3.0"
 
 [[package]]
 name = "compact_frozen"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
- "compact_collections",
+ "compact_backend_std",
  "compact_core",
 ]
 
 [[package]]
 name = "compact_macros"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -39,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "compact_std"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "compact_backend_std",
  "compact_collections",
@@ -68,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "rideshare_bot_fixture"
-version = "2.1.0"
+version = "2.3.0"
 dependencies = [
  "compact_std",
 ]
@@ -89,3 +90,31 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[patch.unused]]
+name = "compact_backend_std"
+version = "2.2.0"
+
+[[patch.unused]]
+name = "compact_collections"
+version = "2.2.0"
+
+[[patch.unused]]
+name = "compact_core"
+version = "2.2.0"
+
+[[patch.unused]]
+name = "compact_frozen"
+version = "2.2.0"
+
+[[patch.unused]]
+name = "compact_macros"
+version = "2.2.0"
+
+[[patch.unused]]
+name = "compact_serde"
+version = "2.2.0"
+
+[[patch.unused]]
+name = "compact_std"
+version = "2.2.0"

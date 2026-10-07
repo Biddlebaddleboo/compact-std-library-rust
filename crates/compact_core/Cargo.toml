@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Backend-independent compact arena and packed-field primitives"
-keywords = ["arena", "no-std", "memory", "packed"]
+description = "Backend-independent compact cage offsets and packed-field primitives"
+keywords = ["compact", "no-std", "memory", "packed"]
 categories = ["no-std", "memory-management"]
 
 [lib]

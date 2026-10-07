@@ -1,31 +1,19 @@
-//! JSON helpers backed by direct compact `DeserializeSeed` visitors.
-
-use compact_core::Arena;
-use serde::de::DeserializeSeed;
+//! JSON helpers that construct compact owners directly in the process cage.
 
 use crate::{CompactDeserialize, CompactDeserializeSeed};
+use serde::de::DeserializeSeed;
 
-/// Deserialize JSON bytes directly into a compact value.
-pub fn from_slice_in<'de, 'arena, 'memory, T>(
+/// Deserialize JSON bytes into a compact value.
+pub fn from_slice<'de, T: CompactDeserialize<'de>>(
     input: &'de [u8],
-    arena: &mut Arena<'arena, 'memory>,
-) -> Result<T, serde_json::Error>
-where
-    T: CompactDeserialize<'de, 'arena>,
-{
+) -> Result<T, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_slice(input);
-    let value = CompactDeserializeSeed::<T>::new(arena).deserialize(&mut deserializer)?;
+    let value = CompactDeserializeSeed::<T>::new().deserialize(&mut deserializer)?;
     deserializer.end()?;
     Ok(value)
 }
 
-/// Deserialize a JSON string directly into a compact value.
-pub fn from_str_in<'de, 'arena, 'memory, T>(
-    input: &'de str,
-    arena: &mut Arena<'arena, 'memory>,
-) -> Result<T, serde_json::Error>
-where
-    T: CompactDeserialize<'de, 'arena>,
-{
-    from_slice_in(input.as_bytes(), arena)
+/// Deserialize a JSON string into a compact value.
+pub fn from_str<'de, T: CompactDeserialize<'de>>(input: &'de str) -> Result<T, serde_json::Error> {
+    from_slice(input.as_bytes())
 }

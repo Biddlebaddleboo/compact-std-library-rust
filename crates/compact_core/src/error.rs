@@ -1,34 +1,38 @@
-//! Allocation-free core errors.
+//! Errors returned by compact cage operations.
 
 use core::fmt;
 
 /// Errors returned by compact memory operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
-    /// A backing region is larger than the compact 4 GiB address domain.
-    BackingTooLarge,
-    /// The backing region has no usable bytes.
+    /// The requested process cage exceeds the 32-bit offset domain.
+    CageTooLarge,
+    /// The requested process cage is too small.
     InvalidCapacity,
-    /// The requested allocation does not fit in the remaining arena.
+    /// The process cage has not been initialized.
+    RuntimeNotInitialized,
+    /// The process cage was already initialized.
+    RuntimeAlreadyInitialized,
+    /// The system allocator could not reserve the process cage.
+    AllocationFailed,
+    /// The requested allocation does not fit in the process cage.
     AllocationExhausted,
     /// An address or size calculation overflowed.
     OffsetOverflow,
-    /// The offset is the null sentinel or otherwise cannot name an allocation.
+    /// The offset is null or otherwise cannot name an allocation.
     InvalidOffset,
-    /// The requested bytes are not within the arena's allocated prefix.
+    /// The requested range is outside a live allocation.
     OutOfBounds,
-    /// An alignment is zero, not a power of two, or is not met by the address.
+    /// An alignment is invalid or is not met by the address.
     AlignmentError,
     /// A bit range is empty or extends beyond its word.
     InvalidBitRange,
     /// A value has set bits outside the selected packed field.
     ValueDoesNotFit,
-    /// Initialization does not match its region or persistent state is invalid.
+    /// The operation received inconsistent initialization metadata.
     InitializationError,
-    /// An allocation owner was used with an arena other than its creator.
-    ForeignArena,
-    /// The arena-local allocation identity counter is exhausted.
-    AllocationIdExhausted,
+    /// The global allocator lock was poisoned.
+    AllocatorPoisoned,
 }
 
 /// Core result type.
@@ -37,18 +41,20 @@ pub type Result<T> = core::result::Result<T, Error>;
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::BackingTooLarge => "backing region exceeds the compact arena limit",
-            Self::InvalidCapacity => "backing region cannot hold arena allocator state",
-            Self::AllocationExhausted => "compact arena is exhausted",
-            Self::OffsetOverflow => "compact arena offset arithmetic overflowed",
+            Self::CageTooLarge => "process cage exceeds the compact 32-bit offset limit",
+            Self::InvalidCapacity => "process cage capacity is too small",
+            Self::RuntimeNotInitialized => "compact runtime has not been initialized",
+            Self::RuntimeAlreadyInitialized => "compact runtime has already been initialized",
+            Self::AllocationFailed => "system allocator could not reserve the process cage",
+            Self::AllocationExhausted => "compact process cage is exhausted",
+            Self::OffsetOverflow => "compact cage offset arithmetic overflowed",
             Self::InvalidOffset => "invalid or null compact offset",
             Self::OutOfBounds => "compact memory range is out of bounds",
             Self::AlignmentError => "compact memory alignment requirement was not met",
             Self::InvalidBitRange => "packed bit range is invalid",
             Self::ValueDoesNotFit => "value does not fit in the packed field",
-            Self::InitializationError => "initialization does not match the allocated region",
-            Self::ForeignArena => "allocation belongs to a different compact arena",
-            Self::AllocationIdExhausted => "compact arena allocation identity space is exhausted",
+            Self::InitializationError => "initialization metadata is inconsistent",
+            Self::AllocatorPoisoned => "compact cage allocator lock was poisoned",
         };
         formatter.write_str(message)
     }

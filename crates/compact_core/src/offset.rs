@@ -1,148 +1,106 @@
-//! Compact arena-relative references.
+//! Lifetime-free compact offset descriptors.
 
 use core::marker::PhantomData;
 
 use crate::CompactValue;
 
-/// A typed arena-relative byte offset with a four-byte representation.
+/// A typed, non-owning 32-bit byte offset into the process cage.
 ///
-/// The arena lifetime is a generative scope supplied by [`with_arena`](crate::with_arena).
-/// It prevents safe code from resolving a reference through a different arena.
-/// The marker carries no bytes. This is a non-owning view descriptor; values
-/// with destructor obligations belong in an [`ArenaAllocation`](crate::ArenaAllocation).
-/// Use [`null`](Self::null) for the V1 null sentinel; no `Option<Offset32<T>>`
-/// size or niche optimization is part of the ABI guarantee.
+/// Offset zero is reserved as null. This descriptor does not keep an
+/// allocation alive; use an owning compact collection or graph to retain its
+/// target.
 #[repr(transparent)]
-pub struct Offset32<'arena, T> {
+pub struct Offset32<T> {
     pub(crate) raw: u32,
-    marker: PhantomData<fn(&'arena mut ()) -> &'arena mut ()>,
-    type_marker: PhantomData<fn(T) -> T>,
+    marker: PhantomData<fn() -> T>,
 }
 
-// SAFETY: Offset32 stores only a byte offset and zero-sized type/lifetime
-// markers; moving it cannot change its target or create a native self-reference.
-unsafe impl<T> CompactValue for Offset32<'_, T> {}
-
-impl<T> Copy for Offset32<'_, T> {}
-
-impl<T> Clone for Offset32<'_, T> {
+unsafe impl<T> CompactValue for Offset32<T> {}
+impl<T> Copy for Offset32<T> {}
+impl<T> Clone for Offset32<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-
-impl<T> core::fmt::Debug for Offset32<'_, T> {
+impl<T> core::fmt::Debug for Offset32<T> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.debug_tuple("Offset32").field(&self.raw).finish()
     }
 }
+impl<T> PartialEq for Offset32<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+impl<T> Eq for Offset32<T> {}
 
-impl<'arena, T> Offset32<'arena, T> {
+impl<T> Offset32<T> {
     pub(crate) const fn new(raw: u32) -> Self {
         Self {
             raw,
             marker: PhantomData,
-            type_marker: PhantomData,
         }
     }
-
-    /// Construct the null offset. It cannot be resolved to a value.
+    /// Construct the null offset.
     pub const fn null() -> Self {
         Self::new(crate::NULL_OFFSET)
     }
-
-    /// Return whether this is the reserved null offset.
+    /// Return whether this offset is null.
     pub const fn is_null(self) -> bool {
         self.raw == crate::NULL_OFFSET
     }
-
-    /// Return the byte offset payload.
-    ///
-    /// This value is useful for diagnostics and compact storage. Reconstructing
-    /// an offset from it requires [`from_raw_unchecked`](Self::from_raw_unchecked).
+    /// Return the raw byte offset for diagnostics or compact storage.
     pub const fn as_u32(self) -> u32 {
         self.raw
     }
-
-    /// Reconstruct an offset from a raw byte offset.
+    /// Reconstruct a typed offset from a raw cage offset.
     ///
     /// # Safety
     ///
-    /// Unless `raw` is [`NULL_OFFSET`](crate::NULL_OFFSET), it must be the
-    /// start of a live allocation of `T` created by the same arena scope, with
-    /// `T` initialized and still within that arena's allocated prefix. The
-    /// caller must not use this to bypass the arena lifetime brand.
+    /// A non-null value must identify a live, initialized allocation of `T`
+    /// that remains owned for every access through this descriptor.
     pub const unsafe fn from_raw_unchecked(raw: u32) -> Self {
         Self::new(raw)
     }
-
-    /// Rebrand an offset that remains live in a persistent arena backing.
-    ///
-    /// This is intended for owners that detach and later reattach to the same
-    /// allocator state, such as `CompactStore`.
-    ///
-    /// # Safety
-    ///
-    /// Unless `raw` is [`NULL_OFFSET`](crate::NULL_OFFSET), it must point to an
-    /// initialized `T` in the same persistent backing currently used by the
-    /// arena. The allocation must not have been released or reused between
-    /// arena attachments, and the backing must be the one that created it.
-    pub const unsafe fn from_persistent_raw_unchecked(raw: u32) -> Self {
-        Self::new(raw)
-    }
 }
 
-/// A compact offset plus the element count for a contiguous typed allocation.
-///
-/// The offset itself remains four bytes; this view descriptor occupies eight
-/// bytes and keeps the length tied to the allocation that created it.
+/// A compact offset and element count for a contiguous typed allocation.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct OffsetSlice32<'arena, T> {
-    pub(crate) offset: Offset32<'arena, T>,
+pub struct OffsetSlice32<T> {
+    pub(crate) offset: Offset32<T>,
     pub(crate) len: u32,
 }
 
-// SAFETY: OffsetSlice32 stores only a byte offset and element count.
-unsafe impl<T> CompactValue for OffsetSlice32<'_, T> {}
+unsafe impl<T> CompactValue for OffsetSlice32<T> {}
 
-impl<'arena, T> OffsetSlice32<'arena, T> {
-    pub(crate) const fn new(offset: Offset32<'arena, T>, len: u32) -> Self {
+impl<T> OffsetSlice32<T> {
+    pub(crate) const fn new(offset: Offset32<T>, len: u32) -> Self {
         Self { offset, len }
     }
-
-    /// Return the first element's compact offset.
-    pub const fn offset(self) -> Offset32<'arena, T> {
+    /// Return the first element offset.
+    pub const fn offset(self) -> Offset32<T> {
         self.offset
     }
-
     /// Return the element count.
     pub const fn len(self) -> usize {
         self.len as usize
     }
-
-    /// Return whether the allocation contains no elements.
+    /// Return whether the slice is empty.
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }
-
-    /// Construct the canonical empty descriptor. It cannot be resolved as an
-    /// allocation, but is useful for containers with zero capacity.
+    /// Construct the canonical empty descriptor.
     pub const fn empty() -> Self {
         Self::new(Offset32::null(), 0)
     }
-
-    /// Reconstruct a slice descriptor from raw parts.
+    /// Reconstruct an offset slice from raw parts.
     ///
     /// # Safety
     ///
-    /// The non-null offset and `len` must describe a live initialized slice of
-    /// `T` created in the same arena scope. Its total byte length must be valid
-    /// for native slice references. Null is only allowed when `len == 0`, but
-    /// such a descriptor cannot be resolved.
+    /// The raw parts must describe `len` initialized values in a live cage
+    /// allocation that outlives all uses of the descriptor.
     pub const unsafe fn from_raw_parts_unchecked(offset: u32, len: u32) -> Self {
-        // SAFETY: this method carries the same allocation-provenance contract
-        // as the returned slice descriptor; callers uphold it when resolving.
         Self::new(unsafe { Offset32::from_raw_unchecked(offset) }, len)
     }
 }

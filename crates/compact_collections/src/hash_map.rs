@@ -1,1038 +1,726 @@
-//! Arena-backed open-addressed hash map.
+//! Randomized cage-backed hash map and set.
 
-use compact_core::{Arena, ArenaAllocation, CompactValue};
+use compact_backend_std::{CageAllocation, CompactRuntime};
+use compact_core::CompactValue;
 use core::borrow::Borrow;
-use core::hash::Hash;
-use core::mem::{self, MaybeUninit};
+use core::hash::{BuildHasher, Hash, Hasher};
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
 
 use crate::{CollectionError, Result};
 
 const EMPTY: u8 = 0;
-const OCCUPIED: u8 = 1;
-const DELETED: u8 = 2;
-const MIN_SLOTS: usize = 8;
+const FULL: u8 = 1;
+const TOMBSTONE: u8 = 2;
 
-/// An arena-backed open-addressed map with randomized hashing by default.
-///
-/// Control bytes and entry slots use separate arena allocations. Removed
-/// entries become tombstones until a later rehash clears them.
-pub struct CompactHashMap<'arena, K: CompactValue, V: CompactValue, S: BuildHasher = RandomState> {
-    control: Option<ArenaAllocation<'arena, u8>>,
-    entries: Option<ArenaAllocation<'arena, MaybeUninit<(K, V)>>>,
+/// Compact SipHash key pair used by default to retain randomized hashing.
+#[derive(Clone, Copy, Debug)]
+pub struct CompactBuildHasher {
+    k0: u64,
+    k1: u64,
+}
+impl CompactBuildHasher {
+    /// Create fresh process-randomized hash keys.
+    pub fn new() -> Self {
+        let random = RandomState::new();
+        let mut hasher = random.build_hasher();
+        hasher.write_u8(0);
+        let k0 = hasher.finish();
+        hasher.write_u8(1);
+        let k1 = hasher.finish();
+        Self { k0, k1 }
+    }
+}
+impl Default for CompactBuildHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl BuildHasher for CompactBuildHasher {
+    type Hasher = SipHasher24;
+    fn build_hasher(&self) -> Self::Hasher {
+        SipHasher24::new(self.k0, self.k1)
+    }
+}
+// SAFETY: the builder retains only two integer hash keys.
+unsafe impl CompactValue for CompactBuildHasher {}
+
+/// SipHash-2-4 state used transiently while hashing a key.
+#[derive(Clone, Copy)]
+pub struct SipHasher24 {
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+    tail: u64,
+    tail_len: u8,
+    length: u64,
+}
+impl SipHasher24 {
+    fn new(k0: u64, k1: u64) -> Self {
+        Self {
+            v0: 0x736f6d6570736575 ^ k0,
+            v1: 0x646f72616e646f6d ^ k1,
+            v2: 0x6c7967656e657261 ^ k0,
+            v3: 0x7465646279746573 ^ k1,
+            tail: 0,
+            tail_len: 0,
+            length: 0,
+        }
+    }
+    fn round(&mut self) {
+        self.v0 = self.v0.wrapping_add(self.v1);
+        self.v1 = self.v1.rotate_left(13);
+        self.v1 ^= self.v0;
+        self.v0 = self.v0.rotate_left(32);
+        self.v2 = self.v2.wrapping_add(self.v3);
+        self.v3 = self.v3.rotate_left(16);
+        self.v3 ^= self.v2;
+        self.v0 = self.v0.wrapping_add(self.v3);
+        self.v3 = self.v3.rotate_left(21);
+        self.v3 ^= self.v0;
+        self.v2 = self.v2.wrapping_add(self.v1);
+        self.v1 = self.v1.rotate_left(17);
+        self.v1 ^= self.v2;
+        self.v2 = self.v2.rotate_left(32);
+    }
+    fn compress(&mut self, word: u64) {
+        self.v3 ^= word;
+        self.round();
+        self.round();
+        self.v0 ^= word;
+    }
+}
+impl Hasher for SipHasher24 {
+    fn finish(&self) -> u64 {
+        let mut state = *self;
+        let final_word = state.tail | ((state.length & 0xff) << 56);
+        state.compress(final_word);
+        state.v2 ^= 0xff;
+        for _ in 0..4 {
+            state.round();
+        }
+        state.v0 ^ state.v1 ^ state.v2 ^ state.v3
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.length = self.length.wrapping_add(bytes.len() as u64);
+        for byte in bytes {
+            self.tail |= (*byte as u64) << (self.tail_len * 8);
+            self.tail_len += 1;
+            if self.tail_len == 8 {
+                self.compress(self.tail);
+                self.tail = 0;
+                self.tail_len = 0;
+            }
+        }
+    }
+}
+
+/// Open-addressed compact map with randomized hashing and cage-backed tables.
+pub struct CompactHashMap<
+    K: CompactValue + Hash + Eq,
+    V: CompactValue,
+    S: BuildHasher + CompactValue = CompactBuildHasher,
+> {
+    control: Option<CageAllocation<u8>>,
+    entries: Option<CageAllocation<MaybeUninit<(K, V)>>>,
     len: usize,
-    deleted: usize,
+    tombstones: usize,
     hash_builder: S,
 }
 
-impl<'arena, K: CompactValue, V: CompactValue, S: BuildHasher> CompactHashMap<'arena, K, V, S> {
-    /// Construct an empty map with the supplied hash builder.
+impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue>
+    CompactHashMap<K, V, S>
+{
+    /// Construct an empty map with a custom randomized or deterministic hasher.
     pub fn with_hasher(hash_builder: S) -> Self {
         Self {
             control: None,
             entries: None,
             len: 0,
-            deleted: 0,
+            tombstones: 0,
             hash_builder,
         }
     }
-
-    /// Construct a map with room for at least `capacity` entries.
-    pub fn with_capacity_and_hasher(
-        capacity: usize,
-        hash_builder: S,
-        arena: &mut Arena<'arena, '_>,
-    ) -> Result<Self> {
-        let slots = slots_for_entries(capacity)?;
+    /// Construct a map with initial capacity and a custom hasher.
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Result<Self> {
         let mut map = Self::with_hasher(hash_builder);
-        if slots != 0 {
-            let allocations = allocate_table(slots, arena)?;
-            map.control = Some(allocations.control);
-            map.entries = Some(allocations.entries);
-        }
+        map.reserve(capacity)?;
         Ok(map)
     }
-
-    /// Return the number of stored key-value pairs.
+    /// Return the number of key-value pairs.
     pub const fn len(&self) -> usize {
         self.len
     }
-
-    /// Return the number of entries the current table can hold before growth.
+    /// Return the number of available hash slots.
     pub fn capacity(&self) -> usize {
-        max_entries(self.slot_count())
+        self.control.as_ref().map_or(0, |c| c.len())
     }
-
-    /// Return whether the map contains no pairs.
+    /// Return whether the map is empty.
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
-
-    /// Borrow the active hash builder.
+    /// Borrow the hash builder.
     pub const fn hasher(&self) -> &S {
         &self.hash_builder
     }
 
-    /// Insert a key-value pair and return the previous value, if the key was
-    /// already present.
-    pub fn insert(&mut self, key: K, value: V, arena: &mut Arena<'arena, '_>) -> Result<Option<V>>
-    where
-        K: Hash + Eq,
-    {
-        self.insert_with_index(key, value, arena)
-            .map(|(old, _index)| old)
-    }
-
-    /// Borrow the value stored for `key`.
-    pub fn get<Q>(&self, key: &Q, arena: &Arena<'arena, '_>) -> Result<Option<&V>>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let Some(index) = self.find_index(key, arena)? else {
+    /// Insert a key-value pair, returning the previous value when replacing.
+    pub fn insert(&mut self, key: K, value: V) -> Result<Option<V>> {
+        self.ensure_insert_capacity()?;
+        let hash = self.hash(&key);
+        if let Some((index, found)) = self.find_slot(&key, hash) {
+            if found {
+                let pair = unsafe {
+                    self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_mut()
+                };
+                return Ok(Some(core::mem::replace(&mut pair.1, value)));
+            }
+            let control = &mut self.control.as_mut().unwrap().as_mut_slice()[index];
+            if *control == TOMBSTONE {
+                self.tombstones -= 1;
+            }
+            self.entries.as_mut().unwrap().as_mut_slice()[index].write((key, value));
+            *control = FULL;
+            self.len += 1;
             return Ok(None);
-        };
-        // SAFETY: find_index returns only a currently occupied table slot.
-        let pair = unsafe {
-            self.entries
-                .as_ref()
-                .expect("occupied map has entry storage")
-                .as_slice()[index]
-                .assume_init_ref()
-        };
-        Ok(Some(&pair.1))
+        }
+        Err(CollectionError::Core(
+            compact_core::Error::AllocationExhausted,
+        ))
     }
 
-    /// Borrow both the stored key and value for `key`.
-    pub fn get_key_value<Q>(&self, key: &Q, arena: &Arena<'arena, '_>) -> Result<Option<(&K, &V)>>
+    /// Return a value by key.
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let Some(index) = self.find_index(key, arena)? else {
-            return Ok(None);
-        };
-        // SAFETY: find_index returns only a currently occupied table slot.
-        let pair = unsafe {
-            self.entries
-                .as_ref()
-                .expect("occupied map has entry storage")
-                .as_slice()[index]
-                .assume_init_ref()
-        };
-        Ok(Some((&pair.0, &pair.1)))
+        let (index, found) = self.find_slot(key, self.hash(key))?;
+        found.then(|| {
+            // SAFETY: FULL control state corresponds to one initialized pair.
+            unsafe {
+                &self.entries.as_ref().unwrap().as_slice()[index]
+                    .assume_init_ref()
+                    .1
+            }
+        })
     }
-
-    /// Mutably borrow the value stored for `key`.
-    pub fn get_mut<'view, Q>(
-        &'view mut self,
-        key: &Q,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<Option<&'view mut V>>
+    /// Return key and value by borrowed key.
+    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let Some(index) = self.find_index(key, arena)? else {
-            return Ok(None);
-        };
-        // SAFETY: find_index identified an occupied slot before the map was
-        // mutably borrowed, and this method returns its unique value borrow.
-        let pair = unsafe {
-            self.entries
-                .as_mut()
-                .expect("occupied map has entry storage")
-                .as_mut_slice()[index]
-                .assume_init_mut()
-        };
-        Ok(Some(&mut pair.1))
+        let (index, found) = self.find_slot(key, self.hash(key))?;
+        found.then(|| {
+            // SAFETY: FULL control state corresponds to one initialized pair.
+            let pair =
+                unsafe { self.entries.as_ref().unwrap().as_slice()[index].assume_init_ref() };
+            (&pair.0, &pair.1)
+        })
     }
-
-    /// Return whether `key` is present.
-    pub fn contains_key<Q>(&self, key: &Q, arena: &Arena<'arena, '_>) -> Result<bool>
+    /// Mutably borrow a value by key.
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        Ok(self.find_index(key, arena)?.is_some())
+        let hash = self.hash(key);
+        let (index, found) = self.find_slot(key, hash)?;
+        found.then(|| {
+            // SAFETY: the map is exclusively borrowed and the slot is initialized.
+            unsafe {
+                &mut self.entries.as_mut().unwrap().as_mut_slice()[index]
+                    .assume_init_mut()
+                    .1
+            }
+        })
     }
-
-    /// Remove a key-value pair and return both owned values.
-    pub fn remove_entry<Q>(&mut self, key: &Q, arena: &Arena<'arena, '_>) -> Result<Option<(K, V)>>
+    /// Return whether a key is present.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let Some(index) = self.find_index(key, arena)? else {
-            return Ok(None);
-        };
-        Ok(Some(self.remove_index(index)))
+        self.get(key).is_some()
     }
-
+    /// Remove a pair and return its key and value.
+    pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash(key);
+        let (index, found) = self.find_slot(key, hash)?;
+        if !found {
+            return None;
+        }
+        self.control.as_mut().unwrap().as_mut_slice()[index] = TOMBSTONE;
+        self.len -= 1;
+        self.tombstones += 1;
+        // SAFETY: control state was FULL and the slot is now logically vacant.
+        Some(unsafe { self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_read() })
+    }
     /// Remove a key and return its value.
-    pub fn remove<Q>(&mut self, key: &Q, arena: &Arena<'arena, '_>) -> Result<Option<V>>
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let Some((key, value)) = self.remove_entry(key, arena)? else {
-            return Ok(None);
-        };
-        drop(key);
-        Ok(Some(value))
+        self.remove_entry(key).map(|(_, value)| value)
     }
-
-    /// Drop all stored pairs and retain the table allocation.
+    /// Drop every pair while retaining table capacity.
     pub fn clear(&mut self) {
-        self.drop_entries();
+        let Some(control) = &mut self.control else {
+            return;
+        };
+        for index in 0..control.len() {
+            if control.as_slice()[index] == FULL {
+                control.as_mut_slice()[index] = EMPTY;
+                self.len -= 1;
+                // SAFETY: the control byte marks one initialized pair.
+                let pair = unsafe {
+                    self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_read()
+                };
+                drop(pair);
+            }
+        }
+        self.len = 0;
+        self.tombstones = 0;
     }
-
     /// Ensure room for at least `additional` more entries.
-    pub fn reserve(&mut self, additional: usize, arena: &mut Arena<'arena, '_>) -> Result<()>
-    where
-        K: Hash,
-    {
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
         let required = self
             .len
             .checked_add(additional)
             .ok_or(CollectionError::CapacityOverflow)?;
-        u32::try_from(required).map_err(|_| CollectionError::CapacityOverflow)?;
-        if required <= self.capacity() {
-            return Ok(());
+        let mut slots = self.capacity().max(8);
+        while required.saturating_mul(8) >= slots.saturating_mul(7) {
+            slots = slots
+                .checked_mul(2)
+                .ok_or(CollectionError::CapacityOverflow)?;
         }
-        self.rehash(slots_for_entries(required)?, arena)
-    }
-
-    /// Reduce storage to the smallest table that can hold the current entries.
-    pub fn shrink_to_fit(&mut self, arena: &mut Arena<'arena, '_>) -> Result<()>
-    where
-        K: Hash,
-    {
-        self.validate_storage(arena)?;
-        let target_slots = slots_for_entries(self.len)?;
-        if target_slots == self.slot_count() && self.deleted == 0 {
-            return Ok(());
-        }
-        self.rehash(target_slots, arena)
-    }
-
-    /// Return an iterator over all key-value pairs.
-    pub fn iter<'view>(
-        &'view self,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<CompactHashMapIter<'view, K, V>> {
-        self.validate_storage(arena)?;
-        Ok(CompactHashMapIter {
-            control: self.control.as_ref().map_or(&[], ArenaAllocation::as_slice),
-            entries: self.entries.as_ref().map_or(&[], ArenaAllocation::as_slice),
-            next: 0,
-            remaining: self.len,
-        })
-    }
-
-    /// Return a mutable iterator over all key-value pairs.
-    pub fn iter_mut<'view>(
-        &'view mut self,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<CompactHashMapIterMut<'view, K, V>> {
-        self.validate_storage(arena)?;
-        Ok(CompactHashMapIterMut {
-            control: self.control.as_ref().map_or(&[], ArenaAllocation::as_slice),
-            entries: self
-                .entries
-                .as_mut()
-                .map_or(core::ptr::null_mut(), |entries| {
-                    entries.as_mut_slice().as_mut_ptr()
-                }),
-            next: 0,
-            remaining: self.len,
-            marker: core::marker::PhantomData,
-        })
-    }
-
-    /// Return an iterator over stored keys.
-    pub fn keys<'view>(
-        &'view self,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<impl ExactSizeIterator<Item = &'view K>> {
-        Ok(self.iter(arena)?.map(|(key, _)| key))
-    }
-
-    /// Return an iterator over stored values.
-    pub fn values<'view>(
-        &'view self,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<impl ExactSizeIterator<Item = &'view V>> {
-        Ok(self.iter(arena)?.map(|(_, value)| value))
-    }
-
-    /// Return a mutable iterator over stored values.
-    pub fn values_mut<'view>(
-        &'view mut self,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<impl ExactSizeIterator<Item = &'view mut V>> {
-        Ok(self.iter_mut(arena)?.map(|(_, value)| value))
-    }
-
-    /// Find or insert `key`, returning an entry handle for `or_insert` APIs.
-    pub fn entry<'view, 'memory>(
-        &'view mut self,
-        key: K,
-        arena: &'view mut Arena<'arena, 'memory>,
-    ) -> Result<CompactHashMapEntry<'view, 'arena, 'memory, K, V, S>>
-    where
-        K: Hash + Eq,
-    {
-        self.validate_storage(arena)?;
-        let hash = self.hash(&key);
-        let probe = self.probe_with_hash(&key, hash);
-        let index = probe.found;
-        let key = if index.is_some() { None } else { Some(key) };
-        Ok(CompactHashMapEntry {
-            map: self,
-            arena,
-            key,
-            index,
-        })
-    }
-
-    /// Keep only pairs for which `keep` returns true.
-    ///
-    /// Hashing and equality are not called during retention. A pair is marked
-    /// deleted before its values are dropped, so a panicking destructor cannot
-    /// make the removed pair visible again.
-    pub fn retain<F>(&mut self, mut keep: F)
-    where
-        F: FnMut(&K, &mut V) -> bool,
-    {
-        let slots = self.slot_count();
-        for index in 0..slots {
-            if self
-                .control
-                .as_ref()
-                .expect("nonempty table has control bytes")
-                .as_slice()[index]
-                != OCCUPIED
-            {
-                continue;
-            }
-            let should_keep = {
-                // SAFETY: an occupied control byte identifies an initialized
-                // pair, and the map is mutably borrowed for this operation.
-                let pair = unsafe {
-                    self.entries
-                        .as_mut()
-                        .expect("occupied table has entries")
-                        .as_mut_slice()[index]
-                        .assume_init_mut()
-                };
-                keep(&pair.0, &mut pair.1)
-            };
-            if !should_keep {
-                let pair = self.remove_index(index);
-                drop(pair);
-            }
-        }
-    }
-
-    fn insert_with_index(
-        &mut self,
-        key: K,
-        value: V,
-        arena: &mut Arena<'arena, '_>,
-    ) -> Result<(Option<V>, usize)>
-    where
-        K: Hash + Eq,
-    {
-        self.validate_storage(arena)?;
-        let hash = self.hash(&key);
-        let initial = self.probe_with_hash(&key, hash);
-        if let Some(index) = initial.found {
-            return Ok((Some(self.replace_value(index, key, value)), index));
-        }
-
-        let required = self
-            .len
-            .checked_add(1)
-            .ok_or(CollectionError::CapacityOverflow)?;
-        u32::try_from(required).map_err(|_| CollectionError::CapacityOverflow)?;
-        let mut probe = initial;
-        if required > self.capacity() {
-            self.rehash(slots_for_entries(required)?, arena)?;
-            probe = self.probe_with_hash(&key, hash);
-        }
-        let Some(index) = probe.vacant else {
-            return Err(CollectionError::Core(
-                compact_core::Error::AllocationExhausted,
-            ));
-        };
-
-        // The pair is fully initialized before the control byte publishes it.
-        self.entries
-            .as_mut()
-            .expect("insertion table has entry storage")
-            .as_mut_slice()[index]
-            .write((key, value));
-        if probe.vacant_is_deleted {
-            self.deleted -= 1;
-        }
-        self.control
-            .as_mut()
-            .expect("insertion table has control bytes")
-            .as_mut_slice()[index] = OCCUPIED;
-        self.len += 1;
-        Ok((None, index))
-    }
-
-    fn replace_value(&mut self, index: usize, key: K, value: V) -> V {
-        // SAFETY: index was returned by a completed immutable probe, and no
-        // table mutation occurs before this unique access.
-        let pair = unsafe {
-            self.entries
-                .as_mut()
-                .expect("occupied table has entries")
-                .as_mut_slice()[index]
-                .assume_init_mut()
-        };
-        let old_value = mem::replace(&mut pair.1, value);
-        drop(key);
-        old_value
-    }
-
-    fn find_index<Q>(&self, key: &Q, arena: &Arena<'arena, '_>) -> Result<Option<usize>>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.validate_storage(arena)?;
-        if self.slot_count() == 0 {
-            return Ok(None);
-        }
-        let hash = self.hash(key);
-        Ok(self.probe_with_hash(key, hash).found)
-    }
-
-    fn validate_storage(&self, arena: &Arena<'arena, '_>) -> Result<()> {
-        if let Some(control) = &self.control {
-            arena.validate_owned(control)?;
-        }
-        if let Some(entries) = &self.entries {
-            arena.validate_owned(entries)?;
+        if self.capacity() == 0 || slots > self.capacity() || self.tombstones > self.capacity() / 4
+        {
+            self.rehash(slots)?;
         }
         Ok(())
+    }
+    /// Release unused slots.
+    pub fn shrink_to_fit(&mut self) -> Result<()> {
+        if self.len == 0 {
+            self.control = None;
+            self.entries = None;
+            self.tombstones = 0;
+            return Ok(());
+        }
+        let mut slots = 8_usize;
+        while self.len.saturating_mul(8) >= slots.saturating_mul(7) {
+            slots = slots
+                .checked_mul(2)
+                .ok_or(CollectionError::CapacityOverflow)?;
+        }
+        if slots != self.capacity() || self.tombstones != 0 {
+            self.rehash(slots)?;
+        }
+        Ok(())
+    }
+    /// Iterate over key-value pairs.
+    pub fn iter(&self) -> CompactHashMapIter<'_, K, V> {
+        CompactHashMapIter {
+            control: self.control.as_ref().map_or(&[], |c| c.as_slice()),
+            entries: self.entries.as_ref().map_or(&[], |e| e.as_slice()),
+            index: 0,
+            remaining: self.len,
+        }
+    }
+    /// Mutably iterate over values and immutably borrow keys.
+    pub fn iter_mut(&mut self) -> CompactHashMapIterMut<'_, K, V> {
+        let control = self.control.as_ref().map_or(&[][..], |c| c.as_slice());
+        let entries = self
+            .entries
+            .as_mut()
+            .map_or(&mut [][..], |e| e.as_mut_slice());
+        CompactHashMapIterMut {
+            control,
+            entries: entries.as_mut_ptr(),
+            slots: entries.len(),
+            index: 0,
+            remaining: self.len,
+            marker: PhantomData,
+        }
+    }
+    /// Iterate over keys.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(key, _)| key)
+    }
+    /// Iterate over values.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, value)| value)
+    }
+    /// Mutably iterate over values.
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.iter_mut().map(|(_, value)| value)
+    }
+    /// Retain entries accepted by `keep`.
+    pub fn retain<F: FnMut(&K, &mut V) -> bool>(&mut self, mut keep: F) {
+        let Some(control) = &mut self.control else {
+            return;
+        };
+        for index in 0..control.len() {
+            if control.as_slice()[index] == FULL {
+                // SAFETY: the map is exclusively borrowed and the slot is live.
+                let pair = unsafe {
+                    self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_mut()
+                };
+                if !keep(&pair.0, &mut pair.1) {
+                    control.as_mut_slice()[index] = TOMBSTONE;
+                    self.len -= 1;
+                    self.tombstones += 1;
+                    // SAFETY: control was made vacant and the pair is moved out exactly once.
+                    let pair = unsafe {
+                        self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_read()
+                    };
+                    drop(pair);
+                }
+            }
+        }
     }
 
     fn hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
         self.hash_builder.hash_one(key)
     }
-
-    fn probe_with_hash<Q>(&self, key: &Q, hash: u64) -> Probe
+    fn find_slot<Q>(&self, key: &Q, hash: u64) -> Option<(usize, bool)>
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        let slots = self.slot_count();
-        if slots == 0 {
-            return Probe::empty();
-        }
-        let control = self
-            .control
-            .as_ref()
-            .expect("allocated table has control")
-            .as_slice();
-        let entries = self
-            .entries
-            .as_ref()
-            .expect("allocated table has entries")
-            .as_slice();
-        let mask = slots - 1;
+        let control = self.control.as_ref()?.as_slice();
+        let entries = self.entries.as_ref()?.as_slice();
+        let mask = control.len().checked_sub(1)?;
+        let mut first_tombstone = None;
         let start = hash as usize & mask;
-        let mut first_deleted = None;
-        for offset in 0..slots {
-            let index = (start + offset) & mask;
+        for step in 0..control.len() {
+            let index = start.wrapping_add(step) & mask;
             match control[index] {
-                EMPTY => {
-                    return match first_deleted {
-                        Some(deleted) => Probe::vacant(deleted, true),
-                        None => Probe::vacant(index, false),
-                    };
-                }
-                DELETED => {
-                    if first_deleted.is_none() {
-                        first_deleted = Some(index);
+                EMPTY => return Some((first_tombstone.unwrap_or(index), false)),
+                TOMBSTONE => {
+                    if first_tombstone.is_none() {
+                        first_tombstone = Some(index);
                     }
                 }
-                OCCUPIED => {
-                    // SAFETY: OCCUPIED is written only after the entry pair
-                    // has been initialized and remains set until it is moved.
+                FULL => {
+                    // SAFETY: FULL slots contain initialized key-value pairs.
                     let pair = unsafe { entries[index].assume_init_ref() };
                     if pair.0.borrow() == key {
-                        return Probe::found(index);
+                        return Some((index, true));
                     }
                 }
-                _ => unreachable!("control byte has a valid table state"),
+                _ => unreachable!("control state is an internal two-bit invariant"),
             }
         }
-        first_deleted.map_or_else(Probe::empty, |index| Probe::vacant(index, true))
+        first_tombstone.map(|index| (index, false))
     }
-
-    fn remove_index(&mut self, index: usize) -> (K, V) {
-        self.control
-            .as_mut()
-            .expect("occupied table has control bytes")
-            .as_mut_slice()[index] = DELETED;
-        self.len -= 1;
-        self.deleted += 1;
-        // SAFETY: the occupied pair is moved out after its state is changed to
-        // a tombstone, so it cannot be observed or dropped again by the map.
-        unsafe {
-            self.entries
-                .as_mut()
-                .expect("occupied table has entries")
-                .as_mut_slice()[index]
-                .assume_init_read()
+    fn ensure_insert_capacity(&mut self) -> Result<()> {
+        if self.capacity() == 0
+            || (self.len + self.tombstones + 1).saturating_mul(8)
+                >= self.capacity().saturating_mul(7)
+        {
+            self.reserve(1)?;
         }
+        Ok(())
     }
-
-    fn rehash(&mut self, new_slots: usize, arena: &mut Arena<'arena, '_>) -> Result<()>
-    where
-        K: Hash,
-    {
-        if new_slots == 0 {
-            if self.len != 0 {
-                return Err(CollectionError::CapacityOverflow);
-            }
-            self.control = None;
-            self.entries = None;
-            self.deleted = 0;
-            return Ok(());
-        }
-        if self.len == 0 && new_slots == self.slot_count() {
-            if let Some(control) = &mut self.control {
-                control.as_mut_slice().fill(EMPTY);
-            }
-            self.deleted = 0;
-            return Ok(());
-        }
-
-        let TableAllocations {
-            control: mut new_control,
-            entries: mut new_entries,
-        } = allocate_table(new_slots, arena)?;
-        if self.len == 0 {
-            self.control = Some(new_control);
-            self.entries = Some(new_entries);
-            self.deleted = 0;
-            return Ok(());
-        }
-
-        // Compute every destination before moving a key or value. Hash may
-        // panic here; the old table remains untouched until planning succeeds.
-        let mut destinations = arena.alloc_owned_slice::<usize>(self.len)?;
-        let old_control = self
-            .control
-            .as_ref()
-            .expect("nonempty map has control")
-            .as_slice();
-        let old_entries = self
-            .entries
-            .as_ref()
-            .expect("nonempty map has entries")
-            .as_slice();
-        let mask = new_slots - 1;
+    fn rehash(&mut self, slots: usize) -> Result<()> {
+        let slots = slots
+            .max(8)
+            .checked_next_power_of_two()
+            .ok_or(CollectionError::CapacityOverflow)?;
+        let (mut new_control, mut new_entries) = empty_table::<K, V>(slots)?;
+        let old_control = self.control.as_ref().map_or(&[][..], |c| c.as_slice());
+        let old_entries = self.entries.as_ref().map_or(&[][..], |e| e.as_slice());
+        let mut destinations = Vec::<usize>::new();
+        destinations
+            .try_reserve_exact(old_control.len())
+            .map_err(|_| CollectionError::Core(compact_core::Error::AllocationFailed))?;
+        destinations.resize(old_control.len(), usize::MAX);
         for old_index in 0..old_control.len() {
-            if old_control[old_index] != OCCUPIED {
+            if old_control[old_index] != FULL {
                 continue;
             }
-            // SAFETY: occupied source slots always contain an initialized pair.
-            let key = unsafe { &old_entries[old_index].assume_init_ref().0 };
-            let start = self.hash(key) as usize & mask;
-            let mut destination = None;
-            for offset in 0..new_slots {
-                let candidate = (start + offset) & mask;
-                if new_control.as_slice()[candidate] == EMPTY {
-                    destination = Some(candidate);
+            // SAFETY: FULL slots contain initialized pairs.
+            let pair = unsafe { old_entries[old_index].assume_init_ref() };
+            let hash = self.hash(&pair.0);
+            let mask = slots - 1;
+            let start = hash as usize & mask;
+            let control = new_control.as_mut_slice();
+            let mut target = None;
+            for step in 0..slots {
+                let index = start.wrapping_add(step) & mask;
+                if control[index] == EMPTY {
+                    target = Some(index);
                     break;
                 }
             }
-            let destination = destination.ok_or(CollectionError::CapacityOverflow)?;
-            new_control.as_mut_slice()[destination] = OCCUPIED;
-            destinations.push(destination)?;
+            let index = target.ok_or(CollectionError::Core(
+                compact_core::Error::AllocationExhausted,
+            ))?;
+            control[index] = FULL;
+            destinations[old_index] = index;
         }
-
-        // No user code runs after the plan is complete; all ownership moves
-        // finish before the map publishes the replacement allocations.
-        let destinations = destinations.as_slice();
-        let mut destination_index = 0;
-        let old_control = self.control.as_mut().expect("nonempty map has control");
-        let old_entries = self.entries.as_mut().expect("nonempty map has entries");
-        for old_index in 0..old_control.capacity() {
-            if old_control.as_slice()[old_index] != OCCUPIED {
-                continue;
+        // No user code or fallible operation remains; transfer all pairs.
+        if let Some(entries) = &mut self.entries {
+            for (old_index, target) in destinations.iter().copied().enumerate() {
+                if target == usize::MAX {
+                    continue;
+                }
+                // SAFETY: this pair is moved exactly once into an empty slot.
+                let pair = unsafe { entries.as_mut_slice()[old_index].assume_init_read() };
+                new_entries.as_mut_slice()[target].write(pair);
             }
-            let new_index = destinations[destination_index];
-            destination_index += 1;
-            old_control.as_mut_slice()[old_index] = EMPTY;
-            // SAFETY: the source pair is initialized and the destination slot
-            // is an initialized MaybeUninit wrapper reserved above.
-            let pair = unsafe { old_entries.as_mut_slice()[old_index].assume_init_read() };
-            new_entries.as_mut_slice()[new_index].write(pair);
         }
         self.control = Some(new_control);
         self.entries = Some(new_entries);
-        self.deleted = 0;
+        self.tombstones = 0;
         Ok(())
     }
+}
 
-    fn slot_count(&self) -> usize {
-        self.control.as_ref().map_or(0, ArenaAllocation::capacity)
+type EntryStorage<K, V> = CageAllocation<MaybeUninit<(K, V)>>;
+type TableStorage<K, V> = (CageAllocation<u8>, EntryStorage<K, V>);
+
+fn empty_table<K: CompactValue, V: CompactValue>(slots: usize) -> Result<TableStorage<K, V>> {
+    let mut control = CompactRuntime::alloc_owned_slice::<u8>(slots)?;
+    for _ in 0..slots {
+        control.push(EMPTY)?;
     }
-
-    fn value_mut_at(&mut self, index: usize) -> &mut V {
-        // SAFETY: the index is either an occupied slot from entry lookup or a
-        // slot just committed by insert_with_index.
-        let pair = unsafe {
-            self.entries
-                .as_mut()
-                .expect("occupied map has entry storage")
-                .as_mut_slice()[index]
-                .assume_init_mut()
-        };
-        &mut pair.1
+    let mut entries = CompactRuntime::alloc_owned_slice::<MaybeUninit<(K, V)>>(slots)?;
+    for _ in 0..slots {
+        entries.push(MaybeUninit::uninit())?;
     }
+    Ok((control, entries))
+}
 
-    fn key_at(&self, index: usize) -> &K {
-        // SAFETY: the index was captured from a completed occupied-slot probe.
-        unsafe {
-            &self
-                .entries
-                .as_ref()
-                .expect("occupied map has entry storage")
-                .as_slice()[index]
-                .assume_init_ref()
-                .0
+struct MapDropGuard<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue> {
+    map: *mut CompactHashMap<K, V, S>,
+    armed: bool,
+}
+impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue> Drop
+    for MapDropGuard<K, V, S>
+{
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: guard is created from an exclusive borrow during map drop.
+        let map = unsafe { &mut *self.map };
+        if let Some(control) = &mut map.control {
+            for index in 0..control.len() {
+                if control.as_slice()[index] == FULL {
+                    control.as_mut_slice()[index] = EMPTY;
+                    map.len -= 1;
+                    // SAFETY: FULL marked an initialized pair and is cleared before its destructor.
+                    let pair = unsafe {
+                        map.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_read()
+                    };
+                    drop(pair);
+                }
+            }
         }
     }
-
-    fn drop_entries(&mut self) {
-        let mut guard = HashMapDropGuard {
+}
+impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue> Drop
+    for CompactHashMap<K, V, S>
+{
+    fn drop(&mut self) {
+        let mut guard = MapDropGuard {
             map: self,
             armed: true,
         };
-        let slots = self.slot_count();
-        for index in 0..slots {
-            if self
-                .control
-                .as_ref()
-                .expect("allocated table has control")
-                .as_slice()[index]
-                != OCCUPIED
-            {
-                continue;
-            }
-            let pair = self.remove_index(index);
-            drop(pair);
-        }
-        if let Some(control) = &mut self.control {
-            control.as_mut_slice().fill(EMPTY);
-        }
-        self.len = 0;
-        self.deleted = 0;
+        self.clear();
         guard.armed = false;
     }
 }
-
-impl<'arena, K: CompactValue, V: CompactValue, S: BuildHasher> Drop
-    for CompactHashMap<'arena, K, V, S>
+// SAFETY: keys and values obey CompactValue and the hasher is required to be a compact value.
+unsafe impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue>
+    CompactValue for CompactHashMap<K, V, S>
 {
-    fn drop(&mut self) {
-        self.drop_entries();
-    }
 }
 
-impl<'arena, K: CompactValue, V: CompactValue> CompactHashMap<'arena, K, V, RandomState> {
-    /// Construct an empty map with a fresh randomized hash builder.
+impl<K: CompactValue + Hash + Eq, V: CompactValue> CompactHashMap<K, V, CompactBuildHasher> {
+    /// Construct an empty map with randomized hashing.
     pub fn new() -> Self {
-        Self::with_hasher(RandomState::new())
+        Self::with_hasher(CompactBuildHasher::new())
     }
-
-    /// Construct a map with room for at least `capacity` entries and a fresh
-    /// randomized hash builder.
-    pub fn with_capacity(capacity: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
-        Self::with_capacity_and_hasher(capacity, RandomState::new(), arena)
+    /// Construct a map with randomized hashing and initial capacity.
+    pub fn with_capacity(capacity: usize) -> Result<Self> {
+        Self::with_capacity_and_hasher(capacity, CompactBuildHasher::new())
     }
 }
-
-impl<K: CompactValue, V: CompactValue> Default for CompactHashMap<'_, K, V, RandomState> {
+impl<K: CompactValue + Hash + Eq, V: CompactValue> Default
+    for CompactHashMap<K, V, CompactBuildHasher>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// An entry handle for conditional insertion into a compact hash map.
-pub struct CompactHashMapEntry<
-    'view,
-    'arena,
-    'memory,
-    K: CompactValue,
-    V: CompactValue,
-    S: BuildHasher,
-> {
-    map: &'view mut CompactHashMap<'arena, K, V, S>,
-    arena: &'view mut Arena<'arena, 'memory>,
-    key: Option<K>,
-    index: Option<usize>,
-}
-
-impl<'view, 'arena, 'memory, K: CompactValue, V: CompactValue, S: BuildHasher>
-    CompactHashMapEntry<'view, 'arena, 'memory, K, V, S>
-{
-    /// Return whether the map already contained this key.
-    pub const fn is_occupied(&self) -> bool {
-        self.index.is_some()
-    }
-
-    /// Borrow the occupied or vacant key.
-    pub fn key(&self) -> &K {
-        match self.index {
-            Some(index) => self.map.key_at(index),
-            None => self.key.as_ref().expect("vacant entry retains its key"),
-        }
-    }
-
-    /// Apply `action` to an existing value, then retain this entry handle.
-    pub fn and_modify<F>(self, action: F) -> Self
-    where
-        F: FnOnce(&mut V),
-    {
-        if let Some(index) = self.index {
-            action(self.map.value_mut_at(index));
-        }
-        self
-    }
-
-    /// Insert `default` if vacant, returning a mutable reference to the value.
-    pub fn or_insert(self, default: V) -> Result<&'view mut V>
-    where
-        K: Hash + Eq,
-    {
-        self.or_insert_with(|| default)
-    }
-
-    /// Call `default` and insert its value only when the key is vacant.
-    pub fn or_insert_with<F>(self, default: F) -> Result<&'view mut V>
-    where
-        K: Hash + Eq,
-        F: FnOnce() -> V,
-    {
-        let Self {
-            map,
-            arena,
-            key,
-            index,
-        } = self;
-        if let Some(index) = index {
-            drop(key);
-            return Ok(map.value_mut_at(index));
-        }
-        let key = key.expect("vacant entry retains its key");
-        let value = default();
-        let (_old, index) = map.insert_with_index(key, value, arena)?;
-        Ok(map.value_mut_at(index))
-    }
-}
-
-/// An iterator over compact hash-map key-value pairs.
-pub struct CompactHashMapIter<'view, K, V> {
-    control: &'view [u8],
-    entries: &'view [MaybeUninit<(K, V)>],
-    next: usize,
+/// Immutable iterator over a compact hash map.
+pub struct CompactHashMapIter<'a, K, V> {
+    control: &'a [u8],
+    entries: &'a [MaybeUninit<(K, V)>],
+    index: usize,
     remaining: usize,
 }
-
-impl<'view, K, V> Iterator for CompactHashMapIter<'view, K, V> {
-    type Item = (&'view K, &'view V);
-
+impl<'a, K, V> Iterator for CompactHashMapIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
     fn next(&mut self) -> Option<Self::Item> {
-        while self.next < self.control.len() {
-            let index = self.next;
-            self.next += 1;
-            if self.control[index] == OCCUPIED {
+        while self.index < self.control.len() {
+            let index = self.index;
+            self.index += 1;
+            if self.control[index] == FULL {
                 self.remaining -= 1;
-                // SAFETY: the occupied control byte identifies an initialized
-                // entry, and the iterator is tied to an immutable map borrow.
+                // SAFETY: FULL entries are initialized and this iterator holds the map borrow.
                 let pair = unsafe { self.entries[index].assume_init_ref() };
                 return Some((&pair.0, &pair.1));
             }
         }
         None
     }
-
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
     }
 }
-
 impl<K, V> ExactSizeIterator for CompactHashMapIter<'_, K, V> {}
 impl<K, V> core::iter::FusedIterator for CompactHashMapIter<'_, K, V> {}
 
-/// A mutable iterator over compact hash-map key-value pairs.
-pub struct CompactHashMapIterMut<'view, K, V> {
-    control: &'view [u8],
+/// Mutable iterator over key-value pairs.
+pub struct CompactHashMapIterMut<'a, K, V> {
+    control: &'a [u8],
     entries: *mut MaybeUninit<(K, V)>,
-    next: usize,
+    slots: usize,
+    index: usize,
     remaining: usize,
-    marker: core::marker::PhantomData<&'view mut (K, V)>,
+    marker: PhantomData<&'a mut (K, V)>,
 }
-
-impl<'view, K, V> Iterator for CompactHashMapIterMut<'view, K, V> {
-    type Item = (&'view K, &'view mut V);
-
+impl<'a, K, V> Iterator for CompactHashMapIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
     fn next(&mut self) -> Option<Self::Item> {
-        while self.next < self.control.len() {
-            let index = self.next;
-            self.next += 1;
-            if self.control[index] == OCCUPIED {
+        while self.index < self.slots {
+            let index = self.index;
+            self.index += 1;
+            if self.control[index] == FULL {
                 self.remaining -= 1;
-                // SAFETY: each slot is yielded at most once; the table is
-                // exclusively borrowed and the control byte marks a live pair.
-                let pair = unsafe { (&mut *self.entries.add(index)).assume_init_mut() };
-                let (key, value) = pair;
-                return Some((&*key, value));
+                // SAFETY: the exclusive map borrow is held for 'a; each control slot is visited once.
+                let pair: &'a mut (K, V) =
+                    unsafe { (&mut *self.entries.add(index)).assume_init_mut() };
+                return Some((&pair.0, &mut pair.1));
             }
         }
         None
     }
-
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
     }
 }
-
 impl<K, V> ExactSizeIterator for CompactHashMapIterMut<'_, K, V> {}
 impl<K, V> core::iter::FusedIterator for CompactHashMapIterMut<'_, K, V> {}
 
-struct HashMapDropGuard<'arena, K: CompactValue, V: CompactValue, S: BuildHasher> {
-    map: *mut CompactHashMap<'arena, K, V, S>,
-    armed: bool,
+/// Randomized cage-backed set.
+pub struct CompactHashSet<
+    T: CompactValue + Hash + Eq,
+    S: BuildHasher + CompactValue = CompactBuildHasher,
+> {
+    map: CompactHashMap<T, (), S>,
 }
-
-impl<K: CompactValue, V: CompactValue, S: BuildHasher> Drop for HashMapDropGuard<'_, K, V, S> {
-    fn drop(&mut self) {
-        if self.armed {
-            // SAFETY: this pointer comes from the exclusive map borrow in
-            // drop_entries and is used only to finish cleanup during unwind.
-            unsafe { (*self.map).drop_entries() };
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Probe {
-    found: Option<usize>,
-    vacant: Option<usize>,
-    vacant_is_deleted: bool,
-}
-
-impl Probe {
-    const fn empty() -> Self {
-        Self {
-            found: None,
-            vacant: None,
-            vacant_is_deleted: false,
-        }
-    }
-
-    const fn found(index: usize) -> Self {
-        Self {
-            found: Some(index),
-            vacant: None,
-            vacant_is_deleted: false,
-        }
-    }
-
-    const fn vacant(index: usize, is_deleted: bool) -> Self {
-        Self {
-            found: None,
-            vacant: Some(index),
-            vacant_is_deleted: is_deleted,
-        }
-    }
-}
-
-struct TableAllocations<'arena, K: CompactValue, V: CompactValue> {
-    control: ArenaAllocation<'arena, u8>,
-    entries: ArenaAllocation<'arena, MaybeUninit<(K, V)>>,
-}
-
-fn allocate_table<'arena, K: CompactValue, V: CompactValue>(
-    slots: usize,
-    arena: &mut Arena<'arena, '_>,
-) -> Result<TableAllocations<'arena, K, V>> {
-    let mut control = arena.alloc_owned_slice::<u8>(slots)?;
-    let mut entries = arena.alloc_owned_slice::<MaybeUninit<(K, V)>>(slots)?;
-    for _ in 0..slots {
-        control.push(EMPTY)?;
-        entries.push(MaybeUninit::uninit())?;
-    }
-    Ok(TableAllocations { control, entries })
-}
-
-fn slots_for_entries(entries: usize) -> Result<usize> {
-    if entries == 0 {
-        return Ok(0);
-    }
-    u32::try_from(entries).map_err(|_| CollectionError::CapacityOverflow)?;
-    let mut slots = MIN_SLOTS;
-    while max_entries(slots) < entries {
-        slots = slots
-            .checked_mul(2)
-            .filter(|slots| *slots <= u32::MAX as usize)
-            .ok_or(CollectionError::CapacityOverflow)?;
-    }
-    Ok(slots)
-}
-
-fn max_entries(slots: usize) -> usize {
-    slots.saturating_sub(slots / 8)
-}
-
-/// An arena-backed hash set implemented as a thin map-backed abstraction.
-pub struct CompactHashSet<'arena, T: CompactValue, S: BuildHasher = RandomState> {
-    map: CompactHashMap<'arena, T, (), S>,
-}
-
-impl<'arena, T: CompactValue, S: BuildHasher> CompactHashSet<'arena, T, S> {
-    /// Construct an empty set with the supplied hash builder.
+impl<T: CompactValue + Hash + Eq, S: BuildHasher + CompactValue> CompactHashSet<T, S> {
+    /// Create an empty set with a custom hasher.
     pub fn with_hasher(hash_builder: S) -> Self {
         Self {
             map: CompactHashMap::with_hasher(hash_builder),
         }
     }
-
-    /// Construct a set with room for at least `capacity` values.
-    pub fn with_capacity_and_hasher(
-        capacity: usize,
-        hash_builder: S,
-        arena: &mut Arena<'arena, '_>,
-    ) -> Result<Self> {
+    /// Create a set with initial capacity and a custom hasher.
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Result<Self> {
         Ok(Self {
-            map: CompactHashMap::with_capacity_and_hasher(capacity, hash_builder, arena)?,
+            map: CompactHashMap::with_capacity_and_hasher(capacity, hash_builder)?,
         })
     }
-
-    /// Return the number of stored values.
+    /// Return the element count.
     pub const fn len(&self) -> usize {
         self.map.len()
     }
-
-    /// Return the number of values the current table can hold before growth.
+    /// Return slot capacity.
     pub fn capacity(&self) -> usize {
         self.map.capacity()
     }
-
-    /// Return whether the set contains no values.
+    /// Return whether the set is empty.
     pub const fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
-
-    /// Borrow the active hash builder.
-    pub const fn hasher(&self) -> &S {
-        self.map.hasher()
+    /// Insert a value and report whether it was new.
+    pub fn insert(&mut self, value: T) -> Result<bool> {
+        Ok(self.map.insert(value, ())?.is_none())
     }
-
-    /// Insert `value`, returning whether it was newly added.
-    pub fn insert(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<bool>
-    where
-        T: Hash + Eq,
-    {
-        Ok(self.map.insert(value, (), arena)?.is_none())
-    }
-
-    /// Borrow the stored value equivalent to `value`.
-    pub fn get<Q>(&self, value: &Q, arena: &Arena<'arena, '_>) -> Result<Option<&T>>
+    /// Return a stored value equivalent to `value`.
+    pub fn get<Q>(&self, value: &Q) -> Option<&T>
     where
         T: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        Ok(self
-            .map
-            .get_key_value(value, arena)?
-            .map(|(stored, _)| stored))
+        self.map.get_key_value(value).map(|(key, _)| key)
     }
-
-    /// Return whether an equivalent value is present.
-    pub fn contains<Q>(&self, value: &Q, arena: &Arena<'arena, '_>) -> Result<bool>
+    /// Return whether the value is present.
+    pub fn contains<Q>(&self, value: &Q) -> bool
     where
         T: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.map.contains_key(value, arena)
+        self.map.contains_key(value)
     }
-
-    /// Remove an equivalent value and report whether one was present.
-    pub fn remove<Q>(&mut self, value: &Q, arena: &Arena<'arena, '_>) -> Result<bool>
+    /// Remove a value.
+    pub fn remove<Q>(&mut self, value: &Q) -> bool
     where
         T: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        Ok(self.map.remove(value, arena)?.is_some())
+        self.map.remove(value).is_some()
     }
-
-    /// Drop all stored values while retaining the table allocation.
+    /// Reserve room for additional values.
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
+        self.map.reserve(additional)
+    }
+    /// Drop all values while retaining table capacity.
     pub fn clear(&mut self) {
         self.map.clear();
     }
-
-    /// Ensure room for at least `additional` more values.
-    pub fn reserve(&mut self, additional: usize, arena: &mut Arena<'arena, '_>) -> Result<()>
-    where
-        T: Hash,
-    {
-        self.map.reserve(additional, arena)
+    /// Iterate over stored values.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.map.keys()
     }
-
-    /// Reduce storage to the smallest table that can hold the current values.
-    pub fn shrink_to_fit(&mut self, arena: &mut Arena<'arena, '_>) -> Result<()>
-    where
-        T: Hash,
-    {
-        self.map.shrink_to_fit(arena)
-    }
-
-    /// Return an iterator over stored values.
-    pub fn iter<'view>(
-        &'view self,
-        arena: &Arena<'arena, '_>,
-    ) -> Result<impl ExactSizeIterator<Item = &'view T>> {
-        self.map.keys(arena)
-    }
-
-    /// Keep only values for which `keep` returns true.
-    pub fn retain<F>(&mut self, mut keep: F)
-    where
-        F: FnMut(&T) -> bool,
-    {
-        self.map.retain(|value, _unit| keep(value));
+    /// Retain values accepted by `keep`.
+    pub fn retain<F: FnMut(&T) -> bool>(&mut self, mut keep: F) {
+        self.map.retain(|key, _| keep(key));
     }
 }
-
-impl<'arena, T: CompactValue> CompactHashSet<'arena, T, RandomState> {
-    /// Construct an empty set with a fresh randomized hash builder.
+impl<T: CompactValue + Hash + Eq> CompactHashSet<T, CompactBuildHasher> {
+    /// Create an empty randomized set.
     pub fn new() -> Self {
-        Self::with_hasher(RandomState::new())
+        Self::with_hasher(CompactBuildHasher::new())
     }
-
-    /// Construct a set with room for at least `capacity` values and a fresh
-    /// randomized hash builder.
-    pub fn with_capacity(capacity: usize, arena: &mut Arena<'arena, '_>) -> Result<Self> {
-        Self::with_capacity_and_hasher(capacity, RandomState::new(), arena)
+    /// Create a randomized set with initial capacity.
+    pub fn with_capacity(capacity: usize) -> Result<Self> {
+        Self::with_capacity_and_hasher(capacity, CompactBuildHasher::new())
     }
 }
-
-impl<T: CompactValue> Default for CompactHashSet<'_, T, RandomState> {
+impl<T: CompactValue + Hash + Eq> Default for CompactHashSet<T, CompactBuildHasher> {
     fn default() -> Self {
         Self::new()
     }
+}
+// SAFETY: all elements and the hasher are compact values.
+unsafe impl<T: CompactValue + Hash + Eq, S: BuildHasher + CompactValue> CompactValue
+    for CompactHashSet<T, S>
+{
 }

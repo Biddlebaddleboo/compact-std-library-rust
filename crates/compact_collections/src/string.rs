@@ -1,6 +1,7 @@
 //! Compact UTF-8 string with a twelve-byte inline payload.
 
-use compact_core::{Arena, ArenaAllocation, CompactValue};
+use compact_backend_std::{CageAllocation, CompactRuntime};
+use compact_core::{CompactValue, Error as CoreError};
 use core::borrow::Borrow;
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -10,30 +11,25 @@ use crate::{CollectionError, Result};
 
 const INLINE_CAPACITY: usize = 12;
 
-enum StringRepr<'arena> {
+enum StringRepr {
     Inline {
         len: u8,
         bytes: [u8; INLINE_CAPACITY],
     },
-    Heap(ArenaAllocation<'arena, u8>),
+    Heap(CageAllocation<u8>),
 }
 
-/// An arena-backed UTF-8 string with twelve inline bytes.
-///
-/// Inline strings allocate nothing. Long strings own a reclaimable byte
-/// allocation; growth preserves the old string if replacement allocation
-/// fails, and dropping the string releases heap storage.
-pub struct CompactString<'arena> {
-    repr: StringRepr<'arena>,
+/// A compact UTF-8 string with twelve inline bytes and a four-byte heap owner.
+pub struct CompactString {
+    repr: StringRepr,
 }
 
-impl<'arena> CompactString<'arena> {
-    /// Construct an empty inline string tied to `arena`.
-    pub fn new_in(_arena: &Arena<'arena, '_>) -> Self {
+impl CompactString {
+    /// Construct an empty inline string.
+    pub const fn new() -> Self {
         Self::empty()
     }
-
-    /// Construct an empty inline string without arena allocation.
+    /// Construct an empty inline string.
     pub const fn empty() -> Self {
         Self {
             repr: StringRepr::Inline {
@@ -42,9 +38,9 @@ impl<'arena> CompactString<'arena> {
             },
         }
     }
-
-    /// Copy a UTF-8 string into compact arena storage.
-    pub fn from_str_in(value: &str, arena: &mut Arena<'arena, '_>) -> Result<Self> {
+    /// Copy UTF-8 text into compact storage.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(value: &str) -> Result<Self> {
         if value.len() <= INLINE_CAPACITY {
             let mut bytes = [0; INLINE_CAPACITY];
             bytes[..value.len()].copy_from_slice(value.as_bytes());
@@ -55,73 +51,52 @@ impl<'arena> CompactString<'arena> {
                 },
             });
         }
-        let mut allocation = arena.alloc_owned_slice::<u8>(value.len())?;
+        let mut allocation = CompactRuntime::alloc_owned_slice::<u8>(value.len())?;
         allocation.extend_copy(value.as_bytes())?;
         Ok(Self {
             repr: StringRepr::Heap(allocation),
         })
     }
-
     /// Return the UTF-8 byte length.
     pub fn len(&self) -> usize {
         match &self.repr {
             StringRepr::Inline { len, .. } => *len as usize,
-            StringRepr::Heap(allocation) => allocation.len(),
+            StringRepr::Heap(a) => a.len(),
         }
     }
-
     /// Return whether the string is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Return the current storage capacity in bytes.
+    /// Return current storage capacity in bytes.
     pub fn capacity(&self) -> usize {
         match &self.repr {
             StringRepr::Inline { .. } => INLINE_CAPACITY,
-            StringRepr::Heap(allocation) => allocation.capacity(),
+            StringRepr::Heap(a) => a.capacity(),
         }
     }
-
-    /// Borrow the exact initialized UTF-8 bytes.
-    pub fn as_bytes<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<&'view [u8]> {
+    /// Borrow the exact UTF-8 bytes.
+    pub fn as_bytes(&self) -> &[u8] {
         match &self.repr {
-            StringRepr::Inline { len, bytes } => Ok(&bytes[..*len as usize]),
-            StringRepr::Heap(allocation) => {
-                arena.validate_owned(allocation)?;
-                Ok(allocation.as_slice())
-            }
+            StringRepr::Inline { len, bytes } => &bytes[..*len as usize],
+            StringRepr::Heap(a) => a.as_slice(),
         }
     }
-
-    /// Borrow the string as a zero-copy native `&str`.
-    pub fn as_str<'view>(&'view self, arena: &'view Arena<'arena, '_>) -> Result<&'view str> {
-        core::str::from_utf8(self.as_bytes(arena)?).map_err(|_| CollectionError::InvalidUtf8)
+    /// Borrow the string as a native `&str`.
+    pub fn as_str(&self) -> &str {
+        // SAFETY: constructors copy from `str`; mutation appends UTF-8 and truncates on character boundaries.
+        unsafe { core::str::from_utf8_unchecked(self.as_bytes()) }
     }
-
-    /// Return a pointer to the initialized UTF-8 bytes.
-    ///
-    /// The pointer is valid only while this string remains alive and is not
-    /// mutated or reallocated. Prefer [`with_ffi_bytes`](Self::with_ffi_bytes)
-    /// for a synchronous native call.
-    pub fn as_ptr(&self, arena: &Arena<'arena, '_>) -> Result<*const u8> {
-        Ok(self.as_bytes(arena)?.as_ptr())
+    /// Return a pointer valid until this string is mutated or dropped.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.as_bytes().as_ptr()
     }
-
-    /// Expose the UTF-8 bytes for the duration of a synchronous native call.
-    ///
-    /// A native callee must not retain the pointer after `call` returns. Use
-    /// `compact_std::FfiByteBuffer` when the bytes must outlive this borrow.
-    pub fn with_ffi_bytes<R>(
-        &self,
-        arena: &Arena<'arena, '_>,
-        call: impl FnOnce(&[u8]) -> R,
-    ) -> Result<R> {
-        Ok(call(self.as_bytes(arena)?))
+    /// Expose the UTF-8 bytes for a synchronous native call.
+    pub fn with_ffi_bytes<R>(&self, call: impl FnOnce(&[u8]) -> R) -> R {
+        call(self.as_bytes())
     }
-
-    /// Append UTF-8 text, preserving the old value if arena allocation fails.
-    pub fn push_str_in(&mut self, value: &str, arena: &mut Arena<'arena, '_>) -> Result<()> {
+    /// Append UTF-8 text. Allocation failure leaves the prior string intact.
+    pub fn push_str(&mut self, value: &str) -> Result<()> {
         if value.is_empty() {
             return Ok(());
         }
@@ -129,7 +104,6 @@ impl<'arena> CompactString<'arena> {
         let required = old_len
             .checked_add(value.len())
             .ok_or(CollectionError::CapacityOverflow)?;
-
         if let StringRepr::Inline { len, bytes } = &mut self.repr {
             if required <= INLINE_CAPACITY {
                 bytes[old_len..required].copy_from_slice(value.as_bytes());
@@ -137,243 +111,207 @@ impl<'arena> CompactString<'arena> {
                 return Ok(());
             }
         }
-
         if let StringRepr::Heap(allocation) = &mut self.repr {
-            arena.validate_owned(allocation)?;
             if required <= allocation.capacity() {
                 allocation.extend_copy(value.as_bytes())?;
                 return Ok(());
             }
-            let new_capacity = required.max(allocation.capacity().saturating_mul(2).max(16));
-            if arena.try_resize_owned(allocation, new_capacity)? {
+            let cap = required.max(allocation.capacity().saturating_mul(2).max(16));
+            if allocation.try_resize(cap)? {
                 allocation.extend_copy(value.as_bytes())?;
                 return Ok(());
             }
         }
-
         let new_capacity = required.max(self.capacity().saturating_mul(2).max(16));
-        let mut replacement = arena.alloc_owned_slice::<u8>(new_capacity)?;
-        match &self.repr {
-            StringRepr::Inline { len, bytes } => {
-                replacement.extend_copy(&bytes[..*len as usize])?;
-            }
-            StringRepr::Heap(allocation) => {
-                replacement.extend_copy(allocation.as_slice())?;
-            }
-        }
+        let mut replacement = CompactRuntime::alloc_owned_slice::<u8>(new_capacity)?;
+        replacement.extend_copy(self.as_bytes())?;
         replacement.extend_copy(value.as_bytes())?;
         self.repr = StringRepr::Heap(replacement);
         Ok(())
     }
-
     /// Append one Unicode scalar value.
-    pub fn push_char_in(&mut self, value: char, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        let mut encoded = [0_u8; 4];
-        self.push_str_in(value.encode_utf8(&mut encoded), arena)
+    pub fn push_char(&mut self, value: char) -> Result<()> {
+        let mut bytes = [0; 4];
+        self.push_str(value.encode_utf8(&mut bytes))
     }
-
-    /// Clear the string while retaining any heap allocation for reuse.
+    /// Clear while retaining any heap allocation.
     pub fn clear(&mut self) {
         match &mut self.repr {
             StringRepr::Inline { len, .. } => *len = 0,
-            StringRepr::Heap(allocation) => allocation.truncate(0),
+            StringRepr::Heap(a) => a.truncate(0),
         }
     }
-
     /// Truncate at a UTF-8 character boundary.
-    pub fn truncate_in(&mut self, new_len: usize, arena: &Arena<'arena, '_>) -> Result<()> {
+    pub fn truncate(&mut self, new_len: usize) -> Result<()> {
         if new_len >= self.len() {
             return Ok(());
         }
-        let value = self.as_str(arena)?;
-        if !value.is_char_boundary(new_len) {
-            return Err(CollectionError::Core(compact_core::Error::OutOfBounds));
+        if !self.as_str().is_char_boundary(new_len) {
+            return Err(CollectionError::Core(CoreError::OutOfBounds));
         }
         if new_len <= INLINE_CAPACITY {
             let mut bytes = [0; INLINE_CAPACITY];
-            bytes[..new_len].copy_from_slice(&value.as_bytes()[..new_len]);
+            bytes[..new_len].copy_from_slice(&self.as_bytes()[..new_len]);
             self.repr = StringRepr::Inline {
                 len: new_len as u8,
                 bytes,
             };
-            return Ok(());
-        }
-        if let StringRepr::Heap(allocation) = &mut self.repr {
-            allocation.truncate(new_len);
+        } else if let StringRepr::Heap(a) = &mut self.repr {
+            a.truncate(new_len);
         }
         Ok(())
     }
-
-    /// Release unused heap capacity while retaining the string contents.
-    pub fn shrink_to_fit_in(&mut self, arena: &mut Arena<'arena, '_>) -> Result<()> {
+    /// Release unused heap capacity, moving short contents back inline.
+    pub fn shrink_to_fit(&mut self) -> Result<()> {
         if self.len() <= INLINE_CAPACITY {
-            if let StringRepr::Heap(allocation) = &self.repr {
-                arena.validate_owned(allocation)?;
+            if let StringRepr::Heap(a) = &self.repr {
+                let len = a.len();
                 let mut bytes = [0; INLINE_CAPACITY];
-                bytes[..allocation.len()].copy_from_slice(allocation.as_slice());
-                let len = allocation.len() as u8;
-                self.repr = StringRepr::Inline { len, bytes };
+                bytes[..len].copy_from_slice(a.as_slice());
+                self.repr = StringRepr::Inline {
+                    len: len as u8,
+                    bytes,
+                };
             }
             return Ok(());
         }
         let StringRepr::Heap(allocation) = &mut self.repr else {
             return Ok(());
         };
-        arena.validate_owned(allocation)?;
         let len = allocation.len();
-        if arena.try_resize_owned(allocation, len)? {
+        if allocation.try_resize(len)? {
             return Ok(());
         }
-        let mut replacement = arena.alloc_owned_slice::<u8>(len)?;
+        let mut replacement = CompactRuntime::alloc_owned_slice::<u8>(len)?;
         replacement.extend_copy(allocation.as_slice())?;
         self.repr = StringRepr::Heap(replacement);
         Ok(())
     }
-
     /// Compare with an ordinary native string.
-    pub fn eq_str(&self, other: &str, arena: &Arena<'arena, '_>) -> Result<bool> {
-        Ok(self.as_str(arena)? == other)
+    pub fn eq_str(&self, other: &str) -> bool {
+        self.as_str() == other
     }
-
-    /// Create a formatting writer that grows this string through `arena`.
-    pub fn writer<'view, 'backing>(
-        &'view mut self,
-        arena: &'view mut Arena<'arena, 'backing>,
-    ) -> CompactStringWriter<'view, 'arena, 'backing> {
+    /// Create a formatting writer that appends to this string.
+    pub fn writer(&mut self) -> CompactStringWriter<'_> {
         CompactStringWriter {
             text: self,
-            arena,
             error: None,
         }
     }
 }
 
-/// A formatting adapter that appends to a [`CompactString`] using an explicit
-/// arena for any required growth.
-pub struct CompactStringWriter<'view, 'arena, 'backing> {
-    text: &'view mut CompactString<'arena>,
-    arena: &'view mut Arena<'arena, 'backing>,
+/// Formatting adapter for a compact string.
+pub struct CompactStringWriter<'a> {
+    text: &'a mut CompactString,
     error: Option<CollectionError>,
 }
 
-impl CompactStringWriter<'_, '_, '_> {
-    /// Append UTF-8 text and preserve the arena allocation error.
-    pub fn write_str_in(&mut self, value: &str) -> Result<()> {
-        self.text.push_str_in(value, self.arena)
+impl CompactStringWriter<'_> {
+    /// Append text and preserve allocation errors.
+    pub fn write_str(&mut self, value: &str) -> Result<()> {
+        self.text.push_str(value)
     }
-
-    /// Append one Unicode scalar value and preserve the arena allocation error.
-    pub fn write_char_in(&mut self, value: char) -> Result<()> {
-        self.text.push_char_in(value, self.arena)
+    /// Append a Unicode scalar value.
+    pub fn write_char(&mut self, value: char) -> Result<()> {
+        self.text.push_char(value)
     }
-
-    /// Format values into the compact string and preserve arena errors.
-    ///
-    /// A `fmt::Display` implementation that returns `fmt::Error` without an
-    /// arena failure follows the behavior of standard formatting and panics.
-    pub fn write_fmt_in(&mut self, arguments: fmt::Arguments<'_>) -> Result<()> {
+    /// Format values and preserve cage allocation errors.
+    pub fn write_fmt(&mut self, arguments: fmt::Arguments<'_>) -> Result<()> {
         self.error = None;
         match fmt::write(self, arguments) {
             Ok(()) => Ok(()),
             Err(_) => match self.error.take() {
-                Some(error) => Err(error),
+                Some(e) => Err(e),
                 None => panic!("a formatter returned an error"),
             },
         }
     }
 }
-
-impl fmt::Write for CompactStringWriter<'_, '_, '_> {
+impl fmt::Write for CompactStringWriter<'_> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.write_str_in(value).map_err(|error| {
-            self.error = Some(error);
+        self.text.push_str(value).map_err(|e| {
+            self.error = Some(e);
             fmt::Error
         })
     }
 }
-
-impl Deref for CompactString<'_> {
+impl Deref for CompactString {
     type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        let bytes = match &self.repr {
-            StringRepr::Inline { len, bytes } => &bytes[..*len as usize],
-            StringRepr::Heap(allocation) => allocation.as_slice(),
-        };
-        // SAFETY: all constructors accept `str`, append preserves UTF-8, and
-        // truncation checks character boundaries before changing the prefix.
-        unsafe { core::str::from_utf8_unchecked(bytes) }
+    fn deref(&self) -> &str {
+        self.as_str()
     }
 }
-
-impl AsRef<str> for CompactString<'_> {
+impl AsRef<str> for CompactString {
     fn as_ref(&self) -> &str {
         self
     }
 }
-
-impl Borrow<str> for CompactString<'_> {
+impl Borrow<str> for CompactString {
     fn borrow(&self) -> &str {
         self
     }
 }
-
-impl fmt::Display for CompactString<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&**self, formatter)
+impl fmt::Display for CompactString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
-
-impl Default for CompactString<'_> {
+impl Default for CompactString {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl fmt::Debug for CompactString<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, formatter)
+impl core::str::FromStr for CompactString {
+    type Err = crate::CollectionError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        CompactString::from_str(value)
     }
 }
-
-impl PartialEq for CompactString<'_> {
+impl fmt::Debug for CompactString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+impl PartialEq for CompactString {
     fn eq(&self, other: &Self) -> bool {
-        self.deref() == other.deref()
+        self.as_str() == other.as_str()
     }
 }
-
-impl Eq for CompactString<'_> {}
-
-impl PartialEq<str> for CompactString<'_> {
+impl Eq for CompactString {}
+impl PartialEq<str> for CompactString {
     fn eq(&self, other: &str) -> bool {
-        self.deref() == other
+        self.as_str() == other
     }
 }
-
-impl PartialEq<&str> for CompactString<'_> {
+impl PartialEq<&str> for CompactString {
     fn eq(&self, other: &&str) -> bool {
-        self.deref() == *other
+        self.as_str() == *other
     }
 }
-
-impl PartialOrd for CompactString<'_> {
+impl PartialOrd for CompactString {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-
-impl Ord for CompactString<'_> {
+impl Ord for CompactString {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.deref().cmp(other.deref())
+        self.as_str().cmp(other.as_str())
     }
 }
-
-impl Hash for CompactString<'_> {
+impl Hash for CompactString {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.deref().hash(state);
+        self.as_str().hash(state);
     }
 }
+// SAFETY: inline bytes move with the string and heap bytes have one cage owner.
+unsafe impl CompactValue for CompactString {}
 
-// SAFETY: the inline bytes move with the wrapper and heap storage is a unique
-// ArenaAllocation token whose bytes have no address-sensitive state.
-unsafe impl CompactValue for CompactString<'_> {}
+impl<T: fmt::Display + ?Sized> crate::TryToCompactString for T {
+    fn try_to_compact_string(&self) -> Result<CompactString> {
+        let mut text = CompactString::new();
+        text.writer().write_fmt(format_args!("{self}"))?;
+        Ok(text)
+    }
+}

@@ -1,77 +1,48 @@
-//! Direct arena-aware Serde seeds and built-in compact visitors.
+//! Direct cage-backed Serde seeds and visitors.
 
-use core::marker::PhantomData;
-use core::{fmt, hash::Hash};
-use std::collections::hash_map::RandomState;
-
+use compact_backend_std::CompactValue;
 use compact_collections::{
     CompactBytes, CompactHashMap, CompactHashSet, CompactOsString, CompactPathBuf, CompactString,
     CompactVec, CompactVecDeque,
 };
-use compact_core::{Arena, CompactValue};
-use serde::de::{self, DeserializeSeed, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
-use serde::Deserialize;
+use core::{fmt, hash::Hash, marker::PhantomData};
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
-/// Construct a compact value directly from a Serde deserializer.
-pub trait CompactDeserialize<'de, 'arena>: Sized {
-    /// Deserialize this value while storing owned data in `arena`.
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>;
+/// Construct a value directly from a Serde deserializer.
+pub trait CompactDeserialize<'de>: Sized {
+    /// Deserialize this value, allocating compact fields in the process cage.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>;
 }
 
-/// A Serde seed carrying the arena used by nested compact visitors.
-pub struct CompactDeserializeSeed<'seed, 'arena, 'memory, T> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<'seed, 'arena, 'memory, T> CompactDeserializeSeed<'seed, 'arena, 'memory, T> {
-    /// Create a seed that stores all owned values in `arena`.
-    pub fn new(arena: &'seed mut Arena<'arena, 'memory>) -> Self {
-        Self {
-            arena,
-            marker: PhantomData,
-        }
+/// A seed for nested compact deserialization.
+pub struct CompactDeserializeSeed<T>(PhantomData<fn() -> T>);
+impl<T> CompactDeserializeSeed<T> {
+    /// Create a seed for `T`.
+    pub const fn new() -> Self {
+        Self(PhantomData)
     }
 }
-
-impl<'de, 'seed, 'arena, 'memory, T> DeserializeSeed<'de>
-    for CompactDeserializeSeed<'seed, 'arena, 'memory, T>
-where
-    T: CompactDeserialize<'de, 'arena>,
-{
+impl<T> Default for CompactDeserializeSeed<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl<'de, T: CompactDeserialize<'de>> DeserializeSeed<'de> for CompactDeserializeSeed<T> {
     type Value = T;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        T::deserialize_in(deserializer, self.arena)
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<T, D::Error> {
+        T::deserialize(deserializer)
     }
 }
 
 macro_rules! scalar_impls {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl<'de, 'arena> CompactDeserialize<'de, 'arena> for $ty {
-                fn deserialize_in<'memory, D>(
-                    deserializer: D,
-                    _arena: &mut Arena<'arena, 'memory>,
-                ) -> Result<Self, D::Error>
-                where
-                    D: Deserializer<'de>,
-                {
-                    <$ty as Deserialize<'de>>::deserialize(deserializer)
-                }
+    ($($ty:ty),* $(,)?) => {$ (
+        impl<'de> CompactDeserialize<'de> for $ty {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                <$ty as serde::Deserialize<'de>>::deserialize(deserializer)
             }
-        )*
-    };
+        }
+    )*};
 }
-
 scalar_impls!(
     (),
     bool,
@@ -89,482 +60,222 @@ scalar_impls!(
     i128,
     isize,
     f32,
-    f64
+    f64,
+    std::string::String
 );
 
-struct OptionVisitor<'seed, 'arena, 'memory, T> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<'de, 'seed, 'arena, 'memory, T> Visitor<'de> for OptionVisitor<'seed, 'arena, 'memory, T>
-where
-    T: CompactDeserialize<'de, 'arena>,
-{
-    type Value = Option<T>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an optional compact value")
+struct StringVisitor;
+impl<'de> Visitor<'de> for StringVisitor {
+    type Value = CompactString;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a UTF-8 string")
     }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(None)
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        CompactString::from_str(value).map_err(E::custom)
     }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(None)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        T::deserialize_in(deserializer, self.arena).map(Some)
-    }
-}
-
-impl<'de, 'arena, T> CompactDeserialize<'de, 'arena> for Option<T>
-where
-    T: CompactDeserialize<'de, 'arena>,
-{
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_option(OptionVisitor {
-            arena,
-            marker: PhantomData,
-        })
-    }
-}
-
-struct StringVisitor<'seed, 'arena, 'memory> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-}
-
-impl<'de, 'seed, 'arena, 'memory> Visitor<'de> for StringVisitor<'seed, 'arena, 'memory> {
-    type Value = CompactString<'arena>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a UTF-8 string for compact storage")
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        CompactString::from_str_in(value, self.arena).map_err(E::custom)
-    }
-
-    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
         self.visit_str(value)
     }
+    fn visit_string<E: de::Error>(self, value: std::string::String) -> Result<Self::Value, E> {
+        self.visit_str(&value)
+    }
 }
-
-impl<'de, 'arena> CompactDeserialize<'de, 'arena> for CompactString<'arena> {
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(StringVisitor { arena })
+impl<'de> CompactDeserialize<'de> for CompactString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(StringVisitor)
     }
 }
 
-struct OsStringVisitor<'seed, 'arena, 'memory> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-}
-
-impl<'de, 'seed, 'arena, 'memory> Visitor<'de> for OsStringVisitor<'seed, 'arena, 'memory> {
-    type Value = CompactOsString<'arena>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a UTF-8 string for a compact operating-system string")
+struct BytesVisitor;
+impl<'de> Visitor<'de> for BytesVisitor {
+    type Value = CompactBytes;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a byte string or byte sequence")
     }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        CompactOsString::from(value, self.arena).map_err(E::custom)
+    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+        CompactBytes::from_slice(value).map_err(E::custom)
     }
-
-    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.visit_str(value)
-    }
-}
-
-impl<'de, 'arena> CompactDeserialize<'de, 'arena> for CompactOsString<'arena> {
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(OsStringVisitor { arena })
-    }
-}
-
-struct PathBufVisitor<'seed, 'arena, 'memory> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-}
-
-impl<'de, 'seed, 'arena, 'memory> Visitor<'de> for PathBufVisitor<'seed, 'arena, 'memory> {
-    type Value = CompactPathBuf<'arena>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a UTF-8 string for a compact path")
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        CompactPathBuf::from(value, self.arena).map_err(E::custom)
-    }
-
-    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.visit_str(value)
-    }
-}
-
-impl<'de, 'arena> CompactDeserialize<'de, 'arena> for CompactPathBuf<'arena> {
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(PathBufVisitor { arena })
-    }
-}
-
-struct BytesVisitor<'seed, 'arena, 'memory> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-}
-
-impl<'de, 'seed, 'arena, 'memory> Visitor<'de> for BytesVisitor<'seed, 'arena, 'memory> {
-    type Value = CompactBytes<'arena>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a byte string or sequence of bytes")
-    }
-
-    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        CompactBytes::from_slice_in(value, self.arena).map_err(E::custom)
-    }
-
-    fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
+    fn visit_borrowed_bytes<E: de::Error>(self, value: &'de [u8]) -> Result<Self::Value, E> {
         self.visit_bytes(value)
     }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut bytes = CompactBytes::new();
-        while let Some(byte) = sequence.next_element::<u8>()? {
-            bytes
-                .push_in(byte, &mut *self.arena)
-                .map_err(A::Error::custom)?;
+    fn visit_byte_buf<E: de::Error>(self, value: std::vec::Vec<u8>) -> Result<Self::Value, E> {
+        self.visit_bytes(&value)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut bytes =
+            CompactBytes::with_capacity(seq.size_hint().unwrap_or(0)).map_err(de::Error::custom)?;
+        while let Some(byte) = seq.next_element::<u8>()? {
+            bytes.push(byte).map_err(de::Error::custom)?;
         }
         Ok(bytes)
     }
 }
-
-impl<'de, 'arena> CompactDeserialize<'de, 'arena> for CompactBytes<'arena> {
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_bytes(BytesVisitor { arena })
+impl<'de> CompactDeserialize<'de> for CompactBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_bytes(BytesVisitor)
     }
 }
 
-struct VecVisitor<'seed, 'arena, 'memory, T> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<'de, 'seed, 'arena, 'memory, T> Visitor<'de> for VecVisitor<'seed, 'arena, 'memory, T>
-where
-    T: CompactValue + CompactDeserialize<'de, 'arena>,
-{
-    type Value = CompactVec<'arena, T>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a sequence of compact values")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = CompactVec::new_in(self.arena);
-        while let Some(value) =
-            sequence.next_element_seed(CompactDeserializeSeed::<T>::new(&mut *self.arena))?
-        {
-            values
-                .push_in(value, &mut *self.arena)
-                .map_err(A::Error::custom)?;
-        }
-        Ok(values)
-    }
-}
-
-impl<'de, 'arena, T> CompactDeserialize<'de, 'arena> for CompactVec<'arena, T>
-where
-    T: CompactValue + CompactDeserialize<'de, 'arena>,
-{
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(VecVisitor {
-            arena,
-            marker: PhantomData,
-        })
-    }
-}
-
-struct VecDequeVisitor<'seed, 'arena, 'memory, T> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<'de, 'seed, 'arena, 'memory, T> Visitor<'de> for VecDequeVisitor<'seed, 'arena, 'memory, T>
-where
-    T: CompactValue + CompactDeserialize<'de, 'arena>,
-{
-    type Value = CompactVecDeque<'arena, T>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a sequence of compact deque values")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = CompactVecDeque::new_in(self.arena);
-        while let Some(value) =
-            sequence.next_element_seed(CompactDeserializeSeed::<T>::new(&mut *self.arena))?
-        {
-            values
-                .push_back_in(value, &mut *self.arena)
-                .map_err(A::Error::custom)?;
-        }
-        Ok(values)
-    }
-}
-
-impl<'de, 'arena, T> CompactDeserialize<'de, 'arena> for CompactVecDeque<'arena, T>
-where
-    T: CompactValue + CompactDeserialize<'de, 'arena>,
-{
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(VecDequeVisitor {
-            arena,
-            marker: PhantomData,
-        })
-    }
-}
-
-struct HashSetVisitor<'seed, 'arena, 'memory, T> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<'de, 'seed, 'arena, 'memory, T> Visitor<'de> for HashSetVisitor<'seed, 'arena, 'memory, T>
-where
-    T: CompactValue + CompactDeserialize<'de, 'arena> + Eq + Hash,
-{
-    type Value = CompactHashSet<'arena, T>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a sequence of compact hash-set values")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = CompactHashSet::new();
-        while let Some(value) =
-            sequence.next_element_seed(CompactDeserializeSeed::<T>::new(&mut *self.arena))?
-        {
-            values
-                .insert(value, &mut *self.arena)
-                .map_err(A::Error::custom)?;
-        }
-        Ok(values)
-    }
-}
-
-impl<'de, 'arena, T> CompactDeserialize<'de, 'arena> for CompactHashSet<'arena, T, RandomState>
-where
-    T: CompactValue + CompactDeserialize<'de, 'arena> + Eq + Hash,
-{
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(HashSetVisitor {
-            arena,
-            marker: PhantomData,
-        })
-    }
-}
-
-struct HashMapVisitor<'seed, 'arena, 'memory, K, V> {
-    arena: &'seed mut Arena<'arena, 'memory>,
-    marker: PhantomData<fn() -> (K, V)>,
-}
-
-impl<'de, 'seed, 'arena, 'memory, K, V> Visitor<'de>
-    for HashMapVisitor<'seed, 'arena, 'memory, K, V>
-where
-    K: CompactValue + CompactDeserialize<'de, 'arena> + Eq + Hash,
-    V: CompactValue + CompactDeserialize<'de, 'arena>,
-{
-    type Value = CompactHashMap<'arena, K, V>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a map of compact keys and values")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut values = CompactHashMap::new();
-        while let Some(key) =
-            map.next_key_seed(CompactDeserializeSeed::<K>::new(&mut *self.arena))?
-        {
-            let value = map.next_value_seed(CompactDeserializeSeed::<V>::new(&mut *self.arena))?;
-            values
-                .insert(key, value, &mut *self.arena)
-                .map_err(A::Error::custom)?;
-        }
-        Ok(values)
-    }
-}
-
-impl<'de, 'arena, K, V> CompactDeserialize<'de, 'arena>
-    for CompactHashMap<'arena, K, V, RandomState>
-where
-    K: CompactValue + CompactDeserialize<'de, 'arena> + Eq + Hash,
-    V: CompactValue + CompactDeserialize<'de, 'arena>,
-{
-    fn deserialize_in<'memory, D>(
-        deserializer: D,
-        arena: &mut Arena<'arena, 'memory>,
-    ) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(HashMapVisitor {
-            arena,
-            marker: PhantomData,
-        })
-    }
-}
-
-macro_rules! tuple_impl {
-    ($visitor:ident, $length:literal; $($ty:ident : $value:ident : $index:literal),+ $(,)?) => {
-        struct $visitor<'seed, 'arena, 'memory, $($ty),+> {
-            arena: &'seed mut Arena<'arena, 'memory>,
-            marker: PhantomData<fn() -> ($($ty,)+)>,
-        }
-
-        impl<'de, 'seed, 'arena, 'memory, $($ty),+> Visitor<'de>
-            for $visitor<'seed, 'arena, 'memory, $($ty),+>
-        where
-            $($ty: CompactDeserialize<'de, 'arena>,)+
-        {
-            type Value = ($($ty,)+);
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(formatter, "a tuple with {} compact elements", $length)
+macro_rules! compact_string_like {
+    ($ty:ty, $visitor:ident, $make:expr, $expecting:literal) => {
+        struct $visitor;
+        impl<'de> Visitor<'de> for $visitor {
+            type Value = $ty;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str($expecting)
             }
-
-            fn visit_seq<__Access>(self, mut sequence: __Access) -> Result<Self::Value, __Access::Error>
-            where
-                __Access: SeqAccess<'de>,
-            {
-                $(
-                    let $value = sequence
-                        .next_element_seed(CompactDeserializeSeed::<$ty>::new(&mut *self.arena))?
-                        .ok_or_else(|| __Access::Error::invalid_length($index, &self))?;
-                )+
-                Ok(($($value,)+))
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                ($make)(value).map_err(E::custom)
+            }
+            fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+                self.visit_str(value)
+            }
+            fn visit_string<E: de::Error>(
+                self,
+                value: std::string::String,
+            ) -> Result<Self::Value, E> {
+                self.visit_str(&value)
             }
         }
-
-        impl<'de, 'arena, $($ty),+> CompactDeserialize<'de, 'arena> for ($($ty,)+)
-        where
-            $($ty: CompactDeserialize<'de, 'arena>,)+
-        {
-            fn deserialize_in<'memory, __Deserializer>(
-                deserializer: __Deserializer,
-                arena: &mut Arena<'arena, 'memory>,
-            ) -> Result<Self, __Deserializer::Error>
-            where
-                __Deserializer: Deserializer<'de>,
-            {
-                deserializer.deserialize_tuple($length, $visitor {
-                    arena,
-                    marker: PhantomData,
-                })
+        impl<'de> CompactDeserialize<'de> for $ty {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserializer.deserialize_str($visitor)
             }
         }
     };
 }
+compact_string_like!(
+    CompactOsString,
+    OsStringVisitor,
+    |value: &str| CompactOsString::from(value),
+    "an operating-system string"
+);
+compact_string_like!(
+    CompactPathBuf,
+    PathBufVisitor,
+    |value: &str| CompactPathBuf::from(value),
+    "a path string"
+);
 
-tuple_impl!(Tuple1Visitor, 1; A: first: 0);
-tuple_impl!(Tuple2Visitor, 2; A: first: 0, B: second: 1);
-tuple_impl!(Tuple3Visitor, 3; A: first: 0, B: second: 1, C: third: 2);
-tuple_impl!(Tuple4Visitor, 4; A: first: 0, B: second: 1, C: third: 2, D: fourth: 3);
+struct OptionVisitor<T>(PhantomData<fn() -> T>);
+impl<'de, T: CompactDeserialize<'de>> Visitor<'de> for OptionVisitor<T> {
+    type Value = Option<T>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an optional value")
+    }
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        T::deserialize(deserializer).map(Some)
+    }
+}
+impl<'de, T: CompactDeserialize<'de>> CompactDeserialize<'de> for Option<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_option(OptionVisitor(PhantomData))
+    }
+}
+
+struct VecVisitor<T>(PhantomData<fn() -> T>);
+impl<'de, T: CompactValue + CompactDeserialize<'de>> Visitor<'de> for VecVisitor<T> {
+    type Value = CompactVec<T>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a sequence")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut values =
+            CompactVec::with_capacity(seq.size_hint().unwrap_or(0)).map_err(de::Error::custom)?;
+        while let Some(value) = seq.next_element_seed(CompactDeserializeSeed::<T>::new())? {
+            values.push(value).map_err(de::Error::custom)?;
+        }
+        Ok(values)
+    }
+}
+impl<'de, T: CompactValue + CompactDeserialize<'de>> CompactDeserialize<'de> for CompactVec<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(VecVisitor(PhantomData))
+    }
+}
+
+struct DequeVisitor<T>(PhantomData<fn() -> T>);
+impl<'de, T: CompactValue + CompactDeserialize<'de>> Visitor<'de> for DequeVisitor<T> {
+    type Value = CompactVecDeque<T>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a sequence")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut values = CompactVecDeque::with_capacity(seq.size_hint().unwrap_or(0))
+            .map_err(de::Error::custom)?;
+        while let Some(value) = seq.next_element_seed(CompactDeserializeSeed::<T>::new())? {
+            values.push_back(value).map_err(de::Error::custom)?;
+        }
+        Ok(values)
+    }
+}
+impl<'de, T: CompactValue + CompactDeserialize<'de>> CompactDeserialize<'de>
+    for CompactVecDeque<T>
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(DequeVisitor(PhantomData))
+    }
+}
+
+struct MapVisitor<K, V>(PhantomData<fn() -> (K, V)>);
+impl<'de, K, V> Visitor<'de> for MapVisitor<K, V>
+where
+    K: CompactValue + Hash + Eq + CompactDeserialize<'de>,
+    V: CompactValue + CompactDeserialize<'de>,
+{
+    type Value = CompactHashMap<K, V>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a map")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut values = CompactHashMap::with_capacity(map.size_hint().unwrap_or(0))
+            .map_err(de::Error::custom)?;
+        while let Some(key) = map.next_key_seed(CompactDeserializeSeed::<K>::new())? {
+            let value = map.next_value_seed(CompactDeserializeSeed::<V>::new())?;
+            values.insert(key, value).map_err(de::Error::custom)?;
+        }
+        Ok(values)
+    }
+}
+impl<'de, K, V> CompactDeserialize<'de> for CompactHashMap<K, V>
+where
+    K: CompactValue + Hash + Eq + CompactDeserialize<'de>,
+    V: CompactValue + CompactDeserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(MapVisitor(PhantomData))
+    }
+}
+
+struct SetVisitor<T>(PhantomData<fn() -> T>);
+impl<'de, T> Visitor<'de> for SetVisitor<T>
+where
+    T: CompactValue + Hash + Eq + CompactDeserialize<'de>,
+{
+    type Value = CompactHashSet<T>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a sequence")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut values = CompactHashSet::with_capacity(seq.size_hint().unwrap_or(0))
+            .map_err(de::Error::custom)?;
+        while let Some(value) = seq.next_element_seed(CompactDeserializeSeed::<T>::new())? {
+            values.insert(value).map_err(de::Error::custom)?;
+        }
+        Ok(values)
+    }
+}
+impl<'de, T> CompactDeserialize<'de> for CompactHashSet<T>
+where
+    T: CompactValue + Hash + Eq + CompactDeserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(SetVisitor(PhantomData))
+    }
+}

@@ -1,12 +1,9 @@
-//! Procedural macros for compact arena layouts and lexical constructor
-//! rewriting, preserving the documented V2.1.0 source contract.
+//! Procedural macros for packed compact layouts and cage-backed deserialization.
 
 extern crate proc_macro;
 
-mod arena;
 mod compact;
 mod compact_deserialize;
-mod compact_freeze;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, Item};
@@ -18,7 +15,7 @@ use syn::{parse_macro_input, Item};
 /// `String`, and fieldless enums also annotated with `#[compact]`. Add
 /// `#[max = CONST_EXPR]` to a nonnegative integer field to pack its proven
 /// `0..=max` range. `#[hot]` and `#[cold]` fields are placed in separate
-/// arena allocations. `#[compact(soa)]` additionally generates a
+/// packed sections. `#[compact(soa)]` additionally generates a
 /// primitive-column SoA collection.
 ///
 /// Named, non-generic structs are the supported struct surface. Unsupported
@@ -38,7 +35,7 @@ pub fn compact(attributes: TokenStream, input: TokenStream) -> TokenStream {
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
-/// Derive direct arena-backed Serde deserialization for compact field types.
+/// Derive direct cage-backed Serde deserialization for compact field types.
 #[proc_macro_derive(CompactDeserialize, attributes(serde))]
 pub fn compact_deserialize(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
@@ -47,35 +44,44 @@ pub fn compact_deserialize(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Generate an immutable frozen companion type for a named compact struct or
-/// unit enum.
-#[proc_macro_derive(CompactFreeze)]
-pub fn compact_freeze(input: TokenStream) -> TokenStream {
-    compact_freeze::expand(syn::parse_macro_input!(input as syn::DeriveInput))
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
-}
-
-/// Rewrite supported compact constructors and methods inside one lexical block.
-///
-/// The named arena must already be an `&mut compact_core::Arena`. Supported
-/// constructors include `Vec::new`, `Vec::with_capacity`, `String::new`,
-/// `String::from`, and `Box::new`; standard `format!` calls are rewritten to
-/// fallible arena-backed formatting. Supported local compact methods receive
-/// the arena argument at the rewritten call site.
-///
-/// Binding analysis is conservative. Helper-returned compact values may need an
-/// explicit compact type annotation. Ambiguous receivers and moving or
-/// mutating closure captures require explicit `*_in(..., arena)` APIs.
-/// `vec!`, known compact-owner `.clone()`, compact-string `.to_string()`, and
-/// explicitly typed compact `.collect()` calls are rewritten through the
-/// arena-aware collection traits. Allocation-bearing rewrites propagate
-/// errors with `?`. Allocation-bearing sugar inside closures must use explicit
-/// arena-aware APIs so mutable arena capture stays visible.
-#[proc_macro]
-pub fn arena(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as arena::ArenaInput);
-    arena::expand(input)
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+/// Derive the immutable frozen-value marker for a copyable, pointer-free type.
+#[proc_macro_derive(FrozenValue)]
+pub fn frozen_value(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    let name = &input.ident;
+    if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
+        return syn::Error::new_spanned(
+            &input.generics,
+            "FrozenValue derive does not support generic types",
+        )
+        .into_compile_error()
+        .into();
+    }
+    if matches!(input.data, syn::Data::Union(_)) {
+        return syn::Error::new_spanned(name, "FrozenValue cannot be derived for unions")
+            .into_compile_error()
+            .into();
+    }
+    let field_types: Vec<_> = match &input.data {
+        syn::Data::Struct(data) => data.fields.iter().map(|field| &field.ty).collect(),
+        syn::Data::Enum(data) => data
+            .variants
+            .iter()
+            .flat_map(|variant| variant.fields.iter().map(|field| &field.ty))
+            .collect(),
+        syn::Data::Union(_) => unreachable!("unions were rejected above"),
+    };
+    let bounds = if field_types.is_empty() {
+        quote::quote!()
+    } else {
+        quote::quote!(where #(#field_types: ::compact_std::__private::frozen::FrozenValue,)*)
+    };
+    quote::quote! {
+        const _: () = assert!(
+            ::core::mem::align_of::<#name>() <= 8,
+            "FrozenValue types must have alignment at most eight"
+        );
+        unsafe impl ::compact_std::__private::frozen::FrozenValue for #name #bounds {}
+    }
+    .into()
 }

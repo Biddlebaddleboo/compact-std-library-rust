@@ -1,9 +1,0 @@
-[package]
-name = "arena_tracking_fixture"
-version = "2.1.0"
-edition = "2021"
-
-[dependencies]
-compact_std = { path = "../../crates/compact_std" }
-
-[workspace]

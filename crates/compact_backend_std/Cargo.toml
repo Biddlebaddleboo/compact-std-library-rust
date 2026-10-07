@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Stable std-backed memory for compact_core arenas"
-keywords = ["arena", "memory", "compact", "std"]
+description = "Process-wide compact cage runtime"
+keywords = ["cage", "memory", "compact", "std"]
 categories = ["memory-management"]
 
 [dependencies]
-compact_core = { version = "2.2.0", path = "../compact_core" }
+compact_core = { version = "2.3.0", path = "../compact_core" }

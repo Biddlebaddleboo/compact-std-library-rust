@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Direct Serde deserialization into compact arena collections"
-keywords = ["serde", "arena", "compact"]
+description = "Direct Serde deserialization into compact cage collections"
+keywords = ["serde", "cage", "compact"]
 categories = ["encoding", "data-structures", "memory-management"]
 
 [features]
@@ -14,8 +14,8 @@ json = ["dep:serde_json"]
 toml = ["dep:toml"]
 
 [dependencies]
-compact_core = { path = "../compact_core", version = "2.2.0" }
-compact_collections = { path = "../compact_collections", version = "2.2.0" }
+compact_collections = { path = "../compact_collections", version = "2.3.0" }
+compact_backend_std = { path = "../compact_backend_std", version = "2.3.0" }
 serde = "1"
 serde_json = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }

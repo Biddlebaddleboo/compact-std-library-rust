@@ -1,291 +1,107 @@
-# Architecture
-
-This document describes the current V2.2.0 architecture. The documented
-V2.1.0 source surface remains the frozen compatibility baseline for 2.x.
-
-## Addressing
-
-Compact arena references use 32-bit byte offsets.
-
-- `Offset32<T>` is four bytes.
-- Offset zero is reserved as the null sentinel.
-- One arena addresses at most 2^32 bytes.
-- Resolution is arena base plus checked offset.
-- Normal dereference does not require a global registry, hash table, or
-  thread-local current arena.
-
-Packed fields use LSB-first bit numbering. Multi-byte packed words use the
-target's native byte order.
-
-Arena bytes are runtime memory, not a persistent or cross-target storage
-format.
-
-## Stable backing and arena state
-
-The backing address must remain stable for the arena lifetime.
-
-Allocator state is stored inside the backing so owning tokens can reclaim
-storage even if the stack `Arena` value itself moves. The allocator tracks the
-backing, current high-water cursor, sorted free list, and next allocation
-identity.
-
-The minimum usable backing is `MIN_ARENA_BYTES`.
-
-### Scratch scopes
-
-`Arena::scratch(capacity, callback)` reserves a parent-owned byte allocation
-and initializes a separate nested arena inside it. The nested arena has its own
-allocator state, so releasing the scratch block cannot invalidate unrelated
-parent allocations. Nested scratch calls are supported. Ordinary compact
-owners run their destructors before the nested backing is released, and the
-callback lifetime prevents scratch-branded values from escaping.
-
-### Persistent `CompactStore`
-
-`CompactStore` owns a fixed `StdBacking` and initializes a separate persistent
-header containing a magic value, ABI version, capacity, and validity marker.
-Every callback validates this header and the allocator free list before
-reattaching. Ordinary `with_arena` scopes keep their existing fresh-state
-layout and behavior.
-
-The store keeps only a private raw root offset. `with` and `with_mut` create a
-freshly branded `RootHandle` after reattachment and validate it before calling
-user code. The initial `StoreRoot` contract is limited to `Copy +
-CompactValue + 'static`, so roots have no destructor to skip when their
-generative lifetime is erased. Arena-branded references and handles cannot
-escape either callback. Dropping the store releases the whole backing.
-
-### Frozen immutable graphs
-
-`FrozenArena` uses a separate immutable backing. `FreezeIn` traverses live
-compact values and copies payloads into a fresh offset space, then stores a
-typed root. The frozen backing has no free list, allocation headers, or
-`ArenaAllocation` tokens. Handles include a process-unique arena identity plus
-offset and length, so a handle from another or already-dropped arena is rejected
-before access. The backing contains only `FrozenValue` items, which are
-`Copy + Send + Sync` and have no destructor obligations. `FrozenArena` therefore
-gets `Send + Sync` from its fields without changing the mutable arena's
-single-owner threading contract. Frozen reads need no lock.
-
-Generated `CompactFreeze` companion structs contain only frozen handles and
-copy-safe scalars. The source graph remains borrowed and intact during the
-copy. Frozen maps and sets are compact sequences with linear lookup in this
-phase; the format is in-process only and is never constructed from arbitrary
-serialized bytes. String and byte payloads are interned during building with a
-fallible descriptor registry and linear content comparison. Their handles stay
-`Copy`, and the registry is discarded when the builder is committed.
-
-## Native interface boundary
-
-Compact owners expose borrowed slices and strings for synchronous native
-calls. A native callee may use those pointers only for the duration of the
-borrowed call. `FfiByteBuffer` is the explicit copied path for data that must
-outlive its compact owner: it transfers a native `Vec` allocation and requires
-one matching `compact_std_ffi_bytes_free` call. Native records should use
-`repr(C)` and contain ordinary copied values or pointers from these explicit
-views, never compact arena offsets.
-
-## Allocation
-
-New tail allocations use a bump-style path. Released allocations become
-reusable ranges stored in arena memory.
-
-The free list is:
-
-- sorted by offset;
-- first-fit;
-- coalesced on release;
-- stored without one native heap allocation per free range.
-
-If a released range reaches the current tail, the high-water cursor contracts.
-Adjacent tail free ranges are folded into that contraction.
-
-Owned allocations have internal metadata for block extent, alignment prefix,
-element capacity, and initialized length. These fields are implementation
-details and are not part of the stable source contract.
-
-## Resize
-
-An owned allocation can grow without moving when:
-
-- it is at the current tail and backing capacity permits growth; or
-- the immediately following free range is large enough.
-
-Shrinking can return a sufficiently large suffix to the free list.
-
-Collections must use allocator APIs rather than manipulate free-list metadata
-directly.
-
-## Ownership
-
-`ArenaAllocation<T>` is the unique owner of one typed arena allocation. It is
-non-`Copy` and non-`Clone`.
-
-Dropping the token:
-
-1. drops every value in the initialized prefix exactly once;
-2. returns the allocation to the reusable allocator.
-
-Moving the token transfers ownership.
-
-Safe release is therefore coupled to an allocator-issued owner token rather
-than an arbitrary `(offset, length)` supplied by the caller.
-
-`Offset32<T>` is a reference-like offset, not an owning token.
-
-## Generic compact values
-
-Owning generic containers require `T: CompactValue`.
-
-The unsafe contract requires values to remain valid when moved between compact
-slots with Rust move semantics. Address-sensitive, pinned, and
-self-referential values are outside that contract unless their implementation
-can independently prove the required invariants.
-
-See [SAFETY.md](SAFETY.md).
-
-## Collections
-
-Allocation-requiring collection operations use `FromIteratorIn`, `ExtendIn`,
-and `CloneIn` with an explicit destination arena. `CloneIn` recursively clones
-compact values into that arena; the ordinary `Clone` trait is reserved for
-operations that do not need hidden allocation context. `ToCompactStringIn`
-formats through a compact writer and returns arena errors directly.
-
-`format_in!` writes `fmt::Arguments` to `CompactStringWriter`. The writer
-records the original arena error behind `fmt::Error`, then returns that error
-to the caller while leaving any completed UTF-8 prefix valid. `arena!` rewrites
-recognized `format!` calls to this fallible path.
-
-### CompactVec
-
-`CompactVec<T>` owns one optional `ArenaAllocation<T>`.
-
-Growth:
-
-1. computes required capacity;
-2. tries in-place resize;
-3. allocates replacement storage if needed;
-4. moves the initialized prefix;
-5. transfers ownership to the replacement.
-
-Allocation failure occurs before element movement, so the existing value
-sequence remains intact.
-
-`pop` moves the final element out. `truncate`, `clear`, and drop destroy
-removed elements exactly once.
-
-### CompactString
-
-Strings up to twelve UTF-8 bytes stay inline. Longer strings use an owned arena
-byte allocation.
-
-`clear` retains heap capacity. `shrink_to_fit_in` can release unused
-capacity or return to inline representation.
-
-### CompactOsString and CompactPathBuf
-
-On Unix, `CompactOsString` stores the exact OS byte sequence. On Windows, it
-stores each exact UTF-16 code unit in a two-byte little-endian slot. Native
-`OsString` and `PathBuf` conversions use the platform extension traits and do
-not pass through UTF-8. Borrowed compact views retain the original arena
-slice; path queries use standard library path rules, and `display` keeps the
-standard lossy formatting behavior.
-
-### CompactSmallVec
-
-Initialized values stay in inline storage until promotion. Promotion allocates
-first and then moves each initialized value into arena storage.
-
-### CompactBytes
-
-`CompactBytes` keeps twenty bytes inline. This uses the same 24-byte wrapper
-size as 12- and 16-byte candidates on the measured 64-bit target; a 24-byte
-inline payload increased the wrapper to 32 bytes. Longer payloads use one
-reclaimable `ArenaAllocation<u8>`. The benchmark shows heap-backed compact
-buffers can be slower than native `Vec<u8>` for short-lived payloads, so they
-are intended where inline payloads or arena ownership are useful.
-
-### CompactVecDeque and CompactRing
-
-The deque tracks a physical head and logical length over one
-`ArenaAllocation<MaybeUninit<T>>`. Growth first makes wrapped values
-contiguous, then extends the allocation in place or moves the initialized
-prefix to a replacement. `make_contiguous` rotates the slots and returns a
-mutable slice. Zero-sized entries use the same finite logical capacity and
-drop rules as other entries.
-
-`CompactRing` allocates its full maximum length at construction. A full ring
-removes and drops the oldest entry before writing into that slot. If the
-removed entry's destructor panics, the entry remains removed and the new value
-is not inserted.
-
-### CompactHashMap and CompactHashSet
-
-The open-addressed map owns separate control-byte and entry allocations.
-Control bytes distinguish empty slots, live entries, and tombstones. A 7/8
-maximum load keeps at least one empty slot available for bounded probing.
-Removal publishes a tombstone before moving the pair out; insertion fully
-initializes a pair before publishing its occupied state.
-
-Growth and shrinking allocate a replacement table and calculate every new
-slot before moving any pair. Hashing can panic during that planning pass, so
-the old table stays intact until all hashes succeed. The std facade defaults
-to `RandomState`; callers can supply any `BuildHasher`. `CompactHashSet` wraps
-the map with unit values.
-
-### CompactSlab
-
-A slab combines slot generations with the owning allocation identity. A handle
-from another slab or from storage that has been released and reused is
-rejected.
-
-### CompactInterner
-
-The interner owns each canonical byte sequence and searches entries linearly.
-It is intended for small intern sets where a hash table would cost more
-metadata than it saves.
-
-## Packed access
-
-Common packed reads and writes operate on byte spans and scalar words rather
-than looping one bit at a time. A field that needs nine bytes, such as a
-64-bit value starting at a nonzero intra-byte offset, uses a correctness-first
-fallback.
-
-The public bit layout remains LSB-first.
-
-## Macro architecture
-
-`arena!` performs conservative lexical source analysis at compile time. It
-tracks compact, native, moved, ambiguous, and unknown bindings across lexical
-scopes.
-
-It intentionally does not try to become a Rust type checker. Arbitrary helper
-return types are resolved through explicit type annotations or explicit
-`*_in` APIs.
-
-Ambiguity is diagnosed rather than guessed.
-
-## Threading
-
-Arena ownership is intentionally single-threaded. The runtime does not install
-a global or thread-local current arena and does not use cross-thread ownership
-for mutable arena values. Frozen arenas provide the immutable sharing boundary
-added in V2.2.0.
-
-## What may change within 2.x
-
-The following are implementation details and may change while preserving the
-V2.1.0 source contract:
-
-- owner-token physical size;
-- collection handle physical size;
-- allocation-header representation;
-- free-list representation and search strategy;
-- coalescing implementation;
-- packed-field fast paths;
-- macro internal analysis representation.
-
-The four-byte `Offset32<T>` representation and documented V2.1.0 source
-behavior are part of the supported contract.
+# V2.3 architecture
+
+V2.3 has one process-wide compact cage. The cage is a stable byte allocation;
+all retained compact addresses are 32-bit offsets into that allocation. Native
+Rust references, allocator bookkeeping, syscalls, and FFI continue to use
+ordinary native pointers.
+
+## Runtime
+
+`CompactRuntime::init(CageConfig::new(capacity))` creates the cage once using
+a process-wide `OnceLock`. The requested capacity must be at least 64 bytes and
+must fit the 32-bit address domain. Initialization fails if the runtime is
+already initialized, and the backing remains alive until process termination.
+No public reset or teardown operation exists.
+
+Runtime state contains the one native base pointer, capacity, and a mutex for
+allocator metadata. The allocator uses a monotonic cursor and coalescing free
+ranges. Allocation, resize, and release update that metadata under the lock.
+Reading or mutating a live value through its unique owner does not acquire the
+allocator lock. Cage exhaustion is an error; allocations never silently move
+to the native heap.
+
+## Offsets and owners
+
+`Offset32<T>` is a four-byte non-owning descriptor. `OffsetSlice32<T>` and
+`ByteRange32` store an offset and length in eight bytes. Zero is reserved for
+null. Safe code cannot construct an arbitrary non-null offset; the unchecked
+constructors require the caller to prove that the target is live and remains
+owned.
+
+`CageAllocation<T>` is a unique four-byte owner. It contains an offset and a
+zero-sized type marker, while the allocation header stores the block extent,
+alignment prefix, element capacity, and initialized length. `Option` uses the
+zero offset niche and remains four bytes. Dropping an owner drops its
+initialized values and returns its block to the allocator.
+
+`CompactBox<T>` and `CompactVec<T>` each contain one optional owner and are
+four bytes. `CompactVecDeque<T>` adds a head and length and is twelve bytes.
+Inline-first types, hash tables, slabs, and path/string wrappers include the
+extra metadata required by their behavior. Collection methods return
+allocation errors explicitly.
+
+The cage base is not stored in compact values or owners. Access resolves an
+owner offset against the base in runtime state for the duration of a Rust
+borrow. Compact byte offsets are not native addresses and must not cross an
+FFI boundary as pointers.
+
+## Collection storage
+
+Owning collections keep their payloads in cage allocations. Types that need
+initialized-prefix tracking use the allocation header; circular queues track
+their head and logical length; hash tables use compact control bytes and
+`MaybeUninit` entry slots. Hash maps use randomized SipHash keys by default.
+Slab generations protect independently copyable slot handles from reuse.
+
+`CompactValue` is the unsafe relocation contract. Values must be valid at
+their normal alignment in the cage, must not depend on their address or
+pinning, must not contain native pointers or references, and must be safe to
+destroy while the cage exists. The caller of an unsafe implementation is
+responsible for upholding these conditions.
+
+## Scratch allocation
+
+`ScratchRegion` owns one cage block and advances a stack-held byte cursor.
+Capacity is rounded to whole `u64` slots. Byte slices are zero-filled;
+`alloc_value` accepts `Copy + CompactValue` values with alignment at most
+eight. Returned mutable references borrow the region, and dropping it returns
+the whole block to the cage.
+
+## Frozen graphs
+
+`FrozenBuilder` uses a temporary native construction buffer. `finish` copies
+the completed bytes into one `CageAllocation<u64>` and returns a
+`FrozenGraph<T>` that owns that single block. The builder and its temporary
+buffer are then dropped. Frozen descriptors contain offsets, lengths, and a
+graph identity; reads validate identity, alignment, and range before forming
+a reference.
+
+Frozen data is immutable after finishing. `FrozenValue` requires `Copy`,
+`Send`, `Sync`, `'static`, alignment no greater than eight, no native pointers
+or interior mutability, and no destructor. The graph can therefore be shared
+for lock-free reads. Unique graph identifiers prevent a descriptor from one
+graph being accepted by another.
+
+## Serde and packed layouts
+
+Direct Serde visitors create supported compact values in the initialized
+process cage. They own each partial value as it is built, so a parse or
+allocation error drops the partial result. The parser helpers need no
+allocation-context argument.
+
+`#[compact]` emits packed byte storage and checked accessors for supported
+structs and fieldless enums. It uses bit offsets and widths rather than
+references to runtime storage. `#[compact(soa)]` can also emit primitive
+column storage.
+
+## Native boundary
+
+An FFI callback receives a temporary native borrow resolved from the compact
+owner. The pointer is valid only during that borrow and while the owner is not
+relocated or dropped. `FfiByteBuffer` is an explicit native allocation for
+interfaces that retain memory; it is freed through its matching library
+function.
+
+Compact cage bytes are process-local runtime representation, not a stable
+serialization or cross-process ABI. Use an external serialization format for
+persistent or transferred data.

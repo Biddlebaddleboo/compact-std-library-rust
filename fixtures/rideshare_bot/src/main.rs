@@ -1,28 +1,24 @@
+use compact_std::{CageConfig, CompactRing, CompactRuntime, CompactString, CompactValue};
 use std::collections::VecDeque;
 
-use compact_std::{CompactRing, CompactString, CompactValue, StdArena};
-
-struct LogRecord<'arena> {
+struct LogRecord {
     sequence: u64,
-    message: CompactString<'arena>,
+    message: CompactString,
 }
+// SAFETY: the record contains only a scalar and the compact string owner.
+unsafe impl CompactValue for LogRecord {}
 
-// SAFETY: both fields are movable compact values with ordinary drop behavior.
-unsafe impl CompactValue for LogRecord<'_> {}
-
-fn append_batch<'arena>(
-    ring: &mut CompactRing<'arena, LogRecord<'arena>>,
+fn append_batch(
+    ring: &mut CompactRing<LogRecord>,
     standard: &mut VecDeque<(u64, String)>,
     start: u64,
     count: u64,
-    arena: &mut compact_std::Arena<'arena, '_>,
 ) -> compact_std::Result<()> {
     for sequence in start..start + count {
-        let message = CompactString::from_str_in("rideshare log event", arena)?;
-        ring.push_back(
-            LogRecord { sequence, message },
-            arena,
-        )?;
+        ring.push_back(LogRecord {
+            sequence,
+            message: CompactString::from_str("rideshare log event")?,
+        })?;
         if standard.len() == 1_000 {
             standard.pop_front();
         }
@@ -31,50 +27,39 @@ fn append_batch<'arena>(
     Ok(())
 }
 
-fn compare_snapshot<'arena>(
-    ring: &CompactRing<'arena, LogRecord<'arena>>,
-    standard: &VecDeque<(u64, String)>,
-    arena: &compact_std::Arena<'arena, '_>,
-) -> compact_std::Result<()> {
+fn compare_snapshot(ring: &CompactRing<LogRecord>, standard: &VecDeque<(u64, String)>) {
     let compact_snapshot = ring
-        .iter(arena)?
-        .map(|record| {
-            Ok((
-                record.sequence,
-                record.message.as_str(arena)?.to_owned(),
-            ))
-        })
-        .collect::<compact_std::Result<Vec<_>>>()?;
-    let standard_snapshot = standard.iter().cloned().collect::<Vec<_>>();
-    assert_eq!(compact_snapshot, standard_snapshot);
-    Ok(())
+        .iter()
+        .map(|record| (record.sequence, record.message.as_str().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compact_snapshot,
+        standard.iter().cloned().collect::<Vec<_>>()
+    );
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    StdArena::with_capacity(128 * 1024, |arena| -> compact_std::Result<()> {
-        let mut ring = CompactRing::with_capacity(1_000, arena)?;
-        let mut standard = VecDeque::with_capacity(1_000);
+    CompactRuntime::init(CageConfig::new(16 * 1024 * 1024))?;
+    let mut ring = CompactRing::with_capacity(1_000)?;
+    let mut standard = VecDeque::with_capacity(1_000);
 
-        append_batch(&mut ring, &mut standard, 0, 1_250, arena)?;
-        assert_eq!(ring.len(), 1_000);
-        assert_eq!(ring.front(arena)?.unwrap().sequence, 250);
-        compare_snapshot(&ring, &standard, arena)?;
+    append_batch(&mut ring, &mut standard, 0, 1_250)?;
+    assert_eq!(ring.len(), 1_000);
+    assert_eq!(ring.front().unwrap().sequence, 250);
+    compare_snapshot(&ring, &standard);
 
-        let retained_capacity = ring.capacity();
-        ring.clear();
-        standard.clear();
-        assert_eq!(ring.capacity(), retained_capacity);
-        append_batch(&mut ring, &mut standard, 5_000, 1_150, arena)?;
-        compare_snapshot(&ring, &standard, arena)?;
+    let retained_capacity = ring.capacity();
+    ring.clear();
+    standard.clear();
+    assert_eq!(ring.capacity(), retained_capacity);
+    append_batch(&mut ring, &mut standard, 5_000, 1_150)?;
+    compare_snapshot(&ring, &standard);
 
-        ring.clear();
-        standard.clear();
-        append_batch(&mut ring, &mut standard, 9_000, 25, arena)?;
-        compare_snapshot(&ring, &standard, arena)?;
-        ring.clear();
-        assert_eq!(ring.len(), 0);
-        Ok(())
-    })??;
-
+    ring.clear();
+    standard.clear();
+    append_batch(&mut ring, &mut standard, 9_000, 25)?;
+    compare_snapshot(&ring, &standard);
+    ring.clear();
+    assert_eq!(ring.len(), 0);
     Ok(())
 }

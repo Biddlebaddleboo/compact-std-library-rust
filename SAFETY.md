@@ -1,226 +1,109 @@
-# Safety
+# Safety contracts
 
-This document defines the safety-relevant V2.2.0 contracts. The documented
-V2.1.0 source surface remains the frozen compatibility baseline for 2.x.
+This document describes the unsafe invariants for the V2.3 process-wide cage.
+The crate-level APIs are safe only while these invariants hold.
 
-## Arena lifetime
+## Compact values
 
-All arena-owned values must be destroyed before the backing storage ceases to
-exist.
+Implementing `CompactValue` is unsafe. A value must remain valid when moved
+between aligned cage slots with raw reads and writes. It must not be
+self-referential, address-sensitive, or require pinning. It must not store
+native pointers or references. Its destructor must be valid while the process
+cage remains alive.
 
-The lifetime branding on `Arena`, offsets, and owning allocations is intended
-to enforce this in safe Rust. Do not use unsafe code to extend an arena-backed
-reference or owner beyond its actual backing lifetime.
+Raw pointers and references are not compact offsets. Store an `Offset32<T>` or
+another compact descriptor when a value needs to name cage data. Resolve that
+offset only while an owner or graph holds the target alive.
 
-The backing address must remain stable for the entire arena lifetime.
+## Runtime and allocator
 
-## Ownership
+The process runtime is initialized once. Its backing allocation must remain at
+the same address until process termination. The runtime owns the sole retained
+native cage base pointer. Cage capacity is bounded by the 32-bit offset space,
+and offset zero is reserved.
 
-Owned arena allocations have exactly one safe owner token.
+Allocator metadata is protected by one mutex. No user code or value destructor
+runs while the allocator lock is held. A live owner exclusively controls its
+allocation header's initialized count and contents. Shared reads are permitted
+only through shared borrows; mutation requires the unique owner borrow.
 
-- Owner tokens are not `Copy` or `Clone`.
-- Moving an owner transfers ownership.
-- Dropping an owner drops its initialized values and releases its allocation.
-- Safe code cannot release an arbitrary raw offset as though it were an owner.
+An allocation offset is issued only after the allocator reserves a complete
+block and writes its aligned header. The owner cannot be safely copied. On
+drop, it lowers the initialized count before each destructor call and releases
+the block exactly once. Free ranges are merged only after the owner has
+finished destruction.
 
-Do not duplicate, forge, or resurrect an owner token through unsafe code.
+The process never moves or resets cage storage. Consequently a safe reference
+formed from an owner remains backed for the reference lifetime. Unsafe offset
+resolution functions require callers to prove that an offset names an
+initialized value or byte range, that it is in bounds, and that its owner
+remains alive and borrowed for the returned lifetime.
 
-`CompactVecDeque` stores `MaybeUninit<T>` slots and tracks which logical ring
-positions contain live values. Every insertion initializes one slot, every
-removal decrements the logical length before moving a value out, and deque drop
-drains the remaining entries before releasing the slot allocation. The ring's
-head and length, rather than allocator initialization metadata, define live
-`T` values.
+## Owner transfer and destruction
 
-## `CompactValue`
+`CageAllocation<T>` uses raw reads and writes to move initialized values
+between cage slots. Every move clears the source initialized count before
+transferring elements, then records the destination count after all writes.
+Operations that can invoke user destructors use guards so unwinding does not
+drop an element twice or leave later initialized elements untracked.
 
-`CompactValue` is an unsafe trait because containers may move values between
-arena slots using raw pointer reads and writes while preserving ordinary Rust
-ownership.
+Collections that store `MaybeUninit<T>` maintain their own initialized-slot
+state. Their `Drop` implementations clear each logical slot before dropping
+its value. Relocation allocates replacement storage first, then moves values
+without invoking user code between source removal and destination
+initialization.
 
-A correct implementation must guarantee all of the following:
+Compact collection wrappers may themselves be stored as `CompactValue` only
+because their fields are compact offsets/scalars or inline `CompactValue`
+elements. Their destructors retain sole ownership of nested allocations.
 
-- the value is valid at its normal Rust alignment in arena storage;
-- moving it from one valid slot to another preserves all invariants;
-- it does not require a stable address or pinning;
-- it does not contain self-references that become invalid when moved;
-- any embedded native references have lifetimes correctly represented by the
-  Rust type;
-- its destructor is safe to run while the arena backing is alive;
-- moving the value does not duplicate external ownership or destructor
-  responsibility.
+## Scratch regions
 
-An incorrect `unsafe impl CompactValue` can cause undefined behavior.
+Scratch storage is one ordinary cage allocation. Each returned mutable slice
+or value is bounded by a mutable borrow of its `ScratchRegion`; it cannot
+outlive the region through safe code. Scratch byte storage is initialized
+before returning a byte slice. Typed scratch values must be `Copy`, satisfy
+`CompactValue`, fit in the reserved extent, and require alignment no greater
+than the `u64` backing alignment.
 
-### Typical valid shapes
+Scratch does not run destructors for arbitrary stored values. Its typed API is
+restricted to `Copy` values, and byte access returns initialized bytes.
 
-Primitive scalars and generated compact handles are supported directly. A
-custom aggregate can be valid when every field has move-safe ownership and the
-aggregate has no address-sensitive invariant.
+## Frozen graphs
 
-Example shape:
+Implementing `FrozenValue` is unsafe. Values must be `Copy + Send + Sync +
+'static`, pointer-free, immutable, free of destructor obligations, and aligned
+to at most eight bytes. Their bytes must represent valid values after copying
+into the graph's aligned storage. The derive requires every field type to
+implement `FrozenValue`, in addition to the root type meeting the trait's
+supertrait bounds.
 
-```rust
-struct Record {
-    count: u32,
-    flags: u16,
-    child: CompactOption<'static, u8>, // illustrative shape only
-}
-```
+Frozen descriptors include a graph identifier, offset, and length. Graph
+reads check that the identifier matches, arithmetic does not overflow, the
+range stays inside the completed graph, and typed offsets satisfy alignment
+before creating a reference. Graph storage is immutable after `finish` and is
+released when its unique `FrozenGraph` owner is dropped.
 
-The exact lifetime parameters in real code must still be correct.
+## Packed values and macros
 
-### Invalid without additional proof
+`#[compact]` accepts only field types for which its generated representation
+has a defined encoder and decoder. Accessors bounds-check bit ranges, validate
+declared maxima, and reject invalid enum discriminants. The macro does not
+emit native pointers. Its generated compact companion types implement
+`CompactValue` because they contain packed bytes and supported compact string
+owners only.
 
-Do not mark a value compact-safe merely because it compiles if it contains
-state such as:
+## FFI
 
-- pointers into itself;
-- intrusive links that encode its own address;
-- pinning requirements;
-- callbacks or foreign objects whose validity depends on the current address;
-- native references whose true lifetime is not represented in the type.
+Native pointers returned by scoped FFI callbacks are valid only for the
+callback's borrow. The caller must not retain them, free them, or use them
+after the owner is dropped or relocated. `FfiByteBuffer` owns a native `Vec`
+allocation and must be released exactly once with the matching free function.
+Never pass a cage offset as a native pointer.
 
-## Relocation
+## Persistence
 
-Collection growth performs all fallible allocation work before moving the first
-element whenever possible.
-
-Once relocation starts, element transfer uses non-fallible pointer moves. The
-source initialized length is cleared before values are read so the old owner
-cannot drop moved values a second time.
-
-Do not add a new relocation path that can return an error after partially
-moving ownership unless it also provides a correct rollback guard.
-
-## Destruction and panic
-
-Before dropping one initialized element, containers reduce the recorded
-initialized prefix so unwinding cannot cause the same element to be dropped a
-second time. If a destructor panics while truncating an owned allocation, a
-cleanup guard continues dropping the remaining initialized prefix during
-unwinding. A second destructor panic follows ordinary Rust double-panic
-behavior.
-
-Custom destructors must still obey ordinary Rust safety requirements.
-
-Applications that require abort-only behavior may choose `panic = "abort"`;
-the library does not require every application to use abort semantics.
-
-## Offsets and stale storage
-
-An `Offset32<T>` is not an ownership proof.
-
-Reusable allocation means an address can later contain unrelated data after
-the original owner releases it. APIs that require ownership validate an
-allocator-issued owner token rather than trusting a raw offset.
-
-Handle types that need stale-instance protection, such as slab handles, include
-allocation identity in addition to their logical slot generation.
-
-Do not construct raw offsets through unsafe code unless all allocation,
-lifetime, alignment, and type invariants are independently guaranteed.
-
-## Threading
-
-Arena ownership and owning compact allocations are not a cross-thread
-ownership model. Do not bypass their non-thread-safe design with unsafe
-`Send` or `Sync` implementations unless the entire allocator and lifetime
-model has been redesigned and re-audited.
-
-## Frozen values
-
-`FrozenArena` is a distinct immutable representation, not a mutable arena with
-thread-safety overrides. It is built only by trusted `FrozenBuilder` and
-`freeze_in` paths. Its storage is a private vector of aligned words; after
-finish, safe APIs expose only shared references to initialized ranges. There
-is no safe mutable access or arbitrary-byte mapping API.
-
-`FrozenValue` is unsafe because frozen storage relocates values by copying
-their initialized bytes and later shares immutable references across threads.
-An implementation must be `Copy + Send + Sync + 'static`, have alignment no
-greater than 64 bytes, and contain no references, owning pointers, interior
-mutability, address-sensitive state, or destructor obligations. Every stored
-value must already be valid. Violating this contract can cause undefined
-behavior. Library-owned frozen descriptors and generated companion structs
-implement it only from fields that satisfy the same contract.
-
-Arena identities are allocated during builder creation so copied handles
-cannot be accepted by another frozen arena even if a backing address is later
-reused. The identity lock is not used by frozen reads. No mutable arena owner
-or allocation token implements `Send` or `Sync` as part of this feature.
-
-## Persistence and IPC
-
-Do not persist raw arena bytes as a durable format.
-
-The arena contains allocator metadata, target-native byte ordering, runtime
-ownership state, and process-local representation assumptions. Raw backing
-bytes are not a stable disk, IPC, network, or cross-process ABI.
-
-Serialize logical values into a dedicated external format instead.
-
-`CompactStore` is an in-process owner, not a persistent-file API. Its root
-contract currently requires `Copy + CompactValue + 'static`, which excludes
-destructors and borrowed arena references. The store privately retains a raw
-offset and rebrands it only after reattaching to the same stable backing,
-validating the allocator header, and resolving the initialized root. The
-callback lifetime prevents a root reference or branded handle from escaping.
-
-`Offset32::from_persistent_raw_unchecked` is unsafe because callers must prove
-that the offset still names an initialized value in the same persistent
-backing and that its storage has not been released or reused. It must never be
-used to interpret arbitrary bytes or data from another backing.
-
-## Macro safety boundary
-
-`arena!` is intentionally conservative. If it cannot prove that a receiver is
-a supported compact binding, it diagnoses the ambiguity or requires explicit
-`*_in` calls.
-
-Do not weaken this behavior by guessing that unknown syntax is compact.
-
-Explicit APIs are the correctness fallback for helper-returned values,
-ambiguous control flow, mutating closure captures, and unsupported source
-patterns.
-
-## Unsafe-code review checklist
-
-Before changing unsafe runtime code, verify:
-
-1. allocation extent, alignment, and initialized length remain consistent;
-2. ownership is neither duplicated nor lost;
-3. every live value is dropped exactly once;
-4. moved-from slots are never read or dropped as initialized values;
-5. reused storage cannot validate a stale owner or protected handle;
-6. every returned reference is bounded by the real arena and owner lifetime;
-7. failure before commit leaves prior logical state valid;
-8. backing storage remains stable while any branded object exists.
-
-The compact hash map keeps its entry allocation in `MaybeUninit` slots and
-uses control bytes as the sole live-entry state. `iter_mut` uses a raw base
-pointer to yield disjoint mutable values; it advances monotonically, yields
-each occupied slot once, and keeps an exclusive borrow marker for the map's
-full lifetime. Rehash planning may call user hashing code, so all destination
-slots are computed before any old entry moves.
-
-The OS string and path wrappers keep their platform units in private compact
-storage. Unix values are reconstructed with `OsStringExt::from_vec`; Windows
-wide units are reconstructed with `OsStringExt::from_wide`. Borrowed compact
-views only expose slices of that private storage, so callers cannot violate
-the platform encoding invariant.
-
-## Native interface boundary
-
-Pointers returned by compact `as_ptr` methods are borrowed views. They remain
-valid only while the owning compact value and its backing are alive and the
-value is not mutated or reallocated. `with_ffi_bytes` bounds a borrowed slice
-to a synchronous callback; native code must not retain its pointer after the
-callback returns.
-
-`FfiByteBuffer` transfers an ordinary native `Vec<u8>` allocation. Its pointer,
-length, and capacity must remain unchanged, and the matching
-`compact_std_ffi_bytes_free` function must reclaim it exactly once. The free
-operation is unsafe because arbitrary or repeated raw parts cannot be safely
-validated. Do not use arena offsets as native identities or free them through
-a native allocator.
+Raw cage bytes are not a persistent file, IPC, network, or cross-process
+format. They contain runtime layout and target-native representations. Use a
+defined external serialization format when data must survive process exit or
+move across process or machine boundaries.

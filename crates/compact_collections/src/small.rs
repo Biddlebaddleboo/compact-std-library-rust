@@ -1,248 +1,181 @@
-//! Inline-first compact vector for small, known-capacity collections.
+//! Inline-first compact small vector.
 
+use compact_backend_std::{CageAllocation, CompactRuntime};
+use compact_core::CompactValue;
 use core::mem::MaybeUninit;
-use core::ptr;
-use core::slice;
+use core::ops::{Deref, DerefMut};
 
-use compact_core::{Arena, CompactValue};
+use crate::{CollectionError, Result};
 
-use crate::{CollectionError, CompactVec, Result};
-
-enum SmallStorage<'arena, T: CompactValue, const N: usize> {
-    Inline {
-        len: u32,
-        values: [MaybeUninit<T>; N],
-    },
-    Heap(CompactVec<'arena, T>),
+/// A compact vector that stores up to `N` values inline before promoting to the cage.
+pub struct CompactSmallVec<T: CompactValue, const N: usize> {
+    inline: [MaybeUninit<T>; N],
+    inline_len: usize,
+    heap: Option<CageAllocation<T>>,
 }
 
-/// A vector that stores up to `N` values inline before allocating arena bytes.
-///
-/// Promotion moves values into the owned arena allocation; dropping the value
-/// runs destructors for either the inline prefix or heap-backed vector.
-pub struct CompactSmallVec<'arena, T: CompactValue, const N: usize> {
-    storage: SmallStorage<'arena, T, N>,
-}
-
-impl<'arena, T: CompactValue, const N: usize> CompactSmallVec<'arena, T, N> {
-    /// Construct an empty inline vector without allocating in `arena`.
-    pub fn new_in(_arena: &Arena<'arena, '_>) -> Self {
-        assert!(
-            N <= u32::MAX as usize,
-            "inline capacity exceeds compact length metadata"
-        );
+impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
+    /// Construct an empty small vector.
+    pub fn new() -> Self {
         Self {
-            storage: SmallStorage::Inline {
-                len: 0,
-                values: [const { MaybeUninit::uninit() }; N],
-            },
+            inline: core::array::from_fn(|_| MaybeUninit::uninit()),
+            inline_len: 0,
+            heap: None,
         }
     }
-
-    /// Return the number of initialized values.
+    /// Return the initialized element count.
     pub fn len(&self) -> usize {
-        match &self.storage {
-            SmallStorage::Inline { len, .. } => *len as usize,
-            SmallStorage::Heap(values) => values.len(),
-        }
+        self.heap.as_ref().map_or(self.inline_len, |h| h.len())
     }
-
-    /// Return the current capacity.
+    /// Return available inline or cage capacity.
     pub fn capacity(&self) -> usize {
-        match &self.storage {
-            SmallStorage::Inline { .. } => N,
-            SmallStorage::Heap(values) => values.capacity(),
-        }
+        self.heap.as_ref().map_or(N, |h| h.capacity())
     }
-
-    /// Return whether this vector still uses its inline representation.
+    /// Return whether storage is still inline.
     pub fn is_inline(&self) -> bool {
-        matches!(self.storage, SmallStorage::Inline { .. })
+        self.heap.is_none()
     }
-
-    /// Return whether the vector contains no values.
+    /// Return whether the collection is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Ensure the vector can hold `additional` more values.
-    pub fn reserve_in(&mut self, additional: usize, arena: &mut Arena<'arena, '_>) -> Result<()> {
+    /// Ensure room for at least `additional` more values.
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
         let required = self
             .len()
             .checked_add(additional)
             .ok_or(CollectionError::CapacityOverflow)?;
-        if let SmallStorage::Heap(values) = &mut self.storage {
-            return values.reserve_in(additional, arena);
+        if required <= self.capacity() {
+            return Ok(());
         }
-        if required > N {
-            self.promote(required, arena)?;
-        }
-        Ok(())
-    }
-
-    /// Append a value, promoting to arena storage when all inline slots are used.
-    pub fn push_in(&mut self, value: T, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        if let SmallStorage::Inline { len, values } = &mut self.storage {
-            if (*len as usize) < N {
-                values[*len as usize].write(value);
-                *len += 1;
+        let capacity = required.max(self.capacity().saturating_mul(2).max(4));
+        if let Some(heap) = &mut self.heap {
+            if heap.try_resize(capacity)? {
                 return Ok(());
             }
+            let mut replacement = CompactRuntime::alloc_owned_slice::<T>(capacity)?;
+            heap.move_into(&mut replacement)?;
+            self.heap = Some(replacement);
+            return Ok(());
         }
-        self.promote(self.len().saturating_add(1), arena)?;
-        let SmallStorage::Heap(values) = &mut self.storage else {
-            unreachable!("promote always switches to the heap representation")
-        };
-        values.push_in(value, arena)
-    }
-
-    /// Borrow all initialized values as a contiguous native slice.
-    pub fn as_slice<'view>(&'view self, arena: &Arena<'arena, '_>) -> Result<&'view [T]> {
-        match &self.storage {
-            SmallStorage::Inline { len, values } => {
-                if *len == 0 {
-                    return Ok(&[]);
-                }
-                // SAFETY: len is advanced only after writing each value, and
-                // the wrapper borrow keeps the inline slots alive.
-                Ok(unsafe { slice::from_raw_parts(values.as_ptr().cast::<T>(), *len as usize) })
-            }
-            SmallStorage::Heap(values) => values.as_slice(arena),
+        let mut replacement = CompactRuntime::alloc_owned_slice::<T>(capacity)?;
+        // SAFETY: exactly `inline_len` inline slots are initialized and become moved.
+        unsafe {
+            replacement.move_from_uninit_slice(self.inline.as_mut_ptr(), self.inline_len)?;
         }
+        self.inline_len = 0;
+        self.heap = Some(replacement);
+        Ok(())
     }
-
+    /// Append a value.
+    pub fn push(&mut self, value: T) -> Result<()> {
+        if self.heap.is_none() && self.inline_len < N {
+            self.inline[self.inline_len].write(value);
+            self.inline_len += 1;
+            return Ok(());
+        }
+        self.reserve(1)?;
+        self.heap
+            .as_mut()
+            .expect("reserve promotes storage")
+            .push(value)?;
+        Ok(())
+    }
+    /// Borrow all initialized values.
+    pub fn as_slice(&self) -> &[T] {
+        if let Some(heap) = &self.heap {
+            return heap.as_slice();
+        }
+        // SAFETY: inline prefix is tracked by inline_len.
+        unsafe { core::slice::from_raw_parts(self.inline.as_ptr().cast::<T>(), self.inline_len) }
+    }
     /// Mutably borrow all initialized values.
-    pub fn as_mut_slice<'view>(
-        &'view mut self,
-        arena: &'view mut Arena<'arena, '_>,
-    ) -> Result<&'view mut [T]> {
-        match &mut self.storage {
-            SmallStorage::Inline { len, values } => {
-                if *len == 0 {
-                    return Ok(&mut []);
-                }
-                // SAFETY: len tracks the initialized prefix and exclusive
-                // access to self prevents other inline views.
-                Ok(unsafe {
-                    slice::from_raw_parts_mut(values.as_mut_ptr().cast::<T>(), *len as usize)
-                })
-            }
-            SmallStorage::Heap(values) => values.as_mut_slice(arena),
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if let Some(heap) = &mut self.heap {
+            return heap.as_mut_slice();
+        }
+        // SAFETY: inline prefix is uniquely borrowed and tracked by inline_len.
+        unsafe {
+            core::slice::from_raw_parts_mut(self.inline.as_mut_ptr().cast::<T>(), self.inline_len)
         }
     }
-
-    /// Borrow an element by index.
-    pub fn get<'view>(
-        &'view self,
-        index: usize,
-        arena: &'view Arena<'arena, '_>,
-    ) -> Result<Option<&'view T>> {
-        if index >= self.len() {
-            return Ok(None);
-        }
-        match &self.storage {
-            SmallStorage::Inline { values, .. } => {
-                // SAFETY: index is below the initialized inline prefix.
-                Ok(Some(unsafe { values[index].assume_init_ref() }))
-            }
-            SmallStorage::Heap(values) => values.get(index, arena),
-        }
+    /// Return an initialized value by index.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        self.as_slice().get(index)
     }
-
-    /// Mutably borrow an element by index.
-    pub fn get_mut<'view>(
-        &'view mut self,
-        index: usize,
-        arena: &'view mut Arena<'arena, '_>,
-    ) -> Result<Option<&'view mut T>> {
-        if index >= self.len() {
-            return Ok(None);
-        }
-        match &mut self.storage {
-            SmallStorage::Inline { values, .. } => {
-                // SAFETY: index is initialized and self is exclusively borrowed.
-                Ok(Some(unsafe { values[index].assume_init_mut() }))
-            }
-            SmallStorage::Heap(values) => values.get_mut(index, arena),
-        }
+    /// Mutably borrow an initialized value by index.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.as_mut_slice().get_mut(index)
     }
-
-    /// Remove and return the last element.
-    pub fn pop_in(&mut self, arena: &Arena<'arena, '_>) -> Result<Option<T>> {
-        match &mut self.storage {
-            SmallStorage::Inline { len, values } => {
-                if *len == 0 {
-                    return Ok(None);
-                }
-                *len -= 1;
-                // SAFETY: the previous length proved this slot initialized;
-                // lowering len transfers its unique ownership to the result.
-                Ok(Some(unsafe { values[*len as usize].assume_init_read() }))
-            }
-            SmallStorage::Heap(values) => values.pop_in(arena),
+    /// Remove and return the final value.
+    pub fn pop(&mut self) -> Option<T> {
+        if let Some(heap) = &mut self.heap {
+            return heap.pop();
         }
+        if self.inline_len == 0 {
+            return None;
+        }
+        self.inline_len -= 1;
+        // SAFETY: the former final slot was initialized and is now removed from the prefix.
+        Some(unsafe { self.inline[self.inline_len].assume_init_read() })
     }
-
-    /// Drop initialized values after `len`.
+    /// Drop values after `len`.
     pub fn truncate(&mut self, len: usize) {
-        match &mut self.storage {
-            SmallStorage::Inline {
-                len: current,
-                values,
-            } => {
-                while (*current as usize) > len {
-                    *current -= 1;
-                    // SAFETY: the length is reduced before the destructor is
-                    // called, so unwinding cannot drop this element twice.
-                    unsafe { values[*current as usize].assume_init_drop() };
-                }
-            }
-            SmallStorage::Heap(values) => values.truncate(len),
+        if let Some(heap) = &mut self.heap {
+            heap.truncate(len);
+            return;
+        }
+        while self.inline_len > len {
+            self.inline_len -= 1;
+            // SAFETY: length is lowered before the destructor is called.
+            unsafe { self.inline[self.inline_len].assume_init_drop() };
         }
     }
-
-    /// Drop all values while retaining the current representation.
+    /// Drop all values and keep current storage.
     pub fn clear(&mut self) {
         self.truncate(0);
     }
-
-    fn promote(&mut self, required: usize, arena: &mut Arena<'arena, '_>) -> Result<()> {
-        if let SmallStorage::Heap(values) = &mut self.storage {
-            return values.reserve_in(required.saturating_sub(values.len()), arena);
-        }
-
-        let inline_len = self.len();
-        let grown = N.saturating_mul(2).max(4);
-        let capacity = required.max(grown);
-        let mut replacement = CompactVec::with_capacity_in(capacity, arena)?;
-        if let SmallStorage::Inline { len, values } = &mut self.storage {
-            if let Some(allocation) = replacement.allocation_mut() {
-                // SAFETY: the inline length is the initialized prefix. The
-                // destination was allocated with capacity >= inline_len.
-                unsafe {
-                    allocation.move_from_uninit_slice(values.as_mut_ptr(), inline_len)?;
-                }
-            }
-            *len = 0;
-        }
-        self.storage = SmallStorage::Heap(replacement);
-        Ok(())
-    }
 }
 
-impl<T: CompactValue, const N: usize> Drop for CompactSmallVec<'_, T, N> {
+impl<T: CompactValue, const N: usize> Default for CompactSmallVec<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl<T: CompactValue, const N: usize> Deref for CompactSmallVec<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+impl<T: CompactValue, const N: usize> DerefMut for CompactSmallVec<T, N> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+impl<T: CompactValue, const N: usize> Drop for CompactSmallVec<T, N> {
     fn drop(&mut self) {
-        if let SmallStorage::Inline { len, values } = &mut self.storage {
-            while *len != 0 {
-                *len -= 1;
-                // SAFETY: the stored prefix is initialized and len is reduced
-                // before each destructor invocation.
-                unsafe { ptr::drop_in_place(values[*len as usize].as_mut_ptr()) };
-            }
-        }
+        let mut guard = SmallVecDropGuard {
+            values: self,
+            armed: true,
+        };
+        self.truncate(0);
+        guard.armed = false;
     }
 }
 
-// SAFETY: all owned values move with the wrapper, and the explicit Drop impl
-// destroys inline values while the heap variant owns a CompactVec token.
-unsafe impl<T: CompactValue, const N: usize> CompactValue for CompactSmallVec<'_, T, N> {}
+struct SmallVecDropGuard<T: CompactValue, const N: usize> {
+    values: *mut CompactSmallVec<T, N>,
+    armed: bool,
+}
+impl<T: CompactValue, const N: usize> Drop for SmallVecDropGuard<T, N> {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: the guard is created from the exclusive borrow in Drop
+            // and is only used during unwinding to drop the remaining values.
+            unsafe { (*self.values).truncate(0) };
+        }
+    }
+}
+// SAFETY: inline elements move with the wrapper and heap values are owned by a cage allocation.
+unsafe impl<T: CompactValue, const N: usize> CompactValue for CompactSmallVec<T, N> {}
