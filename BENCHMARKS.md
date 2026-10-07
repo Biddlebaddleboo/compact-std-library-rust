@@ -485,3 +485,91 @@ merging or resizing.
 Exact retained sizes remain unchanged: the allocation owner and vector are
 4 B, the common header is 16 B, and frozen descriptors are 8 B. This pass adds
 no architecture-specific intrinsics or inline assembly.
+
+## V2.4 recycling and collection hot paths
+
+Implementation source revision: `f9c0e0b`, integrated on top of the pinned
+`8698490347a5e798df4a6a3ab5f516ce3338711a` baseline. Two full release suites
+ran on 2026-10-07 with the same host and Rust toolchain listed above. They used
+features `json,toml` without telemetry and the production allocator policy:
+pending exact reuse enabled, global size-class lookups disabled. All native and
+compact logical checksums matched across all 16 scenarios in both runs.
+
+The full suite commands were:
+
+```sh
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/compact-v24-implemented-run1.tsv
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/compact-v24-implemented-run2.tsv
+```
+
+For each timing cell below, `run 1; run 2` are `median/p95` milliseconds.
+The pinned compact values come from the two complete suites at `8698490`;
+retained memory is compact cage plus auxiliary live bytes divided by native
+live bytes. The changed scenarios cover the allocator workloads and all three
+collection targets.
+
+| ID | Native med/p95 (R1; R2) | Pinned compact med/p95 (R1; R2) | New compact med/p95 (R1; R2) | Old/new median (R1/R2) | New/native median (R1/R2) | Retained memory |
+|---|---:|---:|---:|---:|---:|---:|
+| A2 | 1.742/1.787; 1.764/2.355 | 2.547/3.037; 2.539/3.385 | 2.611/2.864; 2.585/2.641 | 0.98x/0.98x | 1.50x/1.47x | 1.500x |
+| A3 | 4.277/4.874; 4.275/4.891 | 0.638/0.766; 0.612/0.767 | 0.681/0.898; 0.615/0.654 | 0.94x/1.00x | 0.16x/0.14x | 1.001x |
+| A4 | 0.366/0.386; 0.359/0.426 | 3.112/3.633; 2.675/3.334 | 2.258/2.707; 2.029/2.646 | 1.38x/1.32x | 6.16x/5.65x | 1.000x |
+| A5 | 1.176/1.543; 1.165/1.309 | 5.639/6.079; 5.616/5.829 | 5.001/5.174; 5.038/6.553 | 1.13x/1.11x | 4.25x/4.32x | 1.000x |
+| B3 | 32.904/38.237; 32.911/33.838 | 22.949/23.685; 23.148/24.364 | 23.409/25.035; 24.424/24.576 | 0.98x/0.95x | 0.71x/0.74x | 0.911x |
+| B5 | 8.886/10.281; 9.245/10.426 | 7.247/8.569; 7.211/7.471 | 6.906/6.982; 6.799/6.943 | 1.05x/1.06x | 0.78x/0.74x | 0.710x |
+| B6 | 0.039/0.062; 0.038/0.062 | 0.595/0.638; 0.594/0.616 | 0.142/0.170; 0.141/0.161 | 4.19x/4.20x | 3.68x/3.70x | 1.000x |
+| B8 | 11.759/12.932; 11.779/14.124 | 36.661/37.172; 36.706/37.405 | 32.129/32.658; 32.467/34.021 | 1.14x/1.13x | 2.73x/2.76x | 1.026x |
+| B10 | 1.172/1.343; 1.184/1.814 | 3.113/3.180; 2.793/3.053 | 2.619/2.854; 2.806/2.992 | 1.19x/1.00x | 2.24x/2.37x | 1.000x |
+
+The targeted hot phases improved as follows. Values are compact medians in
+milliseconds, run 1 / run 2; percentages compare each run against its pinned
+baseline.
+
+| Scenario phase | Pinned baseline | New implementation | Change |
+|---|---:|---:|---:|
+| A4 deque mutation | 3.001 / 2.580 | 2.187 / 1.969 | 27% / 24% faster |
+| A5 hash mutation | 1.410 / 1.405 | 1.239 / 1.253 | 12% / 11% faster |
+| A5 hash lookup | 0.615 / 0.611 | 0.539 / 0.544 | 12% / 11% faster |
+| B6 quote updates and snapshot rebuilds | 0.540 / 0.535 | 0.088 / 0.088 | 84% / 84% faster |
+| B6 snapshot copy | 0.00428 / 0.00424 | 0.00284 / 0.00280 | 34% / 34% faster |
+| B8 fixed-population churn | 31.230 / 31.325 | 27.526 / 27.834 | 12% / 11% faster |
+| B8 drop | 3.118 / 3.143 | 2.419 / 2.447 | 22% / 22% faster |
+
+The B6 scenario now calls the public `CompactVec::retain` path and uses
+`try_clone_copy` for its `Copy` records. Its end-to-end median fell by about
+76% while retained memory stayed unchanged. A4's no-growth ring pushes avoid
+the second capacity resolution. A5 classifies physically contiguous control
+groups directly and retains bounded scratch for wraparound and partial groups.
+
+The allocator policy comparison used isolated release binaries and no
+telemetry in timed runs. Policy A means pending reuse off/classes on; B means
+pending reuse on/classes off and is the production default; C means both on.
+The `benchmark-allocator-a`, `benchmark-allocator-b`, and
+`benchmark-allocator-c` features select those comparison modes; a build with no
+policy feature uses B. A build with `--all-features` selects C intentionally.
+The B10 values below are the median of two 101-sample passes. B8 values are
+the median of three 21-sample passes.
+
+| Policy | B10 churn / end-to-end (ms) | B8 churn / end-to-end (ms) | A3 end-to-end (ms) |
+|---|---:|---:|---:|
+| Pinned baseline | 2.791 / 2.968 | 31.325 / 36.706 | — |
+| A | 2.718 / 2.899 | — | 0.613 |
+| B (default) | 2.682 / 2.866 | 29.919 / 34.691 | 0.613 |
+| C | 2.764 / 2.955 | 29.722 / 35.167 | 0.612 |
+
+The paired B10 repetitions kept B within the pinned baseline in both passes;
+class-on C was slightly slower than B. A3 timings were effectively tied. With
+telemetry enabled separately, the default B8 run reported 524,340 pending
+exact-reuse hits and 124,594 misses: 124,544 had no active collector, 50 had
+no exact block, and none failed alignment. In class-on policy C, B8 had zero
+class hits and 93,407 misses, all from empty classes. B10 policy C likewise
+had zero class hits and 816,000 empty 32-byte class misses. The class cache
+therefore remains available for explicit A/C comparisons, but is disabled in
+the default policy.
+
+Retained sizes and memory ratios did not change. Formatting, all-feature
+workspace check/tests, strict Clippy, the x86-64 Apple collection check, the
+complete Miri workflow (`PROPTEST_CASES=16`), and the all-feature workspace
+release build passed. Release AArch64 assembly showed direct deque slot writes,
+a direct 16-byte contiguous hash control load, and one-slice `Copy` retain
+compaction. The x86-64 SSE2 classifier also loads contiguous groups directly
+(`movdqu`). Neither assembly contained software prefetch instructions.

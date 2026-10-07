@@ -36,25 +36,37 @@ through `PhantomData`.
 
 Allocator scalars and free-range links are protected by one mutex. No user
 code or destructor runs under that lock. Free blocks contain initialized
-`u32` links and lengths. General-list ranges are sorted by offset; exact-size
-class ranges are exclusively owned by their class, with no overlap between
-classes or the general list. Each class holds at most 32 ranges. Batch release
-and resize drain the classes before checking and coalescing adjacent ranges.
-The complete incoming batch is validated for bounds, overlap, and accounting
-before allocator state is committed. Live and free extents account for the
-entire high-water prefix. There is no native allocation registry. Safe owners
-are valid because their offsets are private, issued by allocation, and
-transferred by Rust moves.
+`u32` links and lengths. General-list ranges are sorted by offset; when the
+optional size-class policy is enabled, class ranges are exclusively owned by
+their class, with no overlap between classes or the general list. Each class
+holds at most 32 ranges. Batch release and resize drain the classes before
+checking and coalescing adjacent ranges. The complete incoming batch is
+validated for bounds, overlap, and accounting before allocator state is
+committed. Live and free extents account for the entire high-water prefix.
+There is no native allocation registry. Safe owners are valid because their
+offsets are private, issued by allocation, and transferred by Rust moves.
 
 The release collector is a stack-local array of at most 64 extent descriptors.
 A thread-local cell points to it only for the outermost batched operation on
-that thread; nested teardown reuses the active collector. The scope guard
-restores the thread-local cell before its stack storage leaves scope and flushes
-pending descriptors during both normal return and unwind. Destructors execute
-before each allocator transaction begins. A contiguous tail batch is validated
-and contracted directly; other batches are sorted and fully checked before
-free-list or class-bin links change. If a batch fails validation while cleanup
-is unwinding, each remaining descriptor is attempted individually.
+that thread; nested teardown reuses the active collector. A process-wide atomic
+count is only a lookup hint: when it is zero, allocation skips TLS; when it is
+nonzero, the allocation still consults only its own thread-local cell. The
+scope guard clears that cell and updates the hint before its stack storage
+leaves scope, then flushes pending descriptors during both normal return and
+unwind. Destructors execute before each allocator transaction begins. A
+contiguous tail batch is validated and contracted directly; other batches are
+sorted and fully checked before free-list or class-bin links change. If a batch
+fails validation while cleanup is unwinding, each remaining descriptor is
+attempted individually.
+
+A pending extent remains accounted as live and is reachable only through its
+thread's stack-local collector. Allocation can claim it only when the new
+request produces the same block length and satisfies alignment. The collector
+removes the extent before the allocator writes a fresh header and publishes the
+new owner; no global live-byte transition occurs during this reuse. Removing
+the descriptor prevents a later flush from freeing it. If no exact match exists,
+the normal mutex-protected allocator path runs. No other thread can inspect or
+claim a pending extent.
 
 The live header is exactly four `u32` fields: block length, alignment prefix,
 capacity, and initialized count. Its start is derived from the owner offset and
@@ -92,7 +104,13 @@ clears the source length before replacing its storage; this is a move under the
 
 `CompactVecDeque`, `CompactSmallVec`, and hash collections use drop guards so
 one panicking destructor does not cause a later element to be dropped twice.
-Their child allocations join a thread-local release batch only after each
+`CompactVec::retain` uses an in-place compaction guard for values without
+destructors. If its predicate unwinds, the guard restores the kept prefix and
+unvisited tail as the initialized vector contents. For drop-bearing values,
+the method stages owned values in a temporary native vector; its retain logic
+repairs the survivor sequence if a predicate or destructor unwinds, and a
+compact-vector guard moves survivors back without allocating or dropping them
+twice. Their child allocations join a thread-local release batch only after each
 destructor returns. The guards hold temporary raw pointers tied to an exclusive
 borrow and never store pointers in compact state.
 
@@ -120,10 +138,11 @@ references borrow the graph, whose one cage allocation remains alive.
 `FrozenGraphView` resolves the graph byte slice once and applies the same
 descriptor identity, bounds, and alignment checks against that borrowed byte
 range. Its lifetime is tied to the graph; it stores no persistent state in the
-graph or descriptor. Hash control SIMD classifies a copied 16-byte temporary
-group, so architecture-specific loads do not cross cage/table bounds. The
-portable scalar classifier defines the same masks and remains the reference
-implementation.
+graph or descriptor. Hash control classification receives a bounded 16-byte
+slice when the group is contiguous and uses an initialized scratch group when
+it wraps or is partial. Architecture-specific classifiers therefore never
+load across cage/table bounds. The portable scalar classifier defines the same
+masks and remains the reference implementation.
 
 ## Collections and macros
 

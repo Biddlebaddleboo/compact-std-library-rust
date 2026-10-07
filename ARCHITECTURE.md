@@ -22,23 +22,29 @@ reset or public teardown. Runtime state retains one native base pointer, its
 configured capacity, and one mutex protecting allocator scalars. Reading live
 values does not acquire that mutex.
 
-The allocator contains a `u32` high-water cursor, `u32` live-byte count, an
-ordered general free-list head, and four bounded exact-size class heads for
-32, 40, 112, and 528-byte blocks. Every class can hold at most 32 blocks.
-Free blocks hold an eight-byte `{ next, len }` node at their start. The general
-list is sorted by offset and remains the first-fit fallback. A class owns its
-blocks exclusively; a batch release or resize drains the classes before
-coalescing adjacent ranges, then may cache exact-size results again. The tail
-contracts once after a batch. There is no native map, set, or heap allocation
-for allocator bookkeeping.
+The allocator contains a `u32` high-water cursor, `u32` live-byte count, and an
+ordered general free-list head. Free blocks hold an eight-byte `{ next, len }`
+node at their start, and the general list is sorted by offset. The bounded
+exact-size caches for 32, 40, 112, and 528-byte blocks remain available to
+explicit A/C benchmark policies, with at most 32 blocks per class; the
+optimized default policy disables them because the measured workloads did not
+justify their lookup cost. When enabled, class blocks are exclusively owned
+by their class, and release or resize drains them before coalescing adjacent
+ranges. The tail contracts once after a batch. There is no native map, set, or
+heap allocation for allocator bookkeeping.
 
 `CompactRuntime::with_batched_releases` collects up to 64 temporary extents on
 the stack and releases each chunk under one `AllocatorTransaction`. Nested
-teardown joins the same thread-local collector. Contiguous tail chunks contract
-directly; other chunks are sorted, checked against current free ranges, and
-coalesced before allocator state changes. The optional `allocator-telemetry`
-feature adds counters to global runtime state and benchmark output only; it
-does not change retained owner or header layouts.
+teardown joins the same thread-local collector. An allocation on that thread
+can remove the most recent exactly compatible pending extent before taking the
+allocator mutex; the allocator writes a fresh header and leaves `live_bytes`
+unchanged. A bounded process-wide active-collector count lets allocations skip
+the thread-local lookup when no batch is active; the actual pending extent
+pointer remains thread-local. Contiguous tail chunks contract directly; other
+chunks are sorted, checked against current free ranges, and coalesced before
+allocator state changes. The optional `allocator-telemetry` feature adds
+counters to global runtime state and benchmark output only; it does not change
+retained owner or header layouts.
 
 The common live header is four `u32` fields and is exactly 16 bytes:
 
@@ -99,9 +105,16 @@ rule applies to retained addressing and links, not every integer field.
 ## Collections
 
 Vectors keep capacity and initialized length in their allocation header, so
-the owner remains four bytes. Deques add a `u32` head and length. Hash tables
-keep controls and entries in cage allocations; their length and tombstone
-counts are `u32`. The randomized SipHash builder retains only two integer keys.
+the owner remains four bytes. `CompactVec::retain` compacts no-drop values in
+place with one resolved slice; drop-bearing values use temporary native
+staging and a restoration guard so predicate or destructor unwinding leaves a
+valid compact vector. Deques add a `u32` head and length. Their no-growth
+pushes resolve capacity once and write directly to the selected ring slot.
+Hash tables keep controls and entries in cage allocations; their length and
+tombstone counts are `u32`. A full contiguous 16-byte control group is
+classified directly from the table slice, while wrapped and partial groups
+use bounded scratch. The randomized SipHash builder retains only two integer
+keys.
 
 Small vectors keep an inline initialized count as `u32`; their inline array is
 part of the wrapper. Strings and bytes use inline payloads, then promote to a
@@ -161,9 +174,10 @@ The V2.4 retained architecture remains frozen. Implementation hot paths use
 temporary borrow-bound resolved views, batch append writers, and direct deque
 iteration without adding state to retained owners. Hash control-byte probing
 keeps the `EMPTY`/`FULL`/`TOMBSTONE` format and has a portable scalar reference,
-an AArch64 NEON classifier, and an x86-64 SSE2 classifier. The SIMD code only
-classifies copied 16-byte groups; probing order and key equality remain in
-ordinary Rust. No inline assembly is used.
+an AArch64 NEON classifier, and an x86-64 SSE2 classifier. The classifiers use
+direct bounded slices for contiguous groups and temporary 16-byte scratch for
+wrapped or partial groups; probing order and key equality remain in ordinary
+Rust. No software prefetching or inline assembly is used.
 
 Compact cage bytes are process-local runtime representation, not a stable file,
 IPC, network, or cross-target format. Use an external serialization format for
