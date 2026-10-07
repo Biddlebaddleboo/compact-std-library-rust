@@ -77,6 +77,25 @@ pub struct CageConfig {
     pub capacity: usize,
 }
 
+/// Read-only snapshot of the process cage allocator.
+///
+/// This diagnostic surface is hidden from the normal API documentation and
+/// does not alter allocator state or retained owner layouts.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AllocatorStats {
+    /// Bytes occupied by live allocations, including headers and padding.
+    pub live_bytes: u32,
+    /// Current high-water cursor measured from the start of the cage.
+    pub high_water_cursor: u32,
+    /// Total bytes in reusable free blocks.
+    pub free_bytes: u32,
+    /// Number of reusable free blocks.
+    pub free_blocks: u32,
+    /// Size of the largest reusable free block.
+    pub largest_free_block: u32,
+}
+
 impl CageConfig {
     /// Create a configuration with the requested capacity.
     pub const fn new(capacity: usize) -> Self {
@@ -137,6 +156,35 @@ impl CompactRuntime {
         Ok(state
             .capacity
             .saturating_sub(lock(state)?.live_bytes as usize))
+    }
+
+    /// Snapshot live and reusable cage allocator ranges without mutation.
+    #[doc(hidden)]
+    pub fn allocator_stats() -> Result<AllocatorStats> {
+        let state = state()?;
+        let allocator = lock(state)?;
+        let mut stats = AllocatorStats {
+            live_bytes: allocator.live_bytes,
+            high_water_cursor: allocator.cursor,
+            ..AllocatorStats::default()
+        };
+        let mut current = allocator.free_head;
+        while current != 0 {
+            // SAFETY: the free list is protected by the allocator lock and each
+            // link is maintained as an in-cage range by allocator operations.
+            let node = unsafe { read_free_node(state, current)? };
+            stats.free_bytes = stats
+                .free_bytes
+                .checked_add(node.len)
+                .ok_or(Error::InvalidOffset)?;
+            stats.free_blocks = stats
+                .free_blocks
+                .checked_add(1)
+                .ok_or(Error::InvalidOffset)?;
+            stats.largest_free_block = stats.largest_free_block.max(node.len);
+            current = node.next;
+        }
+        Ok(stats)
     }
 
     /// Allocate an uninitialized typed block with the requested element capacity.
@@ -370,6 +418,14 @@ impl<T: CompactValue> CageAllocation<T> {
         };
         // SAFETY: the guard is created from this exclusive owner borrow.
         let allocation = unsafe { &mut *guard.allocation };
+        if !core::mem::needs_drop::<T>() {
+            let target_len = new_len.min(allocation.len());
+            allocation
+                .set_initialized(target_len as u32)
+                .expect("live cage owner header");
+            guard.armed = false;
+            return;
+        }
         while allocation.len() > new_len {
             let index = allocation.len() - 1;
             allocation

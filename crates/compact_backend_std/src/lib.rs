@@ -8,7 +8,7 @@ compile_error!("compact_backend_std requires a 64-bit process ABI");
 mod cage;
 mod scratch;
 
-pub use cage::{CageAllocation, CageConfig, CompactRuntime};
+pub use cage::{AllocatorStats, CageAllocation, CageConfig, CompactRuntime};
 pub use compact_core::{
     bits_required, checked_align_up, smallest_word, validate_bit_range, BitField,
     CompactAbiVersion, CompactValue, Error as CoreError, Offset32, OffsetSlice32, PackedWord,

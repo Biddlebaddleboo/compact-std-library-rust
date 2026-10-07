@@ -1,3 +1,6 @@
+//! Compact-only developer smoke benchmark. Use `benchmark_compare` for the
+//! authoritative native-Rust versus V2.4 performance results.
+
 use compact_std::{
     CompactBytes, CompactHashMap, CompactHashSet, CompactPathBuf, CompactRuntime, CompactString,
     CompactVec, CompactVecDeque, FrozenBuilder, FrozenString, FrozenVec, ScratchRegion,

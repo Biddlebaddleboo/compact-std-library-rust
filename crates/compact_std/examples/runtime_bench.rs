@@ -1,3 +1,6 @@
+//! Compact-only developer smoke benchmark. Use `benchmark_compare` for the
+//! authoritative native-Rust versus V2.4 performance results.
+
 use compact_std::{read_bits, write_bits, CageConfig, CompactBytes, CompactRuntime, CompactVec};
 use std::hint::black_box;
 use std::mem::size_of;

@@ -3,7 +3,9 @@
 pub mod ffi;
 pub mod prelude;
 
-pub use compact_backend_std::{CageAllocation, CageConfig, CompactRuntime, ScratchRegion};
+pub use compact_backend_std::{
+    AllocatorStats, CageAllocation, CageConfig, CompactRuntime, ScratchRegion,
+};
 pub use compact_collections::{
     compact_format, CollectionError, CompactBitVec, CompactBox, CompactBuildHasher, CompactBytes,
     CompactComponent, CompactComponentKind, CompactComponents, CompactEnum, CompactHashMap,
