@@ -32,6 +32,7 @@ fn main() -> BenchResult<()> {
 
     let mut runs_override = None;
     let mut output_path = None;
+    let mut scenario_filters = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -48,6 +49,20 @@ fn main() -> BenchResult<()> {
                         .clone(),
                 );
             }
+            "--scenario" => {
+                index += 1;
+                let scenario = arguments
+                    .get(index)
+                    .ok_or("--scenario requires an ID")?
+                    .clone();
+                if !scenarios::SCENARIOS
+                    .iter()
+                    .any(|(known, _)| *known == scenario)
+                {
+                    return Err(format!("unknown scenario {scenario:?}").into());
+                }
+                scenario_filters.push(scenario);
+            }
             other => return Err(format!("unknown argument {other:?}").into()),
         }
         index += 1;
@@ -57,7 +72,14 @@ fn main() -> BenchResult<()> {
     let mut rows = Vec::new();
     let mut metadata = Vec::new();
     let mut checksums = std::collections::BTreeMap::<String, u64>::new();
-    for &(scenario, description) in scenarios::SCENARIOS {
+    let selected_scenarios = scenarios::SCENARIOS
+        .iter()
+        .filter(|(scenario, _)| {
+            scenario_filters.is_empty() || scenario_filters.iter().any(|filter| filter == scenario)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    for &(scenario, description) in &selected_scenarios {
         eprintln!("benchmark {scenario}: {description}");
         let repetitions = runs_override.unwrap_or_else(|| scenarios::repetitions_for(scenario));
         for variant in ["native", "compact"] {
@@ -109,7 +131,7 @@ fn main() -> BenchResult<()> {
     print_report(&rows);
     println!(
         "\nLogical result checksums matched for all {} scenarios.",
-        scenarios::SCENARIOS.len()
+        selected_scenarios.len()
     );
     if !metadata.is_empty() {
         println!("\nSupplemental process and allocator diagnostics:");
@@ -144,23 +166,61 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
     #[cfg(feature = "allocator-telemetry")]
     if variant == "compact" {
         let stats = compact_std::CompactRuntime::allocator_stats()?;
+        let allocator_policy = if cfg!(feature = "benchmark-allocator-a")
+            && !cfg!(feature = "benchmark-allocator-b")
+            && !cfg!(feature = "benchmark-allocator-c")
+        {
+            "A"
+        } else if cfg!(feature = "benchmark-allocator-c")
+            || (cfg!(feature = "benchmark-allocator-a") && cfg!(feature = "benchmark-allocator-b"))
+        {
+            "C"
+        } else {
+            "B"
+        };
+        println!("META\tallocator_policy\t{scenario}\t{variant}\t{allocator_policy}");
         println!(
-            "META\tallocator_summary\t{scenario}\t{variant}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            stats.lock_acquisitions,
-            stats.free_list_nodes_visited,
-            stats.release_batches,
-            stats.released_extents,
-            stats.max_release_batch,
-            stats.size_class_hits,
-            stats.size_class_misses,
+            "META\tallocator_summary\t{scenario}\t{variant}\t{locks}\t{visits}\t{batches}\t{extents}\t{max_batch}\t{class_hits}\t{class_misses}\t{pending_hits}\t{pending_misses}\t{pending_no_collector}\t{pending_no_exact}\t{pending_alignment}\t{class_empty}\t{class_alignment}\t{no_class}\t{general_fallbacks}\t{cursor_fallbacks}\t{released_exact}\t{cached_exact}\t{coalesced_exact}",
+            locks = stats.lock_acquisitions,
+            visits = stats.free_list_nodes_visited,
+            batches = stats.release_batches,
+            extents = stats.released_extents,
+            max_batch = stats.max_release_batch,
+            class_hits = stats.size_class_hits,
+            class_misses = stats.size_class_misses,
+            pending_hits = stats.pending_reuse_hits,
+            pending_misses = stats.pending_reuse_misses,
+            pending_no_collector = stats.pending_reuse_no_active_collector,
+            pending_no_exact = stats.pending_reuse_no_exact_block,
+            pending_alignment = stats.pending_reuse_alignment_incompatible,
+            class_empty = stats.global_class_empty.iter().sum::<u64>(),
+            class_alignment = stats.global_class_alignment_incompatible.iter().sum::<u64>(),
+            no_class = stats.requested_size_no_class,
+            general_fallbacks = stats.general_list_fallbacks,
+            cursor_fallbacks = stats.cursor_fallbacks,
+            released_exact = stats.released_exact_size_extents,
+            cached_exact = stats.exact_size_extents_cached,
+            coalesced_exact = stats.exact_size_extents_coalesced_before_cache,
         );
-        for (class_size, (blocks, bytes)) in [32_u32, 40, 112, 528].into_iter().zip(
-            stats
-                .size_class_free_blocks
-                .into_iter()
-                .zip(stats.size_class_free_bytes),
-        ) {
-            println!("META\tclass_cache\t{scenario}\t{variant}\t{class_size}\t{blocks}\t{bytes}");
+        for (class_index, (class_size, (blocks, bytes))) in [32_u32, 40, 112, 528]
+            .into_iter()
+            .zip(
+                stats
+                    .size_class_free_blocks
+                    .into_iter()
+                    .zip(stats.size_class_free_bytes),
+            )
+            .enumerate()
+        {
+            println!(
+                "META\tclass_cache\t{scenario}\t{variant}\t{class_size}\t{}\t{}\t{}\t{}\t{}\t{}",
+                stats.global_class_hits[class_index],
+                stats.global_class_misses[class_index],
+                stats.global_class_empty[class_index],
+                stats.global_class_alignment_incompatible[class_index],
+                blocks,
+                bytes,
+            );
         }
         for (bucket, count) in stats.allocation_size_histogram.iter().copied().enumerate() {
             if count != 0 {
@@ -294,7 +354,7 @@ fn write_tsv(path: &str, rows: &[PhaseRow], metadata: &[String]) -> BenchResult<
     let mut file = fs::File::create(path)?;
     writeln!(
         file,
-        "scenario\tvariant\tphase\truns\tmedian_ns\tp95_ns\tmin_ns\tmax_ns\tallocation_calls\tdeallocation_calls\trequested_bytes\tlive_delta_bytes\tpeak_extra_bytes\tcage_live_delta_bytes\tcage_high_water_cursor\tfree_bytes\tfree_blocks\tlargest_free_block\tallocator_lock_acquisitions\tfree_list_nodes_visited\trelease_batches\treleased_extents\tmax_release_batch\tsize_class_hits\tsize_class_misses"
+        "scenario\tvariant\tphase\truns\tmedian_ns\tp95_ns\tmin_ns\tmax_ns\tallocation_calls\tdeallocation_calls\trequested_bytes\tlive_delta_bytes\tpeak_extra_bytes\tcage_live_delta_bytes\tcage_high_water_cursor\tfree_bytes\tfree_blocks\tlargest_free_block\tallocator_lock_acquisitions\tfree_list_nodes_visited\trelease_batches\treleased_extents\tmax_release_batch\tsize_class_hits\tsize_class_misses\tpending_reuse_hits\tpending_reuse_misses\tpending_reuse_no_active_collector\tpending_reuse_no_exact_block\tpending_reuse_alignment_incompatible\tglobal_class_hits_32,40,112,528\tglobal_class_misses_32,40,112,528\tglobal_class_empty_32,40,112,528\tglobal_class_alignment_incompatible_32,40,112,528\trequested_size_no_class\tgeneral_list_fallbacks\tcursor_fallbacks\treleased_exact_size_extents\texact_size_extents_cached\texact_size_extents_coalesced_before_cache"
     )?;
     for row in rows {
         writeln!(

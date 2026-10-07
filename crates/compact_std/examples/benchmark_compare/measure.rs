@@ -95,6 +95,21 @@ struct PhaseSample {
     max_release_batch: u32,
     size_class_hits: u64,
     size_class_misses: u64,
+    pending_reuse_hits: u64,
+    pending_reuse_misses: u64,
+    pending_reuse_no_active_collector: u64,
+    pending_reuse_no_exact_block: u64,
+    pending_reuse_alignment_incompatible: u64,
+    global_class_hits: [u64; 4],
+    global_class_misses: [u64; 4],
+    global_class_empty: [u64; 4],
+    global_class_alignment_incompatible: [u64; 4],
+    requested_size_no_class: u64,
+    general_list_fallbacks: u64,
+    cursor_fallbacks: u64,
+    released_exact_size_extents: u64,
+    exact_size_extents_cached: u64,
+    exact_size_extents_coalesced_before_cache: u64,
 }
 
 #[derive(Debug)]
@@ -122,6 +137,21 @@ struct PhaseAggregate {
     max_release_batch: u32,
     size_class_hits: u64,
     size_class_misses: u64,
+    pending_reuse_hits: u64,
+    pending_reuse_misses: u64,
+    pending_reuse_no_active_collector: u64,
+    pending_reuse_no_exact_block: u64,
+    pending_reuse_alignment_incompatible: u64,
+    global_class_hits: [u64; 4],
+    global_class_misses: [u64; 4],
+    global_class_empty: [u64; 4],
+    global_class_alignment_incompatible: [u64; 4],
+    requested_size_no_class: u64,
+    general_list_fallbacks: u64,
+    cursor_fallbacks: u64,
+    released_exact_size_extents: u64,
+    exact_size_extents_cached: u64,
+    exact_size_extents_coalesced_before_cache: u64,
 }
 
 pub type Mutation<'a, T> = (
@@ -342,6 +372,10 @@ fn finish_phase(start: PhaseStart, compact: bool) -> BenchResult<PhaseSample> {
         ),
         _ => (0, 0, 0, 0, 0, 0, 0),
     };
+    let (allocator_before, allocator_after) = match (start.cage_before, cage_after) {
+        (Some(before), Some(after)) => (before, after),
+        _ => (AllocatorStats::default(), AllocatorStats::default()),
+    };
     Ok(PhaseSample {
         elapsed_ns,
         allocation_calls: ALLOC_CALLS.load(Ordering::Relaxed),
@@ -361,6 +395,55 @@ fn finish_phase(start: PhaseStart, compact: bool) -> BenchResult<PhaseSample> {
         max_release_batch,
         size_class_hits,
         size_class_misses,
+        pending_reuse_hits: allocator_after
+            .pending_reuse_hits
+            .saturating_sub(allocator_before.pending_reuse_hits),
+        pending_reuse_misses: allocator_after
+            .pending_reuse_misses
+            .saturating_sub(allocator_before.pending_reuse_misses),
+        pending_reuse_no_active_collector: allocator_after
+            .pending_reuse_no_active_collector
+            .saturating_sub(allocator_before.pending_reuse_no_active_collector),
+        pending_reuse_no_exact_block: allocator_after
+            .pending_reuse_no_exact_block
+            .saturating_sub(allocator_before.pending_reuse_no_exact_block),
+        pending_reuse_alignment_incompatible: allocator_after
+            .pending_reuse_alignment_incompatible
+            .saturating_sub(allocator_before.pending_reuse_alignment_incompatible),
+        global_class_hits: core::array::from_fn(|index| {
+            allocator_after.global_class_hits[index]
+                .saturating_sub(allocator_before.global_class_hits[index])
+        }),
+        global_class_misses: core::array::from_fn(|index| {
+            allocator_after.global_class_misses[index]
+                .saturating_sub(allocator_before.global_class_misses[index])
+        }),
+        global_class_empty: core::array::from_fn(|index| {
+            allocator_after.global_class_empty[index]
+                .saturating_sub(allocator_before.global_class_empty[index])
+        }),
+        global_class_alignment_incompatible: core::array::from_fn(|index| {
+            allocator_after.global_class_alignment_incompatible[index]
+                .saturating_sub(allocator_before.global_class_alignment_incompatible[index])
+        }),
+        requested_size_no_class: allocator_after
+            .requested_size_no_class
+            .saturating_sub(allocator_before.requested_size_no_class),
+        general_list_fallbacks: allocator_after
+            .general_list_fallbacks
+            .saturating_sub(allocator_before.general_list_fallbacks),
+        cursor_fallbacks: allocator_after
+            .cursor_fallbacks
+            .saturating_sub(allocator_before.cursor_fallbacks),
+        released_exact_size_extents: allocator_after
+            .released_exact_size_extents
+            .saturating_sub(allocator_before.released_exact_size_extents),
+        exact_size_extents_cached: allocator_after
+            .exact_size_extents_cached
+            .saturating_sub(allocator_before.exact_size_extents_cached),
+        exact_size_extents_coalesced_before_cache: allocator_after
+            .exact_size_extents_coalesced_before_cache
+            .saturating_sub(allocator_before.exact_size_extents_coalesced_before_cache),
     })
 }
 
@@ -415,6 +498,69 @@ fn aggregate(name: &'static str, samples: Vec<PhaseSample>) -> PhaseAggregate {
             .unwrap_or(0),
         size_class_hits: median_u64(samples.iter().map(|sample| sample.size_class_hits)),
         size_class_misses: median_u64(samples.iter().map(|sample| sample.size_class_misses)),
+        pending_reuse_hits: median_u64(samples.iter().map(|sample| sample.pending_reuse_hits)),
+        pending_reuse_misses: median_u64(samples.iter().map(|sample| sample.pending_reuse_misses)),
+        pending_reuse_no_active_collector: median_u64(
+            samples
+                .iter()
+                .map(|sample| sample.pending_reuse_no_active_collector),
+        ),
+        pending_reuse_no_exact_block: median_u64(
+            samples
+                .iter()
+                .map(|sample| sample.pending_reuse_no_exact_block),
+        ),
+        pending_reuse_alignment_incompatible: median_u64(
+            samples
+                .iter()
+                .map(|sample| sample.pending_reuse_alignment_incompatible),
+        ),
+        global_class_hits: core::array::from_fn(|index| {
+            median_u64(samples.iter().map(|sample| sample.global_class_hits[index]))
+        }),
+        global_class_misses: core::array::from_fn(|index| {
+            median_u64(
+                samples
+                    .iter()
+                    .map(|sample| sample.global_class_misses[index]),
+            )
+        }),
+        global_class_empty: core::array::from_fn(|index| {
+            median_u64(
+                samples
+                    .iter()
+                    .map(|sample| sample.global_class_empty[index]),
+            )
+        }),
+        global_class_alignment_incompatible: core::array::from_fn(|index| {
+            median_u64(
+                samples
+                    .iter()
+                    .map(|sample| sample.global_class_alignment_incompatible[index]),
+            )
+        }),
+        requested_size_no_class: median_u64(
+            samples.iter().map(|sample| sample.requested_size_no_class),
+        ),
+        general_list_fallbacks: median_u64(
+            samples.iter().map(|sample| sample.general_list_fallbacks),
+        ),
+        cursor_fallbacks: median_u64(samples.iter().map(|sample| sample.cursor_fallbacks)),
+        released_exact_size_extents: median_u64(
+            samples
+                .iter()
+                .map(|sample| sample.released_exact_size_extents),
+        ),
+        exact_size_extents_cached: median_u64(
+            samples
+                .iter()
+                .map(|sample| sample.exact_size_extents_cached),
+        ),
+        exact_size_extents_coalesced_before_cache: median_u64(
+            samples
+                .iter()
+                .map(|sample| sample.exact_size_extents_coalesced_before_cache),
+        ),
     }
 }
 
@@ -450,32 +596,65 @@ fn median_i64(values: impl Iterator<Item = i64>) -> i64 {
 }
 
 fn emit_phase(scenario: &str, variant: &str, summary: PhaseAggregate) {
-    println!(
-        "PHASE\t{scenario}\t{variant}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        summary.name,
-        summary.runs,
-        summary.median_ns,
-        summary.p95_ns,
-        summary.min_ns,
-        summary.max_ns,
-        summary.allocation_calls,
-        summary.deallocation_calls,
-        summary.requested_bytes,
-        summary.live_delta,
-        summary.peak_extra,
-        summary.cage_live_delta,
-        summary.cage_cursor,
-        summary.free_bytes,
-        summary.free_blocks,
-        summary.largest_free_block,
-        summary.allocator_lock_acquisitions,
-        summary.free_list_nodes_visited,
-        summary.release_batches,
-        summary.released_extents,
-        summary.max_release_batch,
-        summary.size_class_hits,
-        summary.size_class_misses,
-    );
+    let class_hits = summary
+        .global_class_hits
+        .map(|value| value.to_string())
+        .join(",");
+    let class_misses = summary
+        .global_class_misses
+        .map(|value| value.to_string())
+        .join(",");
+    let class_empty = summary
+        .global_class_empty
+        .map(|value| value.to_string())
+        .join(",");
+    let class_alignment = summary
+        .global_class_alignment_incompatible
+        .map(|value| value.to_string())
+        .join(",");
+    let fields = [
+        summary.name.to_owned(),
+        summary.runs.to_string(),
+        summary.median_ns.to_string(),
+        summary.p95_ns.to_string(),
+        summary.min_ns.to_string(),
+        summary.max_ns.to_string(),
+        summary.allocation_calls.to_string(),
+        summary.deallocation_calls.to_string(),
+        summary.requested_bytes.to_string(),
+        summary.live_delta.to_string(),
+        summary.peak_extra.to_string(),
+        summary.cage_live_delta.to_string(),
+        summary.cage_cursor.to_string(),
+        summary.free_bytes.to_string(),
+        summary.free_blocks.to_string(),
+        summary.largest_free_block.to_string(),
+        summary.allocator_lock_acquisitions.to_string(),
+        summary.free_list_nodes_visited.to_string(),
+        summary.release_batches.to_string(),
+        summary.released_extents.to_string(),
+        summary.max_release_batch.to_string(),
+        summary.size_class_hits.to_string(),
+        summary.size_class_misses.to_string(),
+        summary.pending_reuse_hits.to_string(),
+        summary.pending_reuse_misses.to_string(),
+        summary.pending_reuse_no_active_collector.to_string(),
+        summary.pending_reuse_no_exact_block.to_string(),
+        summary.pending_reuse_alignment_incompatible.to_string(),
+        class_hits,
+        class_misses,
+        class_empty,
+        class_alignment,
+        summary.requested_size_no_class.to_string(),
+        summary.general_list_fallbacks.to_string(),
+        summary.cursor_fallbacks.to_string(),
+        summary.released_exact_size_extents.to_string(),
+        summary.exact_size_extents_cached.to_string(),
+        summary
+            .exact_size_extents_coalesced_before_cache
+            .to_string(),
+    ];
+    println!("PHASE\t{scenario}\t{variant}\t{}", fields.join("\t"));
 }
 
 fn peak_rss_kb() -> Option<u64> {

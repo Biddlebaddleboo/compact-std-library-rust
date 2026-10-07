@@ -10,6 +10,8 @@ use core::slice;
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
+#[cfg(feature = "allocator-telemetry")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const INITIAL_CURSOR: u32 = 8;
@@ -17,9 +19,17 @@ const FREE_NODE_BYTES: u32 = size_of::<FreeNode>() as u32;
 const BLOCK_SIZE_BUCKETS: usize = 129;
 const RELEASE_BATCH_CAPACITY: usize = 64;
 const SIZE_CLASSES: [u32; 4] = [32, 40, 112, 528];
+const SIZE_CLASS_COUNT: usize = SIZE_CLASSES.len();
 const SIZE_CLASS_CACHE_CAPACITY: u32 = 32;
 const MAX_SIZE_CLASS_EXTENTS: usize = SIZE_CLASSES.len() * SIZE_CLASS_CACHE_CAPACITY as usize;
 const MAX_MERGE_EXTENTS: usize = RELEASE_BATCH_CAPACITY + MAX_SIZE_CLASS_EXTENTS;
+const BENCHMARK_POLICY_A: bool = cfg!(feature = "benchmark-allocator-a")
+    && !cfg!(feature = "benchmark-allocator-b")
+    && !cfg!(feature = "benchmark-allocator-c");
+const BENCHMARK_POLICY_C: bool = cfg!(feature = "benchmark-allocator-c")
+    || (cfg!(feature = "benchmark-allocator-a") && cfg!(feature = "benchmark-allocator-b"));
+const ENABLE_PENDING_REUSE: bool = !BENCHMARK_POLICY_A;
+const ENABLE_SIZE_CLASS_CACHE: bool = BENCHMARK_POLICY_A || BENCHMARK_POLICY_C;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -37,7 +47,7 @@ struct FreeNode {
     len: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ReleaseExtent {
     start: u32,
     len: u32,
@@ -47,6 +57,43 @@ struct ReleaseCollector {
     extents: [ReleaseExtent; RELEASE_BATCH_CAPACITY],
     len: usize,
 }
+
+#[derive(Clone, Copy)]
+struct RecycledExtent {
+    data_offset: core::num::NonZeroU32,
+    prefix: u32,
+    block_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingLookup {
+    Disabled,
+    NoCollector,
+    NoExactBlock { alignment_incompatible: bool },
+    Recycled,
+}
+
+#[cfg(feature = "allocator-telemetry")]
+struct PendingReuseTelemetry {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    no_active_collector: AtomicU64,
+    no_exact_block: AtomicU64,
+    alignment_incompatible: AtomicU64,
+}
+
+#[cfg(feature = "allocator-telemetry")]
+static PENDING_REUSE_TELEMETRY: PendingReuseTelemetry = PendingReuseTelemetry {
+    hits: AtomicU64::new(0),
+    misses: AtomicU64::new(0),
+    no_active_collector: AtomicU64::new(0),
+    no_exact_block: AtomicU64::new(0),
+    alignment_incompatible: AtomicU64::new(0),
+};
+
+#[cfg(feature = "allocator-telemetry")]
+static PENDING_ALLOCATION_SIZE_HISTOGRAM: [AtomicU64; BLOCK_SIZE_BUCKETS] =
+    [const { AtomicU64::new(0) }; BLOCK_SIZE_BUCKETS];
 
 impl ReleaseCollector {
     fn new() -> Self {
@@ -66,16 +113,68 @@ impl ReleaseCollector {
         }
     }
 
+    fn take_compatible(
+        &mut self,
+        base: *mut u8,
+        bytes: usize,
+        alignment: usize,
+    ) -> (PendingLookup, Option<RecycledExtent>) {
+        let minimum_len = bytes
+            .checked_add(size_of::<AllocationHeader>())
+            .and_then(|raw| raw.checked_add(7))
+            .and_then(|raw| u32::try_from(raw & !7).ok());
+        let mut alignment_incompatible = false;
+        for index in (0..self.len).rev() {
+            let extent = self.extents[index];
+            let Ok((data_offset, prefix, block_len)) =
+                block_layout(base, extent.start, bytes, alignment)
+            else {
+                continue;
+            };
+            if block_len == extent.len {
+                let Some(data_offset) = core::num::NonZeroU32::new(data_offset) else {
+                    continue;
+                };
+                // Preserve insertion order so the last remaining entry is
+                // still the most recently released candidate.
+                self.extents.copy_within(index + 1..self.len, index);
+                self.len -= 1;
+                self.extents[self.len] = ReleaseExtent::default();
+                return (
+                    PendingLookup::Recycled,
+                    Some(RecycledExtent {
+                        data_offset,
+                        prefix,
+                        block_len,
+                    }),
+                );
+            }
+            if minimum_len == Some(extent.len) && block_len > extent.len {
+                alignment_incompatible = true;
+            }
+        }
+        (
+            PendingLookup::NoExactBlock {
+                alignment_incompatible,
+            },
+            None,
+        )
+    }
+
     fn flush(&mut self) {
+        self.flush_with(release_many);
+    }
+
+    fn flush_with(&mut self, mut release: impl FnMut(&mut [ReleaseExtent]) -> Result<()>) {
         if self.len == 0 {
             return;
         }
-        if release_many(&mut self.extents[..self.len]).is_err() {
+        if release(&mut self.extents[..self.len]).is_err() {
             // A bad member must not prevent the remaining valid descriptors
             // from being returned during destructor unwinding.
             for index in 0..self.len {
                 let mut one = [self.extents[index]];
-                let _ = release_many(&mut one);
+                let _ = release(&mut one);
             }
         }
         self.len = 0;
@@ -128,6 +227,26 @@ struct Allocator {
     size_class_hits: u64,
     #[cfg(feature = "allocator-telemetry")]
     size_class_misses: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    global_class_hits: [u64; SIZE_CLASS_COUNT],
+    #[cfg(feature = "allocator-telemetry")]
+    global_class_misses: [u64; SIZE_CLASS_COUNT],
+    #[cfg(feature = "allocator-telemetry")]
+    global_class_empty: [u64; SIZE_CLASS_COUNT],
+    #[cfg(feature = "allocator-telemetry")]
+    global_class_alignment_incompatible: [u64; SIZE_CLASS_COUNT],
+    #[cfg(feature = "allocator-telemetry")]
+    requested_size_no_class: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    general_list_fallbacks: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    cursor_fallbacks: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    released_exact_size_extents: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    exact_size_extents_cached: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    exact_size_extents_coalesced_before_cache: u64,
 }
 
 struct CageState {
@@ -159,7 +278,12 @@ impl DerefMut for AllocatorTransaction<'_> {
 
 impl AllocatorTransaction<'_> {
     fn release_many(&mut self, extents: &mut [ReleaseExtent]) -> Result<()> {
-        release_many_locked(self.state, &mut self.allocator, extents, true)
+        release_many_locked(
+            self.state,
+            &mut self.allocator,
+            extents,
+            ENABLE_SIZE_CLASS_CACHE,
+        )
     }
 }
 
@@ -227,6 +351,36 @@ pub struct AllocatorStats {
     pub size_class_hits: u64,
     /// Number of eligible small allocations that missed size-class caches.
     pub size_class_misses: u64,
+    /// Pending-release exact-reuse hits before acquiring the allocator lock.
+    pub pending_reuse_hits: u64,
+    /// Allocations that could not reuse an extent in the active pending batch.
+    pub pending_reuse_misses: u64,
+    /// Pending-reuse misses that had no active thread-local collector.
+    pub pending_reuse_no_active_collector: u64,
+    /// Pending-reuse misses with no exact compatible block length.
+    pub pending_reuse_no_exact_block: u64,
+    /// Pending-reuse misses where alignment padding made an exact-size block too small.
+    pub pending_reuse_alignment_incompatible: u64,
+    /// Successful global-cache allocations by exact block size.
+    pub global_class_hits: [u64; SIZE_CLASS_COUNT],
+    /// Global-cache lookups not served by each class, by exact block size.
+    pub global_class_misses: [u64; SIZE_CLASS_COUNT],
+    /// Global-cache lookups where each relevant class had no cached blocks.
+    pub global_class_empty: [u64; SIZE_CLASS_COUNT],
+    /// Global-class candidate blocks rejected because alignment padding would not fit.
+    pub global_class_alignment_incompatible: [u64; SIZE_CLASS_COUNT],
+    /// Requests whose natural block length is not one of the configured classes.
+    pub requested_size_no_class: u64,
+    /// Allocations served by the general free-list fallback.
+    pub general_list_fallbacks: u64,
+    /// Allocations served by the bump cursor after reusable ranges missed.
+    pub cursor_fallbacks: u64,
+    /// Released extents whose individual block length matched a configured class.
+    pub released_exact_size_extents: u64,
+    /// Exact-size free runs inserted into a global class cache.
+    pub exact_size_extents_cached: u64,
+    /// Exact-size released extents joined a larger run before cache insertion.
+    pub exact_size_extents_coalesced_before_cache: u64,
     /// Allocation counts by 8-byte block-size bucket; bucket 128 is 1024 B+.
     pub allocation_size_histogram: [u64; BLOCK_SIZE_BUCKETS],
     /// Cached free block counts for the measured exact-size classes.
@@ -250,6 +404,21 @@ impl Default for AllocatorStats {
             max_release_batch: 0,
             size_class_hits: 0,
             size_class_misses: 0,
+            pending_reuse_hits: 0,
+            pending_reuse_misses: 0,
+            pending_reuse_no_active_collector: 0,
+            pending_reuse_no_exact_block: 0,
+            pending_reuse_alignment_incompatible: 0,
+            global_class_hits: [0; SIZE_CLASS_COUNT],
+            global_class_misses: [0; SIZE_CLASS_COUNT],
+            global_class_empty: [0; SIZE_CLASS_COUNT],
+            global_class_alignment_incompatible: [0; SIZE_CLASS_COUNT],
+            requested_size_no_class: 0,
+            general_list_fallbacks: 0,
+            cursor_fallbacks: 0,
+            released_exact_size_extents: 0,
+            exact_size_extents_cached: 0,
+            exact_size_extents_coalesced_before_cache: 0,
             allocation_size_histogram: [0; BLOCK_SIZE_BUCKETS],
             size_class_free_blocks: [0; SIZE_CLASSES.len()],
             size_class_free_bytes: [0; SIZE_CLASSES.len()],
@@ -309,6 +478,26 @@ impl CompactRuntime {
                 size_class_hits: 0,
                 #[cfg(feature = "allocator-telemetry")]
                 size_class_misses: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                global_class_hits: [0; SIZE_CLASS_COUNT],
+                #[cfg(feature = "allocator-telemetry")]
+                global_class_misses: [0; SIZE_CLASS_COUNT],
+                #[cfg(feature = "allocator-telemetry")]
+                global_class_empty: [0; SIZE_CLASS_COUNT],
+                #[cfg(feature = "allocator-telemetry")]
+                global_class_alignment_incompatible: [0; SIZE_CLASS_COUNT],
+                #[cfg(feature = "allocator-telemetry")]
+                requested_size_no_class: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                general_list_fallbacks: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                cursor_fallbacks: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                released_exact_size_extents: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                exact_size_extents_cached: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                exact_size_extents_coalesced_before_cache: 0,
             }),
         };
         CAGE.set(state)
@@ -362,7 +551,48 @@ impl CompactRuntime {
             #[cfg(feature = "allocator-telemetry")]
             size_class_misses: allocator.size_class_misses,
             #[cfg(feature = "allocator-telemetry")]
-            allocation_size_histogram: allocator.allocation_size_histogram,
+            pending_reuse_hits: PENDING_REUSE_TELEMETRY.hits.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_misses: PENDING_REUSE_TELEMETRY.misses.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_no_active_collector: PENDING_REUSE_TELEMETRY
+                .no_active_collector
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_no_exact_block: PENDING_REUSE_TELEMETRY
+                .no_exact_block
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_alignment_incompatible: PENDING_REUSE_TELEMETRY
+                .alignment_incompatible
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            global_class_hits: allocator.global_class_hits,
+            #[cfg(feature = "allocator-telemetry")]
+            global_class_misses: allocator.global_class_misses,
+            #[cfg(feature = "allocator-telemetry")]
+            global_class_empty: allocator.global_class_empty,
+            #[cfg(feature = "allocator-telemetry")]
+            global_class_alignment_incompatible: allocator.global_class_alignment_incompatible,
+            #[cfg(feature = "allocator-telemetry")]
+            requested_size_no_class: allocator.requested_size_no_class,
+            #[cfg(feature = "allocator-telemetry")]
+            general_list_fallbacks: allocator.general_list_fallbacks,
+            #[cfg(feature = "allocator-telemetry")]
+            cursor_fallbacks: allocator.cursor_fallbacks,
+            #[cfg(feature = "allocator-telemetry")]
+            released_exact_size_extents: allocator.released_exact_size_extents,
+            #[cfg(feature = "allocator-telemetry")]
+            exact_size_extents_cached: allocator.exact_size_extents_cached,
+            #[cfg(feature = "allocator-telemetry")]
+            exact_size_extents_coalesced_before_cache: allocator
+                .exact_size_extents_coalesced_before_cache,
+            #[cfg(feature = "allocator-telemetry")]
+            allocation_size_histogram: core::array::from_fn(|index| {
+                allocator.allocation_size_histogram[index].saturating_add(
+                    PENDING_ALLOCATION_SIZE_HISTOGRAM[index].load(Ordering::Relaxed),
+                )
+            }),
             ..AllocatorStats::default()
         };
         let mut current = allocator.free_head;
@@ -638,12 +868,34 @@ impl<T: CompactValue> CageAllocation<T> {
             .checked_mul(capacity)
             .ok_or(Error::OffsetOverflow)?;
         let state = state()?;
-        let mut allocator = lock(state)?;
         let needed = bytes.max(1);
         let alignment = align_of::<T>().max(4);
+        let (lookup, recycled) = take_pending_reuse(state, needed, alignment);
+        if let Some(recycled) = recycled {
+            debug_assert_eq!(lookup, PendingLookup::Recycled);
+            record_pending_lookup(PendingLookup::Recycled, recycled.block_len);
+            let header = AllocationHeader {
+                block_len: recycled.block_len,
+                prefix: recycled.prefix,
+                capacity: capacity_u32,
+                initialized: 0,
+            };
+            // SAFETY: the exact pending extent was removed from the
+            // thread-local collector after all layout checks succeeded.
+            unsafe { header_ptr(state, recycled.data_offset.get()).write(header) };
+            return Ok(Self {
+                offset: NonZeroOffset(recycled.data_offset),
+                marker: PhantomData,
+            });
+        } else {
+            debug_assert_ne!(lookup, PendingLookup::Recycled);
+            record_pending_lookup(lookup, 0);
+        }
+        let mut allocator = lock(state)?;
         let (data_offset, prefix, block_len) =
             allocate_block(state, &mut allocator, needed, alignment)?;
-        let offset = data_offset;
+        let offset = core::num::NonZeroU32::new(data_offset)
+            .expect("cage allocations include a nonzero header and payload offset");
         let header = AllocationHeader {
             block_len,
             prefix,
@@ -651,8 +903,7 @@ impl<T: CompactValue> CageAllocation<T> {
             initialized: 0,
         };
         // SAFETY: `allocate_block` reserves this aligned header and data range.
-        unsafe { header_ptr(state, offset).write(header) };
-        let offset = core::num::NonZeroU32::new(offset).ok_or(Error::InvalidOffset)?;
+        unsafe { header_ptr(state, offset.get()).write(header) };
         Ok(Self {
             offset: NonZeroOffset(offset),
             marker: PhantomData,
@@ -1124,6 +1375,66 @@ fn lock(state: &CageState) -> Result<AllocatorTransaction<'_>> {
     };
     Ok(AllocatorTransaction { state, allocator })
 }
+
+fn take_pending_reuse(
+    state: &CageState,
+    bytes: usize,
+    alignment: usize,
+) -> (PendingLookup, Option<RecycledExtent>) {
+    if !ENABLE_PENDING_REUSE {
+        let _ = (state, bytes, alignment);
+        (PendingLookup::Disabled, None)
+    } else {
+        ACTIVE_RELEASE_COLLECTOR.with(|active| {
+            let collector = active.get();
+            if collector.is_null() {
+                return (PendingLookup::NoCollector, None);
+            }
+            // SAFETY: this pointer is installed only while its stack-local
+            // collector is alive on this thread, and this closure runs on the
+            // same thread before any collector flush can occur.
+            unsafe { (*collector).take_compatible(state.base(), bytes, alignment) }
+        })
+    }
+}
+
+fn record_pending_lookup(lookup: PendingLookup, block_len: u32) {
+    #[cfg(feature = "allocator-telemetry")]
+    match lookup {
+        PendingLookup::Disabled => {}
+        PendingLookup::NoCollector => {
+            PENDING_REUSE_TELEMETRY
+                .misses
+                .fetch_add(1, Ordering::Relaxed);
+            PENDING_REUSE_TELEMETRY
+                .no_active_collector
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        PendingLookup::NoExactBlock {
+            alignment_incompatible,
+        } => {
+            PENDING_REUSE_TELEMETRY
+                .misses
+                .fetch_add(1, Ordering::Relaxed);
+            PENDING_REUSE_TELEMETRY
+                .no_exact_block
+                .fetch_add(1, Ordering::Relaxed);
+            if alignment_incompatible {
+                PENDING_REUSE_TELEMETRY
+                    .alignment_incompatible
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        PendingLookup::Recycled => {
+            PENDING_REUSE_TELEMETRY.hits.fetch_add(1, Ordering::Relaxed);
+            let bucket = ((block_len as usize) / 8).min(BLOCK_SIZE_BUCKETS - 1);
+            PENDING_ALLOCATION_SIZE_HISTOGRAM[bucket].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "allocator-telemetry"))]
+    let _ = (lookup, block_len);
+}
+
 fn block_layout(
     base: *mut u8,
     start: u32,
@@ -1258,7 +1569,6 @@ fn allocate_block(
     // With the cage base, starts, and header aligned to eight bytes, requests
     // up to that alignment have a position-independent block length. Probe
     // only that exact class; wider alignments still need to check every class.
-    #[cfg(feature = "allocator-telemetry")]
     let candidate_class = if alignment <= 8 {
         let block_len = required_bytes
             .checked_add(size_of::<AllocationHeader>() as u32 + 7)
@@ -1268,23 +1578,12 @@ fn allocate_block(
     } else {
         None
     };
-    #[cfg(not(feature = "allocator-telemetry"))]
-    let candidate_class = if alignment <= 8 && allocator.has_size_class_cache {
-        let block_len = required_bytes
-            .checked_add(size_of::<AllocationHeader>() as u32 + 7)
-            .ok_or(Error::OffsetOverflow)?
-            & !7;
-        size_class_index(block_len)
-    } else {
-        None
-    };
-    let matching_class = allocator
-        .has_size_class_cache
+    let matching_class = (ENABLE_SIZE_CLASS_CACHE && allocator.has_size_class_cache)
         .then_some(candidate_class)
         .flatten();
     #[cfg(feature = "allocator-telemetry")]
-    let class_eligible = if alignment <= 8 {
-        candidate_class.is_some()
+    let class_metric_index = if let Some(index) = candidate_class {
+        Some(index)
     } else {
         size_class_index(
             block_layout(
@@ -1295,13 +1594,20 @@ fn allocate_block(
             )?
             .2,
         )
-        .is_some()
     };
-    let class_range = match matching_class {
-        Some(index) => index..index + 1,
-        None if alignment > 8 && allocator.has_size_class_cache => 0..SIZE_CLASSES.len(),
-        None => 0..0,
+    #[cfg(feature = "allocator-telemetry")]
+    let minimum_block_len = required_bytes
+        .checked_add(size_of::<AllocationHeader>() as u32 + 7)
+        .map(|raw| raw & !7);
+    let class_range = match (ENABLE_SIZE_CLASS_CACHE, matching_class) {
+        (true, Some(index)) => index..index + 1,
+        (true, None) if alignment > 8 && allocator.has_size_class_cache => 0..SIZE_CLASSES.len(),
+        (false, _) | (true, None) => 0..0,
     };
+    #[cfg(feature = "allocator-telemetry")]
+    let class_range_is_empty = class_range.is_empty();
+    #[cfg(feature = "allocator-telemetry")]
+    let mut class_alignment_incompatible = [false; SIZE_CLASS_COUNT];
     for class_index in class_range {
         let class_size = SIZE_CLASSES[class_index];
         let mut current = allocator.size_class_heads[class_index];
@@ -1317,6 +1623,10 @@ fn allocate_block(
             }
             let (data, prefix, required_len) =
                 block_layout(state.base(), current, required_bytes as usize, alignment)?;
+            #[cfg(feature = "allocator-telemetry")]
+            if minimum_block_len == Some(node.len) && required_len > node.len {
+                class_alignment_incompatible[class_index] = true;
+            }
             if required_len == node.len {
                 let live_bytes = allocator
                     .live_bytes
@@ -1330,16 +1640,48 @@ fn allocate_block(
                 #[cfg(feature = "allocator-telemetry")]
                 {
                     allocator.size_class_hits = allocator.size_class_hits.saturating_add(1);
+                    allocator.global_class_hits[class_index] =
+                        allocator.global_class_hits[class_index].saturating_add(1);
                 }
                 record_allocation_size(allocator, node.len);
                 return Ok((data, prefix, node.len));
             }
             current = node.next;
         }
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.global_class_misses[class_index] =
+                allocator.global_class_misses[class_index].saturating_add(1);
+            if allocator.size_class_heads[class_index] == 0 {
+                allocator.global_class_empty[class_index] =
+                    allocator.global_class_empty[class_index].saturating_add(1);
+            }
+            if class_alignment_incompatible[class_index] {
+                allocator.global_class_alignment_incompatible[class_index] =
+                    allocator.global_class_alignment_incompatible[class_index].saturating_add(1);
+            }
+        }
     }
     #[cfg(feature = "allocator-telemetry")]
-    if class_eligible {
-        allocator.size_class_misses = allocator.size_class_misses.saturating_add(1);
+    {
+        if ENABLE_SIZE_CLASS_CACHE {
+            if let Some(class_index) = class_metric_index {
+                allocator.size_class_misses = allocator.size_class_misses.saturating_add(1);
+                if class_range_is_empty {
+                    allocator.global_class_misses[class_index] =
+                        allocator.global_class_misses[class_index].saturating_add(1);
+                    if allocator.size_class_heads[class_index] == 0 {
+                        allocator.global_class_empty[class_index] =
+                            allocator.global_class_empty[class_index].saturating_add(1);
+                    }
+                }
+            } else {
+                allocator.requested_size_no_class =
+                    allocator.requested_size_no_class.saturating_add(1);
+            }
+        } else if class_metric_index.is_none() {
+            allocator.requested_size_no_class = allocator.requested_size_no_class.saturating_add(1);
+        }
     }
 
     let mut previous = 0;
@@ -1389,6 +1731,11 @@ fn allocate_block(
                 unsafe { write_free_node(state, previous, previous_node) };
             }
             allocator.live_bytes = live_bytes;
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                allocator.general_list_fallbacks =
+                    allocator.general_list_fallbacks.saturating_add(1);
+            }
             record_allocation_size(allocator, allocated_len);
             return Ok((data, prefix, allocated_len));
         }
@@ -1409,6 +1756,10 @@ fn allocate_block(
         .ok_or(Error::OffsetOverflow)?;
     allocator.cursor = end;
     allocator.live_bytes = live_bytes;
+    #[cfg(feature = "allocator-telemetry")]
+    {
+        allocator.cursor_fallbacks = allocator.cursor_fallbacks.saturating_add(1);
+    }
     record_allocation_size(allocator, len);
     Ok((data, prefix, len))
 }
@@ -1751,6 +2102,11 @@ fn release_many_locked(
     if extents.len() > RELEASE_BATCH_CAPACITY {
         return Err(Error::InvalidOffset);
     }
+    #[cfg(feature = "allocator-telemetry")]
+    let released_exact_size_count = extents
+        .iter()
+        .filter(|extent| size_class_index(extent.len).is_some())
+        .count() as u64;
 
     // Nested owners are often allocated as one tail run and then dropped
     // together. If no earlier holes exist, validate that run and contract it
@@ -1792,6 +2148,23 @@ fn release_many_locked(
             allocator.cursor = extents[0].start;
             #[cfg(feature = "allocator-telemetry")]
             {
+                allocator.released_exact_size_extents = allocator
+                    .released_exact_size_extents
+                    .saturating_add(released_exact_size_count);
+                for (index, extent) in extents.iter().copied().enumerate() {
+                    if size_class_index(extent.len).is_some()
+                        && ((index > 0
+                            && extents[index - 1].start.checked_add(extents[index - 1].len)
+                                == Some(extent.start))
+                            || (index + 1 < extents.len()
+                                && extent.start.checked_add(extent.len)
+                                    == Some(extents[index + 1].start)))
+                    {
+                        allocator.exact_size_extents_coalesced_before_cache = allocator
+                            .exact_size_extents_coalesced_before_cache
+                            .saturating_add(1);
+                    }
+                }
                 allocator.release_batches = allocator.release_batches.saturating_add(1);
                 allocator.released_extents = allocator
                     .released_extents
@@ -1821,6 +2194,9 @@ fn release_many_locked(
         allocator.live_bytes = new_live_bytes;
         #[cfg(feature = "allocator-telemetry")]
         {
+            allocator.released_exact_size_extents = allocator
+                .released_exact_size_extents
+                .saturating_add(released_exact_size_count);
             allocator.release_batches = allocator.release_batches.saturating_add(1);
             allocator.released_extents = allocator.released_extents.saturating_add(1);
             allocator.max_release_batch = allocator.max_release_batch.max(1);
@@ -1966,6 +2342,10 @@ fn release_many_locked(
     let mut last_end = 0_u32;
     let mut last_general_previous = 0_u32;
     let mut last_class = None;
+    #[cfg(feature = "allocator-telemetry")]
+    let mut cached_exact_size_count = 0_u64;
+    #[cfg(feature = "allocator-telemetry")]
+    let mut coalesced_exact_size_count = 0_u64;
     while general_current != 0 || released_index < merged_len {
         let (mut run, _from_general) = next_merge_extent(
             state,
@@ -2029,6 +2409,28 @@ fn release_many_locked(
             .then(|| size_class_index(run.len))
             .flatten()
             .filter(|index| allocator.size_class_counts[*index] < SIZE_CLASS_CACHE_CAPACITY);
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            for released in extents.iter().copied() {
+                if size_class_index(released.len).is_some()
+                    && released.start >= run_start
+                    && released
+                        .start
+                        .checked_add(released.len)
+                        .is_some_and(|end| end <= run_end)
+                    && released.len < run.len
+                {
+                    coalesced_exact_size_count = coalesced_exact_size_count.saturating_add(1);
+                }
+            }
+            if class_index.is_some()
+                && extents
+                    .iter()
+                    .any(|released| released.start == run_start && released.len == run.len)
+            {
+                cached_exact_size_count = cached_exact_size_count.saturating_add(1);
+            }
+        }
         if let Some(index) = class_index {
             unsafe {
                 write_free_node(
@@ -2096,6 +2498,15 @@ fn release_many_locked(
 
     #[cfg(feature = "allocator-telemetry")]
     {
+        allocator.released_exact_size_extents = allocator
+            .released_exact_size_extents
+            .saturating_add(released_exact_size_count);
+        allocator.exact_size_extents_cached = allocator
+            .exact_size_extents_cached
+            .saturating_add(cached_exact_size_count);
+        allocator.exact_size_extents_coalesced_before_cache = allocator
+            .exact_size_extents_coalesced_before_cache
+            .saturating_add(coalesced_exact_size_count);
         allocator.free_list_nodes_visited =
             allocator.free_list_nodes_visited.saturating_add(visited);
         if !extents.is_empty() {
@@ -2255,6 +2666,7 @@ fn validate_allocator(state: &CageState, allocator: &Allocator) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn local_allocate(state: &CageState, allocator: &mut Allocator, bytes: usize) -> ReleaseExtent {
         let (data, prefix, len) = allocate_block(state, allocator, bytes, 8).unwrap();
@@ -2265,7 +2677,70 @@ mod tests {
     }
 
     fn local_release(state: &CageState, allocator: &mut Allocator, extents: &mut [ReleaseExtent]) {
-        release_many_locked(state, allocator, extents, true).unwrap();
+        release_many_locked(state, allocator, extents, ENABLE_SIZE_CLASS_CACHE).unwrap();
+    }
+
+    fn local_flush(state: &CageState, collector: &mut ReleaseCollector) {
+        let mut allocator = lock(state).unwrap();
+        collector.flush_with(|extents| {
+            release_many_locked(state, &mut allocator, extents, ENABLE_SIZE_CLASS_CACHE)
+        });
+    }
+
+    fn allocator_free_extents(state: &CageState, allocator: &Allocator) -> Vec<ReleaseExtent> {
+        let mut extents = Vec::new();
+        let mut current = allocator.free_head;
+        while current != 0 {
+            let node = unsafe { read_free_node(state, current).unwrap() };
+            extents.push(ReleaseExtent {
+                start: current,
+                len: node.len,
+            });
+            current = node.next;
+        }
+        for class_head in allocator.size_class_heads {
+            let mut current = class_head;
+            while current != 0 {
+                let node = unsafe { read_free_node(state, current).unwrap() };
+                extents.push(ReleaseExtent {
+                    start: current,
+                    len: node.len,
+                });
+                current = node.next;
+            }
+        }
+        extents
+    }
+
+    fn assert_pending_partition(
+        state: &CageState,
+        allocator: &Allocator,
+        collector: &ReleaseCollector,
+        live: &[ReleaseExtent],
+        pending: &[ReleaseExtent],
+    ) {
+        assert_eq!(collector.len, pending.len());
+        assert_eq!(&collector.extents[..collector.len], pending);
+        let mut all = live.to_vec();
+        all.extend_from_slice(pending);
+        let free = allocator_free_extents(state, allocator);
+        all.extend(free.iter().copied());
+        all.sort_unstable_by_key(|extent| extent.start);
+        for adjacent in all.windows(2) {
+            assert!(adjacent[0].start + adjacent[0].len <= adjacent[1].start);
+        }
+        let modeled_live = live
+            .iter()
+            .chain(pending)
+            .map(|extent| extent.len)
+            .sum::<u32>();
+        let modeled_free = free.iter().map(|extent| extent.len).sum::<u32>();
+        assert_eq!(allocator.live_bytes, modeled_live);
+        assert_eq!(
+            modeled_live + modeled_free,
+            allocator.cursor - INITIAL_CURSOR
+        );
+        validate_allocator(state, allocator).unwrap();
     }
 
     fn local_state(capacity: usize) -> CageState {
@@ -2298,7 +2773,289 @@ mod tests {
                 size_class_hits: 0,
                 #[cfg(feature = "allocator-telemetry")]
                 size_class_misses: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                global_class_hits: [0; SIZE_CLASS_COUNT],
+                #[cfg(feature = "allocator-telemetry")]
+                global_class_misses: [0; SIZE_CLASS_COUNT],
+                #[cfg(feature = "allocator-telemetry")]
+                global_class_empty: [0; SIZE_CLASS_COUNT],
+                #[cfg(feature = "allocator-telemetry")]
+                global_class_alignment_incompatible: [0; SIZE_CLASS_COUNT],
+                #[cfg(feature = "allocator-telemetry")]
+                requested_size_no_class: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                general_list_fallbacks: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                cursor_fallbacks: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                released_exact_size_extents: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                exact_size_extents_cached: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                exact_size_extents_coalesced_before_cache: 0,
             }),
+        }
+    }
+
+    #[test]
+    fn pending_exact_reuse_preserves_live_accounting_and_compacts_middle() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let first_filler = local_allocate(&state, &mut allocator, 8);
+        let middle = local_allocate(&state, &mut allocator, 24);
+        let last_filler = local_allocate(&state, &mut allocator, 8);
+        let live_before = allocator.live_bytes;
+        drop(allocator);
+
+        let mut collector = ReleaseCollector::new();
+        for extent in [first_filler, middle, last_filler] {
+            collector.push(extent);
+        }
+        let original_order = collector.extents[..collector.len].to_vec();
+        let (lookup, recycled) = collector.take_compatible(state.base(), 24, 8);
+        let recycled = recycled.expect("middle block has the exact requested size");
+        assert_eq!(lookup, PendingLookup::Recycled);
+        assert_eq!(recycled.data_offset.get(), middle.start + 16);
+        assert_eq!(collector.len, 2);
+        assert_eq!(collector.extents[0], original_order[0]);
+        assert_eq!(collector.extents[1], original_order[2]);
+        let allocator = lock(&state).unwrap();
+        assert_eq!(allocator.live_bytes, live_before);
+        drop(allocator);
+        let pending = collector.extents[..collector.len].to_vec();
+        assert_pending_partition(
+            &state,
+            &lock(&state).unwrap(),
+            &collector,
+            &[middle],
+            &pending,
+        );
+
+        local_flush(&state, &mut collector);
+        assert_eq!(collector.len, 0);
+        let mut allocator = lock(&state).unwrap();
+        assert_eq!(allocator.live_bytes, middle.len);
+        let mut recycled_as_live = [middle];
+        local_release(&state, &mut allocator, &mut recycled_as_live);
+        assert_eq!(allocator.live_bytes, 0);
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn pending_reuse_prefers_most_recent_matching_extent() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let older = local_allocate(&state, &mut allocator, 24);
+        let filler = local_allocate(&state, &mut allocator, 8);
+        let newer = local_allocate(&state, &mut allocator, 24);
+        drop(allocator);
+        let mut collector = ReleaseCollector::new();
+        for extent in [older, filler, newer] {
+            collector.push(extent);
+        }
+
+        let (_, first_reuse) = collector.take_compatible(state.base(), 24, 8);
+        assert_eq!(first_reuse.unwrap().data_offset.get(), newer.start + 16);
+        let (_, second_reuse) = collector.take_compatible(state.base(), 24, 8);
+        assert_eq!(second_reuse.unwrap().data_offset.get(), older.start + 16);
+        assert_eq!(collector.len, 1);
+        assert_eq!(collector.extents[0], filler);
+    }
+
+    #[test]
+    fn pending_reuse_reports_size_and_alignment_misses() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let wrong_size = local_allocate(&state, &mut allocator, 24);
+        let mut alignment_candidate = None;
+        for _ in 0..8 {
+            let extent = local_allocate(&state, &mut allocator, 8);
+            let aligned_len = block_layout(state.base(), extent.start, 8, 64).unwrap().2;
+            if aligned_len > extent.len {
+                alignment_candidate = Some(extent);
+                break;
+            }
+        }
+        let alignment_candidate = alignment_candidate
+            .expect("one of the consecutive blocks needs extra 64-byte alignment padding");
+        drop(allocator);
+
+        let mut collector = ReleaseCollector::new();
+        collector.push(wrong_size);
+        let (wrong_size_lookup, wrong_size_recycled) =
+            collector.take_compatible(state.base(), 8, 8);
+        assert!(wrong_size_recycled.is_none());
+        assert_eq!(
+            wrong_size_lookup,
+            PendingLookup::NoExactBlock {
+                alignment_incompatible: false
+            }
+        );
+        collector.push(alignment_candidate);
+        let (alignment_lookup, alignment_recycled) = collector.take_compatible(state.base(), 8, 64);
+        assert!(alignment_recycled.is_none());
+        assert_eq!(
+            alignment_lookup,
+            PendingLookup::NoExactBlock {
+                alignment_incompatible: true
+            }
+        );
+        assert_eq!(collector.len, 2);
+    }
+
+    #[cfg(all(
+        feature = "allocator-telemetry",
+        any(feature = "benchmark-allocator-a", feature = "benchmark-allocator-c")
+    ))]
+    #[test]
+    fn global_class_telemetry_separates_alignment_misses() {
+        let state = local_state(16 * 1024);
+        let mut allocator = lock(&state).unwrap();
+        let mut alignment_misses = Vec::new();
+        for _ in 0..16 {
+            let extent = local_allocate(&state, &mut allocator, 16);
+            if block_layout(state.base(), extent.start, 16, 64).unwrap().2 > extent.len {
+                alignment_misses.push(extent);
+            }
+        }
+        assert!(alignment_misses.len() >= 2);
+        let first = alignment_misses[0];
+        let second = *alignment_misses
+            .iter()
+            .find(|extent| extent.start > first.start + first.len)
+            .expect("separated cached candidates avoid coalescing");
+        let mut release = [first, second];
+        local_release(&state, &mut allocator, &mut release);
+        assert_eq!(allocator.size_class_counts[0], 2);
+        let alignment_before = allocator.global_class_alignment_incompatible[0];
+
+        let _ = allocate_block(&state, &mut allocator, 16, 64).unwrap();
+
+        assert_eq!(
+            allocator.global_class_alignment_incompatible[0],
+            alignment_before + 1
+        );
+        assert!(allocator.global_class_misses[0] > 0);
+        assert!(allocator.global_class_empty[1..]
+            .iter()
+            .all(|count| *count > 0));
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn full_pending_collector_accepts_64_and_flushes_remaining_exactly_once() {
+        let state = local_state(8192);
+        let mut allocator = lock(&state).unwrap();
+        let extents = (0..RELEASE_BATCH_CAPACITY)
+            .map(|_| local_allocate(&state, &mut allocator, 16))
+            .collect::<Vec<_>>();
+        drop(allocator);
+        let mut collector = ReleaseCollector::new();
+        for extent in &extents {
+            collector.push(*extent);
+        }
+        assert_eq!(collector.len, RELEASE_BATCH_CAPACITY);
+        let (lookup, recycled) = collector.take_compatible(state.base(), 16, 8);
+        assert_eq!(lookup, PendingLookup::Recycled);
+        assert_eq!(
+            recycled.unwrap().data_offset.get(),
+            extents.last().unwrap().start + 16
+        );
+        let pending = collector.extents[..collector.len].to_vec();
+        assert_pending_partition(
+            &state,
+            &lock(&state).unwrap(),
+            &collector,
+            &[*extents.last().unwrap()],
+            &pending,
+        );
+        local_flush(&state, &mut collector);
+        let mut allocator = lock(&state).unwrap();
+        let mut recycled_live = [*extents.last().unwrap()];
+        local_release(&state, &mut allocator, &mut recycled_live);
+        assert_eq!(allocator.live_bytes, 0);
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+
+        #[test]
+        fn pending_global_allocator_model(operations in prop::collection::vec((0_u8..3, 0_u8..6), 1..240)) {
+            let state = local_state(1 << 20);
+            let mut allocator = lock(&state).unwrap();
+            let mut collector = ReleaseCollector::new();
+            let mut live = Vec::<ReleaseExtent>::new();
+            let mut pending = Vec::<ReleaseExtent>::new();
+            let sizes = [8_usize, 16, 24, 32, 80, 512];
+
+            for (operation, size_index) in operations {
+                match operation {
+                    0 => {
+                        let bytes = sizes[size_index as usize];
+                        drop(allocator);
+                        let (lookup, recycled) = collector.take_compatible(state.base(), bytes, 8);
+                        if let Some(recycled) = recycled {
+                            prop_assert_eq!(lookup, PendingLookup::Recycled);
+                            let extent = ReleaseExtent {
+                                start: recycled.data_offset.get()
+                                    - size_of::<AllocationHeader>() as u32
+                                    - recycled.prefix,
+                                len: recycled.block_len,
+                            };
+                            let pending_index = pending.iter().position(|candidate| *candidate == extent)
+                                .expect("recycled extent exists in pending category");
+                            pending.remove(pending_index);
+                            live.push(extent);
+                        } else {
+                            let mut guard = lock(&state).unwrap();
+                            let (data, prefix, len) = allocate_block(&state, &mut guard, bytes, 8).unwrap();
+                            live.push(ReleaseExtent {
+                                start: data - size_of::<AllocationHeader>() as u32 - prefix,
+                                len,
+                            });
+                        }
+                        allocator = lock(&state).unwrap();
+                    }
+                    1 => {
+                        if !live.is_empty() {
+                            if collector.len == RELEASE_BATCH_CAPACITY {
+                                drop(allocator);
+                                local_flush(&state, &mut collector);
+                                pending.clear();
+                                allocator = lock(&state).unwrap();
+                            }
+                            let index = (size_index as usize) % live.len();
+                            let extent = live.swap_remove(index);
+                            collector.push(extent);
+                            pending.push(extent);
+                        }
+                    }
+                    _ => {
+                        drop(allocator);
+                        local_flush(&state, &mut collector);
+                        pending.clear();
+                        allocator = lock(&state).unwrap();
+                    }
+                }
+                assert_pending_partition(&state, &allocator, &collector, &live, &pending);
+            }
+
+            drop(allocator);
+            local_flush(&state, &mut collector);
+            pending.clear();
+            let mut allocator = lock(&state).unwrap();
+            let mut batch = core::mem::take(&mut live);
+            while !batch.is_empty() {
+                let take = batch.len().min(RELEASE_BATCH_CAPACITY);
+                let mut chunk = batch.split_off(batch.len() - take);
+                local_release(&state, &mut allocator, &mut chunk);
+            }
+            assert_eq!(allocator.live_bytes, 0);
+            assert_eq!(allocator.cursor, INITIAL_CURSOR);
+            validate_allocator(&state, &allocator).unwrap();
         }
     }
 
@@ -2353,6 +3110,7 @@ mod tests {
         validate_allocator(&state, &allocator).unwrap();
     }
 
+    #[cfg(any(feature = "benchmark-allocator-a", feature = "benchmark-allocator-c"))]
     #[test]
     fn batch_release_reuses_classes_merges_neighbors_and_contracts_tail() {
         let state = local_state(4096);
@@ -2400,6 +3158,7 @@ mod tests {
         validate_allocator(&state, &allocator).unwrap();
     }
 
+    #[cfg(any(feature = "benchmark-allocator-a", feature = "benchmark-allocator-c"))]
     #[test]
     fn class_neighbors_merge_into_general_ranges_on_release() {
         let state = local_state(4096);
@@ -2429,6 +3188,7 @@ mod tests {
         validate_allocator(&state, &allocator).unwrap();
     }
 
+    #[cfg(any(feature = "benchmark-allocator-a", feature = "benchmark-allocator-c"))]
     #[test]
     fn resize_merge_exposes_cached_neighbor_to_ordered_free_list() {
         let state = local_state(4096);

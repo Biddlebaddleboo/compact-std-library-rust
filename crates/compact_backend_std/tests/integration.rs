@@ -4,6 +4,10 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 static DROPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PANIC_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const BENCHMARK_POLICY_A: bool = cfg!(feature = "benchmark-allocator-a")
+    && !cfg!(feature = "benchmark-allocator-b")
+    && !cfg!(feature = "benchmark-allocator-c");
 #[derive(Debug)]
 struct DropCount(u32);
 unsafe impl CompactValue for DropCount {}
@@ -11,6 +15,16 @@ impl Drop for DropCount {
     fn drop(&mut self) {
         let _ = self.0;
         DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct PanicOnce;
+unsafe impl CompactValue for PanicOnce {}
+impl Drop for PanicOnce {
+    fn drop(&mut self) {
+        if !PANIC_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            panic!("intentional one-time destructor panic for allocator test");
+        }
     }
 }
 
@@ -95,6 +109,93 @@ fn process_cage_owners_layout_drop_and_threaded_release() {
     barrier.wait();
     thread.join().unwrap();
     assert_eq!(DROPS.load(std::sync::atomic::Ordering::SeqCst), 2);
+    CompactRuntime::validate_allocator_state().unwrap();
+
+    let before_recycle = CompactRuntime::used_bytes().unwrap();
+    let mut old_header_owner = CompactRuntime::alloc_owned_slice::<u32>(6).unwrap();
+    old_header_owner.push(7).unwrap();
+    old_header_owner.push(9).unwrap();
+    let old_header_offset = old_header_owner.offset().as_u32();
+    let live_before_recycle = CompactRuntime::used_bytes().unwrap();
+    #[cfg(feature = "allocator-telemetry")]
+    let pending_hits_before_recycle = CompactRuntime::allocator_stats()
+        .unwrap()
+        .pending_reuse_hits;
+    let fresh_header_owner = CompactRuntime::with_batched_releases(|| {
+        CompactRuntime::with_batched_releases(|| drop(old_header_owner));
+        assert_eq!(CompactRuntime::used_bytes().unwrap(), live_before_recycle);
+        let fresh = CompactRuntime::alloc_owned_slice::<u64>(3).unwrap();
+        if BENCHMARK_POLICY_A {
+            assert_ne!(fresh.offset().as_u32(), old_header_offset);
+        } else {
+            assert_eq!(fresh.offset().as_u32(), old_header_offset);
+        }
+        assert_eq!(fresh.capacity(), 3);
+        assert_eq!(fresh.len(), 0);
+        if !BENCHMARK_POLICY_A {
+            assert_eq!(CompactRuntime::used_bytes().unwrap(), live_before_recycle);
+        }
+        fresh
+    });
+    #[cfg(feature = "allocator-telemetry")]
+    assert_eq!(
+        CompactRuntime::allocator_stats()
+            .unwrap()
+            .pending_reuse_hits,
+        pending_hits_before_recycle + (!BENCHMARK_POLICY_A) as u64
+    );
+    drop(fresh_header_owner);
+    assert_eq!(CompactRuntime::used_bytes().unwrap(), before_recycle);
+    CompactRuntime::validate_allocator_state().unwrap();
+
+    let cross_thread_owner = CompactRuntime::alloc_owned_slice::<u64>(3).unwrap();
+    let pending_offset = cross_thread_owner.offset().as_u32();
+    let pending_ready = Arc::new(Barrier::new(2));
+    let allocation_done = Arc::new(Barrier::new(2));
+    let worker_ready = pending_ready.clone();
+    let worker_done = allocation_done.clone();
+    let worker = thread::spawn(move || {
+        CompactRuntime::with_batched_releases(|| {
+            drop(cross_thread_owner);
+            worker_ready.wait();
+            worker_done.wait();
+        });
+    });
+    pending_ready.wait();
+    let other_thread_owner = CompactRuntime::alloc_owned_slice::<u64>(3).unwrap();
+    assert_ne!(other_thread_owner.offset().as_u32(), pending_offset);
+    CompactRuntime::validate_allocator_state().unwrap();
+    allocation_done.wait();
+    worker.join().unwrap();
+    drop(other_thread_owner);
+    let globally_released_owner = CompactRuntime::alloc_owned_slice::<u64>(3).unwrap();
+    assert_eq!(globally_released_owner.offset().as_u32(), pending_offset);
+    drop(globally_released_owner);
+    CompactRuntime::validate_allocator_state().unwrap();
+
+    PANIC_ONCE.store(false, std::sync::atomic::Ordering::SeqCst);
+    let before_panic_batch = CompactRuntime::used_bytes().unwrap();
+    let mut panic_owner = CompactRuntime::alloc_owned_slice::<PanicOnce>(1).unwrap();
+    panic_owner.push(PanicOnce).unwrap();
+    let panic_offset = panic_owner.offset().as_u32();
+    CompactRuntime::with_batched_releases(|| {
+        CompactRuntime::with_batched_releases(|| {
+            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(panic_owner);
+            }));
+            assert!(panic_result.is_err());
+        });
+        let mut replacement = CompactRuntime::alloc_owned_slice::<PanicOnce>(1).unwrap();
+        if BENCHMARK_POLICY_A {
+            assert_ne!(replacement.offset().as_u32(), panic_offset);
+        } else {
+            assert_eq!(replacement.offset().as_u32(), panic_offset);
+        }
+        assert_eq!(replacement.len(), 0);
+        replacement.push(PanicOnce).unwrap();
+        drop(replacement);
+    });
+    assert_eq!(CompactRuntime::used_bytes().unwrap(), before_panic_batch);
     CompactRuntime::validate_allocator_state().unwrap();
 
     thread::scope(|scope| {

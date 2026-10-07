@@ -40,6 +40,7 @@ name = "compact_backend_std"
 version = "2.4.0"
 dependencies = [
  "compact_core",
+ "proptest",
 ]
 
 [[package]]

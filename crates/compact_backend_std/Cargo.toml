@@ -10,6 +10,15 @@ categories = ["memory-management"]
 
 [features]
 allocator-telemetry = []
+# Policy matrix: A=classes on/pending off, B=pending on/classes off,
+# C=pending on/classes on. No policy flag selects the optimized B default;
+# when multiple flags are set, C wins.
+benchmark-allocator-a = []
+benchmark-allocator-b = []
+benchmark-allocator-c = []
 
 [dependencies]
 compact_core = { version = "2.4.0", path = "../compact_core" }
+
+[dev-dependencies]
+proptest = "=1.6.0"
