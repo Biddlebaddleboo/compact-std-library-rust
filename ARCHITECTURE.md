@@ -1,7 +1,7 @@
 # Architecture
 
-This document describes the current V2.1.0 architecture. V2.1.0 is the only
-supported contract.
+This document describes the current V2.2.0 architecture. The documented
+V2.1.0 source surface remains the frozen compatibility baseline for 2.x.
 
 ## Addressing
 
@@ -271,7 +271,8 @@ Ambiguity is diagnosed rather than guessed.
 
 Arena ownership is intentionally single-threaded. The runtime does not install
 a global or thread-local current arena and does not use cross-thread ownership
-as part of the V2.1.0 contract.
+for mutable arena values. Frozen arenas provide the immutable sharing boundary
+added in V2.2.0.
 
 ## What may change within 2.x
 

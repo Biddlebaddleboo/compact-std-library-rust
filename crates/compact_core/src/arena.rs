@@ -30,11 +30,17 @@ where
         return Err(Error::BackingTooLarge);
     }
 
-    let (state, _) = ArenaState::place(region)?;
+    let region_pointer = NonNull::new(region.as_mut_ptr()).expect("validated backing is nonempty");
+    let capacity = region.len();
+    // SAFETY: StableBacking guarantees that this writable slice remains at a
+    // fixed address for the callback's backing borrow.
+    let (state, _) = unsafe { ArenaState::place(region_pointer.as_ptr(), capacity) }?;
     let mut arena = Arena {
-        region,
+        region: region_pointer,
+        capacity,
         state,
         drop_state: true,
+        backing: PhantomData,
         brand: PhantomData,
         not_send_sync: PhantomData,
     };
@@ -60,11 +66,17 @@ where
         return Err(Error::BackingTooLarge);
     }
 
-    let (state, _) = ArenaState::place_persistent(region)?;
+    let region_pointer = NonNull::new(region.as_mut_ptr()).expect("validated backing is nonempty");
+    let capacity = region.len();
+    // SAFETY: StableBacking guarantees that this writable slice remains at a
+    // fixed address for the callback's backing borrow.
+    let (state, _) = unsafe { ArenaState::place_persistent(region_pointer.as_ptr(), capacity) }?;
     let mut arena = Arena {
-        region,
+        region: region_pointer,
+        capacity,
         state,
         drop_state: false,
+        backing: PhantomData,
         brand: PhantomData,
         not_send_sync: PhantomData,
     };
@@ -99,11 +111,17 @@ where
 
     // SAFETY: the caller guarantees the bytes contain an initialized state
     // from this exact stable backing; attach checks its header and links.
-    let (state, _) = ArenaState::attach_persistent(region)?;
+    let region_pointer = NonNull::new(region.as_mut_ptr()).expect("validated backing is nonempty");
+    let capacity = region.len();
+    // SAFETY: inherited from this function's contract: the caller provides
+    // the original initialized backing and no concurrent attachment.
+    let (state, _) = unsafe { ArenaState::attach_persistent(region_pointer.as_ptr(), capacity) }?;
     let mut arena = Arena {
-        region,
+        region: region_pointer,
+        capacity,
         state,
         drop_state: false,
+        backing: PhantomData,
         brand: PhantomData,
         not_send_sync: PhantomData,
     };
@@ -116,12 +134,16 @@ where
 /// generative reference brand and the backing borrow; callers normally infer
 /// them and do not name them directly.
 ///
-/// V1 arenas are single-owner and neither `Send` nor `Sync`; packed word
+/// Mutable arenas are single-owner and neither `Send` nor `Sync`; packed word
 /// mutation is non-atomic.
 pub struct Arena<'arena, 'memory> {
-    region: &'memory mut [MaybeUninit<u8>],
+    // Keep the backing borrow in `backing`, but do not retain a wide mutable
+    // reference that aliases allocator state stored inside this region.
+    region: NonNull<MaybeUninit<u8>>,
+    capacity: usize,
     state: NonNull<ArenaState>,
     drop_state: bool,
+    backing: PhantomData<&'memory mut [MaybeUninit<u8>]>,
     brand: PhantomData<fn(&'arena mut ()) -> &'arena mut ()>,
     // Arenas are single-owner and intentionally do not imply thread-safe
     // access, even when the underlying byte allocation itself is Send/Sync.
@@ -141,7 +163,7 @@ impl Drop for Arena<'_, '_> {
 impl<'arena, 'memory> Arena<'arena, 'memory> {
     /// Return the backing capacity in bytes.
     pub fn capacity(&self) -> usize {
-        self.region.len()
+        self.capacity
     }
 
     /// Return the allocator high-water prefix, including state and alignment
@@ -155,6 +177,12 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
     pub fn remaining_bytes(&self) -> usize {
         // SAFETY: the state object remains in the backing for the arena scope.
         unsafe { self.state.as_ref() }.remaining_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_validate_allocator(&self, live_ranges: &[(usize, usize)]) -> Result<()> {
+        // SAFETY: the arena scope retains its initialized allocator state.
+        unsafe { self.state.as_ref() }.debug_validate_allocator(live_ranges)
     }
 
     /// Run a nested arena in a parent-owned allocation and release all of its
@@ -272,7 +300,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
             return Ok(crate::ByteRange32::empty());
         }
         let raw = self.allocate(bytes.len(), 1)?;
-        let destination = self.region.as_mut_ptr().cast::<u8>();
+        let destination = self.region.as_ptr().cast::<u8>();
         // SAFETY: allocate reserved this exact range, and the immutable source
         // cannot overlap the arena's exclusive backing borrow.
         unsafe {
@@ -294,7 +322,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
             return Ok(crate::ByteRange32::empty());
         }
         let raw = self.allocate(len, 1)?;
-        let destination = self.region.as_mut_ptr().cast::<u8>();
+        let destination = self.region.as_ptr().cast::<u8>();
         // SAFETY: allocate reserved `len` bytes and u8 accepts the all-zero
         // bit pattern. The exclusive arena borrow guarantees unique access.
         unsafe {
@@ -325,7 +353,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
             return Ok(&mut []);
         }
         let start = self.checked_range::<u8>(range.offset, range.len())?;
-        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
         // SAFETY: the descriptor validates the complete initialized byte
         // range and the exclusive arena borrow excludes all other references.
         Ok(unsafe { native::slice_mut(byte_ptr.add(start), range.len()) })
@@ -346,7 +374,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         byte_len: usize,
     ) -> Result<&'view mut [u8]> {
         let start = self.checked_range::<T>(offset.raw, byte_len)?;
-        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
         // SAFETY: the caller guarantees initialized bytes and preserves type
         // validity; checked_range proves arena extent/alignment and &mut self
         // guarantees exclusive access.
@@ -368,7 +396,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         }
         let source_start = self.checked_range::<u8>(source.offset, source.len())?;
         let destination_start = self.checked_range::<u8>(destination.offset, destination.len())?;
-        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
         // SAFETY: both ranges are checked initialized byte allocations. `copy`
         // permits overlap, and `&mut self` guarantees exclusive arena access.
         unsafe {
@@ -423,7 +451,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         }
         let byte_len = checked_slice_bytes::<T>(initialized_len)?;
         let start = self.checked_range::<MaybeUninit<T>>(allocation.offset.raw, byte_len)?;
-        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
         // SAFETY: the caller proves initialization and unique access; this
         // method proves extent/alignment and ties the result to `&mut self`.
         Ok(unsafe { native::slice_mut(byte_ptr.add(start).cast::<T>(), initialized_len) })
@@ -455,7 +483,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         let destination_start =
             self.checked_range::<MaybeUninit<T>>(destination.offset.raw, destination_len)?;
         if initialized_len != 0 {
-            let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+            let byte_ptr = self.region.as_ptr().cast::<u8>();
             // SAFETY: both ranges are checked and the source initialization is
             // guaranteed by the caller. `copy` supports overlap; Copy values
             // require no ownership transfer or destructor bookkeeping.
@@ -485,7 +513,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         }
         let byte_len = checked_slice_bytes::<T>(allocation.len())?;
         let start = self.checked_range::<MaybeUninit<T>>(allocation.offset.raw, byte_len)?;
-        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
         // SAFETY: the checked allocation includes `index`; MaybeUninit<T> has
         // the same size/alignment as T and writing it initializes that slot.
         unsafe {
@@ -510,7 +538,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         let byte_len = checked_slice_bytes::<T>(allocation.len())?;
         let start = self.checked_range::<MaybeUninit<T>>(allocation.offset.raw, byte_len)?;
         if !values.is_empty() {
-            let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+            let byte_ptr = self.region.as_ptr().cast::<u8>();
             // SAFETY: the destination has room for the source prefix, the
             // source is initialized, and arena storage is exclusively borrowed.
             unsafe {
@@ -555,7 +583,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         value: T,
     ) -> Result<Offset32<'arena, T>> {
         let start = self.checked_range::<MaybeUninit<T>>(offset.raw, size_of::<T>())?;
-        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
         // SAFETY: checked_range proved the complete reserved range is inside
         // the backing and correctly aligned. `&mut self` gives exclusive
         // access, `T: Copy` has no destructor, and the backing remains stable
@@ -573,7 +601,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         let byte_len = checked_slice_bytes::<T>(values.len())?;
         let raw = self.allocate(byte_len, align_of::<T>())?;
         if !values.is_empty() {
-            let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+            let byte_ptr = self.region.as_ptr().cast::<u8>();
             // SAFETY: allocate reserved byte_len bytes at a T-aligned address;
             // the source is a valid initialized slice, the destination is
             // exclusively borrowed, and Copy values need no drop tracking.
@@ -611,7 +639,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         let byte_len = checked_slice_bytes::<T>(values.len())?;
         let start = self.checked_range::<MaybeUninit<T>>(offset.offset.raw, byte_len)?;
         if !values.is_empty() {
-            let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+            let byte_ptr = self.region.as_ptr().cast::<u8>();
             // SAFETY: checked_range proved the destination covers the complete
             // slice and is aligned. `&mut self` guarantees exclusivity; the
             // source has `values.len()` initialized Copy elements; and the
@@ -648,7 +676,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         offset: Offset32<'arena, T>,
     ) -> Result<&'view mut T> {
         let start = self.checked_range::<T>(offset.raw, size_of::<T>())?;
-        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
         // SAFETY: checked_range established bounds and alignment. The offset
         // identifies one allocation from this arena; `&mut self` excludes all
         // other arena borrows, and the reference cannot outlive that borrow.
@@ -680,7 +708,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         let len = allocation.len();
         let byte_len = checked_slice_bytes::<T>(len)?;
         let start = self.checked_range::<T>(allocation.offset.raw, byte_len)?;
-        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
         // SAFETY: checked_range established bounds, alignment, and allocation
         // size. The offset/length originate from one arena allocation and
         // `&mut self` gives exclusive access for the returned borrow.
@@ -701,7 +729,7 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         let end = start
             .checked_add(byte_len.max(1))
             .ok_or(Error::OffsetOverflow)?;
-        if end > self.used_bytes() || end > self.region.len() {
+        if end > self.used_bytes() || end > self.capacity {
             return Err(Error::OutOfBounds);
         }
         if allocation::is_free(self.state, start, end) {

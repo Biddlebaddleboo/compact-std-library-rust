@@ -1,5 +1,6 @@
 use core::mem::{align_of, MaybeUninit};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::format;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
@@ -36,10 +37,229 @@ fn offsets_are_four_bytes_for_representative_types() {
 }
 
 #[test]
+fn seeded_allocator_operations_match_a_reference_model() {
+    const SEED: u64 = 0x7A91_3D52_C4E8_0B6F;
+    const CAPACITY: usize = 32 * 1024;
+    let operation_count = if cfg!(miri) { 128 } else { 1_500 };
+
+    struct ModelAllocation {
+        values: std::vec::Vec<u8>,
+        capacity: usize,
+    }
+
+    struct SeededRng(u64);
+
+    impl SeededRng {
+        fn next(&mut self) -> u64 {
+            let mut value = self.0;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.0 = value;
+            value
+        }
+    }
+
+    let mut backing = TestBacking::new(CAPACITY);
+    with_arena(&mut backing, |arena| {
+        let mut rng = SeededRng(SEED);
+        let mut owners: std::vec::Vec<Option<crate::ArenaAllocation<'_, u8>>> =
+            std::vec::Vec::new();
+        let mut model: std::vec::Vec<Option<ModelAllocation>> = std::vec::Vec::new();
+        let mut trace = std::vec::Vec::new();
+
+        for step in 0..operation_count {
+            let operation = (rng.next() % 6) as u8;
+            if operation == 0 {
+                let index = owners
+                    .iter()
+                    .position(Option::is_none)
+                    .unwrap_or(owners.len());
+                if index == owners.len() {
+                    owners.push(None);
+                    model.push(None);
+                }
+                let capacity = 1 + (rng.next() % 32) as usize;
+                let len = (rng.next() as usize) % (capacity + 1);
+                let first = rng.next() as u8;
+                trace.push(format!(
+                    "{step}: allocate slot={index} cap={capacity} len={len}"
+                ));
+                if let Ok(mut allocation) = arena.alloc_owned_slice::<u8>(capacity) {
+                    let mut values = std::vec::Vec::with_capacity(len);
+                    for offset in 0..len {
+                        let value = first.wrapping_add((offset as u8).wrapping_mul(29));
+                        allocation.push(value).unwrap();
+                        values.push(value);
+                    }
+                    owners[index] = Some(allocation);
+                    model[index] = Some(ModelAllocation { values, capacity });
+                }
+            } else if !owners.is_empty() {
+                let index = (rng.next() as usize) % owners.len();
+                match operation {
+                    1 => {
+                        trace.push(format!("{step}: release slot={index}"));
+                        owners[index] = None;
+                        model[index] = None;
+                    }
+                    2 => {
+                        if let (Some(owner), Some(expected)) =
+                            (owners[index].as_mut(), model[index].as_mut())
+                        {
+                            let requested = expected.capacity + 1 + (rng.next() % 8) as usize;
+                            trace.push(format!("{step}: grow slot={index} cap={requested}"));
+                            if arena.try_resize_owned(owner, requested).unwrap() {
+                                expected.capacity = requested;
+                            }
+                        }
+                    }
+                    3 => {
+                        if let (Some(owner), Some(expected)) =
+                            (owners[index].as_mut(), model[index].as_mut())
+                        {
+                            let spare = expected.capacity - expected.values.len();
+                            let requested = expected.values.len()
+                                + if spare == 0 {
+                                    0
+                                } else {
+                                    (rng.next() as usize) % (spare + 1)
+                                };
+                            trace.push(format!("{step}: shrink slot={index} cap={requested}"));
+                            if arena.try_resize_owned(owner, requested).unwrap() {
+                                expected.capacity = requested;
+                            }
+                        }
+                    }
+                    4 => {
+                        if let (Some(owner), Some(expected)) =
+                            (owners[index].as_mut(), model[index].as_mut())
+                        {
+                            if !expected.values.is_empty() {
+                                let element = (rng.next() as usize) % expected.values.len();
+                                let value = rng.next() as u8;
+                                trace.push(format!(
+                                    "{step}: write slot={index} element={element} value={value}"
+                                ));
+                                *owner.get_mut(element).unwrap() = value;
+                                expected.values[element] = value;
+                            }
+                        }
+                    }
+                    _ => {
+                        trace.push(format!("{step}: verify slot={index}"));
+                    }
+                }
+            }
+
+            let mut live_ranges: std::vec::Vec<_> = owners
+                .iter()
+                .filter_map(|owner| {
+                    owner
+                        .as_ref()
+                        .map(crate::ArenaAllocation::debug_block_range)
+                })
+                .collect();
+            live_ranges.sort_unstable();
+            for pair in live_ranges.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0,
+                    "overlapping live blocks; seed={SEED:#x}; trace={trace:?}"
+                );
+            }
+            for (index, (owner, expected)) in owners.iter().zip(&model).enumerate() {
+                if let (Some(owner), Some(expected)) = (owner, expected) {
+                    assert_eq!(
+                        owner.len(),
+                        expected.values.len(),
+                        "seed={SEED:#x}; trace={trace:?}"
+                    );
+                    assert_eq!(
+                        owner.capacity(),
+                        expected.capacity,
+                        "seed={SEED:#x}; trace={trace:?}"
+                    );
+                    assert_eq!(
+                        owner.as_slice(),
+                        expected.values,
+                        "slot={index}; seed={SEED:#x}; trace={trace:?}"
+                    );
+                } else {
+                    assert!(
+                        owner.is_none() && expected.is_none(),
+                        "slot={index}; seed={SEED:#x}; trace={trace:?}"
+                    );
+                }
+            }
+            assert!(
+                arena.used_bytes() <= CAPACITY,
+                "cursor out of bounds; seed={SEED:#x}; trace={trace:?}"
+            );
+            assert!(
+                arena.debug_validate_allocator(&live_ranges).is_ok(),
+                "allocator structure invalid; seed={SEED:#x}; used={}; ranges={live_ranges:?}; trace={trace:?}",
+                arena.used_bytes(),
+            );
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn owner_drop_releases_its_block_after_a_destructor_panics() {
+    struct DropProbe {
+        drops: Rc<Cell<usize>>,
+        panic: bool,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(!self.panic, "intentional destructor panic");
+        }
+    }
+
+    // SAFETY: DropProbe has no address-sensitive state; moving it preserves
+    // its Rc ownership, and its destructor is valid while the arena is alive.
+    unsafe impl crate::CompactValue for DropProbe {}
+
+    let mut backing = TestBacking::new(512);
+    with_arena(&mut backing, |arena| {
+        let baseline = arena.used_bytes();
+        let drops = Rc::new(Cell::new(0));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut allocation = arena.alloc_owned_slice::<DropProbe>(2).unwrap();
+            allocation
+                .push(DropProbe {
+                    drops: Rc::clone(&drops),
+                    panic: true,
+                })
+                .unwrap();
+            allocation
+                .push(DropProbe {
+                    drops: Rc::clone(&drops),
+                    panic: false,
+                })
+                .unwrap();
+            drop(allocation);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(drops.get(), 2);
+        assert_eq!(arena.used_bytes(), baseline);
+        let reused = arena.alloc_owned_slice::<u8>(64).unwrap();
+        assert_eq!(reused.capacity(), 64);
+    })
+    .unwrap();
+}
+
+#[test]
 fn persistent_arena_reattaches_without_resetting_allocator_state() {
     let mut backing = TestBacking::new(512);
     let (root, used_after_first_access) = with_arena_persistent(&mut backing, |arena| {
+        let recyclable = arena.alloc_owned_slice::<u8>(32).unwrap();
         let root = arena.alloc_value(41_u32).unwrap();
+        drop(recyclable);
         (root.as_u32(), arena.used_bytes())
     })
     .unwrap();
@@ -53,7 +273,11 @@ fn persistent_arena_reattaches_without_resetting_allocator_state() {
             let root: Offset32<'_, u32> = Offset32::from_persistent_raw_unchecked(root);
             assert_eq!(*arena.get(root).unwrap(), 41);
             assert_eq!(arena.used_bytes(), used_after_first_access);
+            let reused = arena.alloc_value(73_u32).unwrap();
+            assert_eq!(*arena.get(reused).unwrap(), 73);
+            assert_eq!(arena.used_bytes(), used_after_first_access);
             arena.alloc_value(73_u64).unwrap();
+            arena.alloc_value(74_u64).unwrap();
             arena.used_bytes()
         })
     }

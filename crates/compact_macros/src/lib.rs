@@ -1,5 +1,5 @@
-//! Procedural macros for V2.1.0 compact arena layouts and lexical constructor
-//! rewriting.
+//! Procedural macros for compact arena layouts and lexical constructor
+//! rewriting, preserving the documented V2.1.0 source contract.
 
 extern crate proc_macro;
 

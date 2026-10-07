@@ -1,3 +1,21 @@
+error[E0277]: `NonNull<MaybeUninit<u8>>` cannot be shared between threads safely
+ --> tests/ui/mutable_owners_are_not_sync.rs:6:19
+  |
+6 |     assert_sync::<Arena<'static, 'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^ `NonNull<MaybeUninit<u8>>` cannot be shared between threads safely
+  |
+  = help: within `Arena<'static, 'static>`, the trait `Sync` is not implemented for `NonNull<MaybeUninit<u8>>`
+note: required because it appears within the type `Arena<'static, 'static>`
+ --> $WORKSPACE/crates/compact_core/src/arena.rs
+  |
+  | pub struct Arena<'arena, 'memory> {
+  |            ^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/mutable_owners_are_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
 error[E0277]: `NonNull<compact_std::__private::compact_core::allocation::ArenaState>` cannot be shared between threads safely
  --> tests/ui/mutable_owners_are_not_sync.rs:6:19
   |

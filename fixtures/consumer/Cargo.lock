@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "compact_backend_std"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "compact_core",
 ]
@@ -19,4 +19,4 @@ dependencies = [
 
 [[package]]
 name = "compact_core"
-version = "2.1.0"
+version = "2.2.0"

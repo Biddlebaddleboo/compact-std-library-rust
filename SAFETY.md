@@ -1,7 +1,7 @@
 # Safety
 
-This document defines the safety-relevant V2.1.0 contracts. V2.1.0 is the only
-supported contract.
+This document defines the safety-relevant V2.2.0 contracts. The documented
+V2.1.0 source surface remains the frozen compatibility baseline for 2.x.
 
 ## Arena lifetime
 
@@ -104,8 +104,8 @@ behavior.
 
 Custom destructors must still obey ordinary Rust safety requirements.
 
-Applications that require abort-only behavior may choose `panic = "abort"`,
-but V2.1.0 does not require every application to use abort semantics.
+Applications that require abort-only behavior may choose `panic = "abort"`;
+the library does not require every application to use abort semantics.
 
 ## Offsets and stale storage
 

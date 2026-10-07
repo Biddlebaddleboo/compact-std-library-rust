@@ -5,6 +5,7 @@ use compact_std::{
     CompactOsString, CompactPathBuf, CompactString, CompactVec, CompactVecDeque, FrozenArena,
     FrozenBuilder, FrozenError, FrozenResult, FrozenValue, Result, StdArena,
 };
+use proptest::prelude::*;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -39,6 +40,18 @@ struct ServiceConfig<'arena> {
 #[serde(deny_unknown_fields)]
 struct NodeRegistry<'arena> {
     nodes: CompactHashMap<'arena, CompactString<'arena>, u32>,
+}
+
+#[derive(CompactDeserialize)]
+struct TomlIntegerBoundaries {
+    maximum: i64,
+    minimum: i64,
+}
+
+#[derive(CompactDeserialize)]
+struct PartialConfig<'arena> {
+    allocated: CompactString<'arena>,
+    required: u32,
 }
 
 #[derive(CompactDeserialize, CompactFreeze, Copy, Clone, Debug, PartialEq)]
@@ -131,6 +144,8 @@ fn json_fixture_deserializes_compact_node_registry_and_containers() {
 fn malformed_duplicate_unknown_and_exhausted_inputs_return_errors() {
     StdArena::with_capacity(32 * 1024, |arena| {
         assert!(compact_std::json::from_str_in::<NodeRegistry<'_>>("{", arena).is_err());
+        assert!(compact_std::json::from_str_in::<NodeRegistry<'_>>("", arena).is_err());
+        assert!(compact_std::json::from_str_in::<NodeRegistry<'_>>("{\"nodes\":", arena).is_err());
         assert!(compact_std::json::from_str_in::<NodeRegistry<'_>>(
             "{\"nodes\": {}, \"nodes\": {}}",
             arena
@@ -155,6 +170,96 @@ fn malformed_duplicate_unknown_and_exhausted_inputs_return_errors() {
         assert!(exhausted.is_err());
         assert!(compact_std::json::from_str_in::<CompactString<'_>>("\"ok\"", arena).is_ok());
     })
+    .unwrap();
+}
+
+#[test]
+fn serde_edges_cover_empty_large_unicode_boundaries_and_partial_cleanup() {
+    StdArena::with_capacity(64 * 1024, |arena| -> Result<()> {
+        {
+            let empty_vec = compact_std::json::from_str_in::<CompactVec<'_, u32>>("[]", arena)
+                .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?;
+            let empty_map = compact_std::json::from_str_in::<
+                CompactHashMap<'_, CompactString<'_>, u32>,
+            >("{}", arena)
+            .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?;
+            let empty_set = compact_std::json::from_str_in::<
+                CompactHashSet<'_, CompactString<'_>>,
+            >("[]", arena)
+            .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?;
+            assert!(empty_vec.is_empty());
+            assert!(empty_map.is_empty());
+            assert!(empty_set.is_empty());
+
+            let long_text = "λ雪🙂".repeat(128);
+            let encoded_text = format!("\"{long_text}\"");
+            let decoded_text = compact_std::json::from_str_in::<CompactString<'_>>(
+                &encoded_text,
+                arena,
+            )
+            .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?;
+            assert_eq!(decoded_text.as_str(arena)?, long_text);
+
+            let encoded_numbers = format!(
+                "[{}]",
+                (0..512)
+                    .map(|value| value.to_string())
+                    .collect::<std::vec::Vec<_>>()
+                    .join(",")
+            );
+            let numbers = compact_std::json::from_str_in::<CompactVec<'_, u32>>(
+                &encoded_numbers,
+                arena,
+            )
+            .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?;
+            assert_eq!(numbers.len(), 512);
+            assert_eq!(numbers.as_slice(arena)?.last(), Some(&511));
+
+            assert_eq!(
+                compact_std::json::from_str_in::<u64>("18446744073709551615", arena)
+                    .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?,
+                u64::MAX
+            );
+            assert_eq!(
+                compact_std::json::from_str_in::<i64>("-9223372036854775808", arena)
+                    .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?,
+                i64::MIN
+            );
+            assert!(compact_std::json::from_str_in::<u32>("4294967296", arena).is_err());
+
+            let toml = compact_std::toml::from_str_in::<TomlIntegerBoundaries>(
+                "maximum = 9223372036854775807\nminimum = -9223372036854775808",
+                arena,
+            )
+            .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?;
+            assert_eq!(toml.maximum, i64::MAX);
+            assert_eq!(toml.minimum, i64::MIN);
+        }
+
+        let built = compact_std::json::from_str_in::<PartialConfig<'_>>(
+            "{\"allocated\":\"a successful compact string allocation\",\"required\":7}",
+            arena,
+        )
+        .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?;
+        assert_eq!(built.allocated.as_str(arena)?, "a successful compact string allocation");
+        assert_eq!(built.required, 7);
+        drop(built);
+
+        let available = arena.remaining_bytes();
+        let malformed = compact_std::json::from_str_in::<PartialConfig<'_>>(
+            "{\"allocated\":\"a string long enough to allocate outside inline storage\",\"required\":\"invalid\"}",
+            arena,
+        );
+        assert!(malformed.is_err());
+        assert_eq!(arena.remaining_bytes(), available);
+
+        let recovery = CompactString::from_str_in("recovered", arena)?;
+        assert_eq!(recovery.as_str(arena)?, "recovered");
+        drop(recovery);
+        assert_eq!(arena.remaining_bytes(), available);
+        Ok(())
+    })
+    .unwrap()
     .unwrap();
 }
 
@@ -288,4 +393,27 @@ fn frozen_builder_interns_equal_string_and_byte_payloads() {
         empty_a.as_str(&arena).unwrap().as_ptr(),
         empty_b.as_str(&arena).unwrap().as_ptr()
     );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 48,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn compact_json_sequence_matches_generated_native_values(
+        values in prop::collection::vec(any::<u32>(), 0..64)
+    ) {
+        let encoded = format!(
+            "[{}]",
+            values.iter().map(u32::to_string).collect::<std::vec::Vec<_>>().join(",")
+        );
+        let decoded = StdArena::with_capacity(16 * 1024, |arena| -> Result<std::vec::Vec<u32>> {
+            let compact = compact_std::json::from_str_in::<CompactVec<'_, u32>>(&encoded, arena)
+                .map_err(|_| compact_std::CollectionError::InvalidCompactValue)?;
+            Ok(compact.as_slice(arena)?.to_vec())
+        }).unwrap().unwrap();
+        prop_assert_eq!(decoded, values);
+    }
 }

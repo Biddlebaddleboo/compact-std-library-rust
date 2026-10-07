@@ -34,8 +34,9 @@ fn collision_heavy_operations_match_std_hash_map() {
         let mut compact = CompactHashMap::with_hasher(CollisionBuildHasher);
         let mut standard = StdHashMap::new();
         let mut state = 0x5eed_u64;
+        let steps = if cfg!(miri) { 256 } else { 2_000 };
 
-        for step in 0..2_000 {
+        for step in 0..steps {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let key = ((state >> 32) % 113) as u32;
             match state as u8 % 7 {
@@ -142,13 +143,14 @@ fn collision_heavy_set_matches_std_hash_set() {
     StdArena::with_capacity(32 * 1024, |arena| {
         let mut compact = CompactHashSet::with_hasher(CollisionBuildHasher);
         let mut standard = StdHashSet::new();
-        for value in (0..200_u32).chain((0..100).rev()) {
+        let value_count = if cfg!(miri) { 48_u32 } else { 200_u32 };
+        for value in (0..value_count).chain((0..value_count / 2).rev()) {
             assert_eq!(
                 compact.insert(value, arena).unwrap(),
                 standard.insert(value)
             );
         }
-        for value in (0..200_u32).step_by(3) {
+        for value in (0..value_count).step_by(3) {
             assert_eq!(
                 compact.remove(&value, arena).unwrap(),
                 standard.remove(&value)

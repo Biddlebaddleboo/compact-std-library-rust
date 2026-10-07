@@ -1,3 +1,21 @@
+error[E0277]: `NonNull<MaybeUninit<u8>>` cannot be sent between threads safely
+ --> tests/ui/mutable_owners_are_not_send.rs:6:19
+  |
+6 |     assert_send::<Arena<'static, 'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^ `NonNull<MaybeUninit<u8>>` cannot be sent between threads safely
+  |
+  = help: within `Arena<'static, 'static>`, the trait `Send` is not implemented for `NonNull<MaybeUninit<u8>>`
+note: required because it appears within the type `Arena<'static, 'static>`
+ --> $WORKSPACE/crates/compact_core/src/arena.rs
+  |
+  | pub struct Arena<'arena, 'memory> {
+  |            ^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/mutable_owners_are_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `NonNull<compact_std::__private::compact_core::allocation::ArenaState>` cannot be sent between threads safely
  --> tests/ui/mutable_owners_are_not_send.rs:6:19
   |

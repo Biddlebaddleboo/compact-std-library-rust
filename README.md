@@ -6,7 +6,7 @@ control flow and opts into compact layouts with procedural macros.
 
 ## Supported contract
 
-**V2.1.0 is the only supported contract.**
+**V2.2.0 is the current release. V2.1.0 is the frozen compatibility baseline for 2.x.**
 
 The documented V2.1.0 source surface is the compatibility baseline for future
 2.x releases. Valid code that uses documented V2.1.0 APIs and syntax should
@@ -189,7 +189,7 @@ Enable `serde` for `CompactDeserialize` and its derive, `json` for JSON helpers,
 and `toml` for TOML helpers:
 
 ```toml
-compact_std = { version = "2.1.0", features = ["json", "toml"] }
+compact_std = { version = "2.2.0", features = ["json", "toml"] }
 ```
 
 The visitors use `DeserializeSeed` to build compact strings, bytes, vectors,

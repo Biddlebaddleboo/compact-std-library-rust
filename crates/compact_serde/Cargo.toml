@@ -14,8 +14,8 @@ json = ["dep:serde_json"]
 toml = ["dep:toml"]
 
 [dependencies]
-compact_core = { path = "../compact_core", version = "2.1.0" }
-compact_collections = { path = "../compact_collections", version = "2.1.0" }
+compact_core = { path = "../compact_core", version = "2.2.0" }
+compact_collections = { path = "../compact_collections", version = "2.2.0" }
 serde = "1"
 serde_json = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }

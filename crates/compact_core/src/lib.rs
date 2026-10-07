@@ -3,10 +3,11 @@
 #![deny(missing_docs)]
 //! Backend-independent compact memory primitives.
 //!
-//! V2.1.0 is the supported contract. The core crate uses only `core` and
-//! provides scoped arenas, four-byte offsets, owned arena allocations, and
-//! packed-field primitives. Use [`with_arena`] to create a scoped arena over a
-//! backend-provided stable memory region.
+//! The V2.1.0 four-byte offset and documented source surface remain the 2.x
+//! compatibility baseline. The core crate uses only `core` and provides
+//! scoped arenas, owned arena allocations, and packed-field primitives. Use
+//! [`with_arena`] to create a scoped arena over a backend-provided stable
+//! memory region.
 
 mod abi;
 mod allocation;

@@ -1,15 +1,15 @@
-//! V2.1.0 compact representation rules.
+//! V2.2.0 compact runtime ABI rules.
 //!
 //! Compact references use 32-bit byte offsets. Packed fields use LSB-first bit
 //! numbering, and multi-byte packed words use the target's native byte order.
-//! The four-byte offset representation and byte unit are stable V2.1.0
-//! contract rules.
+//! The four-byte offset representation and byte unit remain frozen V2.1.0
+//! source contract rules.
 //!
 //! Arena bytes are runtime memory, not a persistent or cross-process file
 //! format. Arena alignment is established from the actual base address plus a
 //! checked byte offset. No `repr(packed)` layout is required.
 
-/// The compact ABI version understood by this crate.
+/// The compact runtime ABI version understood by this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct CompactAbiVersion {
@@ -19,8 +19,8 @@ pub struct CompactAbiVersion {
     pub minor: u16,
 }
 
-/// Current supported compact ABI version.
-pub const ABI_VERSION: CompactAbiVersion = CompactAbiVersion { major: 2, minor: 1 };
+/// Current supported compact runtime ABI version.
+pub const ABI_VERSION: CompactAbiVersion = CompactAbiVersion { major: 2, minor: 2 };
 
 /// Maximum logical span of one compact arena: 2^32 bytes.
 pub const MAX_ARENA_BYTES: u64 = 1_u64 << 32;

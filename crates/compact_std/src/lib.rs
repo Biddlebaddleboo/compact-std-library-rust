@@ -1,9 +1,9 @@
-//! A single-dependency facade for V2.1.0 compact arena programming.
+//! A single-dependency facade for V2.2.0 compact arena programming.
 //!
-//! V2.1.0 is the supported contract. Familiar collection names are aliases for
-//! arena-aware types. Their methods accept an explicit arena or can be
-//! shortened locally with [`arena!`]. No global or thread-local arena context
-//! is installed.
+//! V2.1.0 remains the frozen 2.x source compatibility baseline. Familiar
+//! collection names are aliases for arena-aware types. Their methods accept an
+//! explicit arena or can be shortened locally with [`arena!`]. No global or
+//! thread-local arena context is installed.
 
 pub mod ffi;
 pub mod prelude;

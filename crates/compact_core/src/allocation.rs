@@ -57,31 +57,41 @@ pub(crate) struct ArenaState {
 }
 
 impl ArenaState {
-    pub(crate) fn place(
-        region: &mut [core::mem::MaybeUninit<u8>],
+    /// # Safety
+    ///
+    /// `base` must point to `capacity` writable bytes that remain allocated
+    /// at a stable address for the full arena scope.
+    pub(crate) unsafe fn place(
+        base: *mut core::mem::MaybeUninit<u8>,
+        capacity: usize,
     ) -> Result<(NonNull<Self>, usize)> {
-        let base = region.as_mut_ptr().cast::<u8>();
-        let (state_offset, cursor) = state_layout(base, region.len(), 1)?;
-        Self::place_at(base, region.len(), state_offset, cursor)
+        let base = base.cast::<u8>();
+        let (state_offset, cursor) = state_layout(base, capacity, 1)?;
+        Self::place_at(base, capacity, state_offset, cursor)
     }
 
-    pub(crate) fn place_persistent(
-        region: &mut [core::mem::MaybeUninit<u8>],
+    /// # Safety
+    ///
+    /// `base` must point to `capacity` writable bytes that remain allocated
+    /// at a stable address for the full arena scope.
+    pub(crate) unsafe fn place_persistent(
+        base: *mut core::mem::MaybeUninit<u8>,
+        capacity: usize,
     ) -> Result<(NonNull<Self>, usize)> {
-        let base = region.as_mut_ptr().cast::<u8>();
+        let base = base.cast::<u8>();
         let header_len = size_of::<PersistentArenaHeader>();
-        let (state_offset, cursor) = state_layout(base, region.len(), header_len)?;
+        let (state_offset, cursor) = state_layout(base, capacity, header_len)?;
         let header = PersistentArenaHeader {
             magic: PERSISTENT_ARENA_MAGIC,
             abi_major: crate::ABI_VERSION.major,
             abi_minor: crate::ABI_VERSION.minor,
-            capacity: region.len() as u64,
+            capacity: capacity as u64,
             validity: PERSISTENT_ARENA_VALID,
         };
         // SAFETY: the prefix is reserved by `state_layout`; unaligned access
         // is used because byte backings only promise alignment one.
         unsafe { base.cast::<PersistentArenaHeader>().write_unaligned(header) };
-        Self::place_at(base, region.len(), state_offset, cursor)
+        Self::place_at(base, capacity, state_offset, cursor)
     }
 
     fn place_at(
@@ -108,11 +118,16 @@ impl ArenaState {
         Ok((unsafe { NonNull::new_unchecked(state_ptr) }, cursor))
     }
 
-    pub(crate) fn attach_persistent(
-        region: &mut [core::mem::MaybeUninit<u8>],
+    /// # Safety
+    ///
+    /// `base` must point to the exact stable backing previously initialized
+    /// by `place_persistent`, with no other arena attached at the same time.
+    pub(crate) unsafe fn attach_persistent(
+        base: *mut core::mem::MaybeUninit<u8>,
+        capacity: usize,
     ) -> Result<(NonNull<Self>, usize)> {
-        let base = region.as_mut_ptr().cast::<u8>();
-        if region.len() < size_of::<PersistentArenaHeader>() {
+        let base = base.cast::<u8>();
+        if capacity < size_of::<PersistentArenaHeader>() {
             return Err(Error::InitializationError);
         }
         // SAFETY: the caller guarantees persistent state was initialized in
@@ -120,7 +135,7 @@ impl ArenaState {
         let header = unsafe { base.cast::<PersistentArenaHeader>().read_unaligned() };
         if header.magic != PERSISTENT_ARENA_MAGIC
             || header.validity != PERSISTENT_ARENA_VALID
-            || header.capacity != region.len() as u64
+            || header.capacity != capacity as u64
         {
             return Err(Error::InitializationError);
         }
@@ -130,7 +145,7 @@ impl ArenaState {
             return Err(Error::InitializationError);
         }
         let (state_offset, cursor) =
-            state_layout(base, region.len(), size_of::<PersistentArenaHeader>())?;
+            state_layout(base, capacity, size_of::<PersistentArenaHeader>())?;
         // SAFETY: persistent attach callers guarantee this exact region was
         // initialized by `place_persistent` and has not moved or been aliased.
         let state_ptr = unsafe { base.add(state_offset).cast::<Self>() };
@@ -139,15 +154,21 @@ impl ArenaState {
         let state = unsafe { &*state_ptr };
         // SAFETY: the checked persistent header identifies an initialized
         // ArenaState, whose inner fields are verified before reuse.
-        let inner = unsafe { &*state.inner.get() };
+        // SAFETY: the attach precondition guarantees no other Arena is active
+        // for this backing, so the allocator state can be mutably rebound to
+        // the provenance of the current StableBacking borrow.
+        let inner = unsafe { &mut *state.inner.get() };
         if inner.base != base
-            || inner.capacity != region.len()
+            || inner.capacity != capacity
             || inner.cursor < cursor
-            || inner.cursor > region.len()
+            || inner.cursor > capacity
             || inner.cursor as u64 > MAX_ARENA_BYTES
         {
             return Err(Error::InitializationError);
         }
+        // Persistent backing may be borrowed again through a fresh mutable
+        // reference. Keep the stored raw pointer tied to that current borrow.
+        inner.base = base;
         validate_free_list(inner, cursor)?;
         // SAFETY: the address is non-null and was computed from a nonempty
         // mutable slice.
@@ -396,6 +417,41 @@ impl ArenaState {
             current = node.next;
         }
         total
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_validate_allocator(&self, live_ranges: &[(usize, usize)]) -> Result<()> {
+        // SAFETY: the test calls this only between arena operations, with no
+        // concurrent access to the single-owner allocator state.
+        let inner = unsafe { &*self.inner.get() };
+        let (_, minimum_cursor) = state_layout(inner.base, inner.capacity, 1)?;
+        if inner.cursor < minimum_cursor || inner.cursor > inner.capacity {
+            return Err(Error::InitializationError);
+        }
+        validate_free_list(inner, minimum_cursor)?;
+
+        for &(start, end) in live_ranges {
+            if start < minimum_cursor || start >= end || end > inner.cursor {
+                return Err(Error::InitializationError);
+            }
+        }
+
+        let mut current = inner.free_head;
+        while current != 0 {
+            let node = unsafe { read_free_node(inner.base, current) };
+            let free_start = current as usize;
+            let free_end = free_start
+                .checked_add(node.len as usize)
+                .ok_or(Error::InitializationError)?;
+            if live_ranges
+                .iter()
+                .any(|&(live_start, live_end)| live_start < free_end && free_start < live_end)
+            {
+                return Err(Error::InitializationError);
+            }
+            current = node.next;
+        }
+        Ok(())
     }
 }
 
@@ -666,6 +722,14 @@ impl<'arena, T: CompactValue> ArenaAllocation<'arena, T> {
         self.offset
     }
 
+    #[cfg(test)]
+    pub(crate) fn debug_block_range(&self) -> (usize, usize) {
+        let header = self.header();
+        let header_offset = self.offset as usize - size_of::<AllocationHeader>();
+        let start = header_offset - header.prefix as usize;
+        (start, start + header.block_len as usize)
+    }
+
     fn header(&self) -> AllocationHeader {
         let inner = unsafe { &*self.state.as_ref().inner.get() };
         read_allocation_header(inner.base, self.offset)
@@ -695,6 +759,20 @@ struct TruncateGuard<'arena, T: CompactValue> {
     armed: bool,
 }
 
+struct AllocationReleaseGuard {
+    state: NonNull<ArenaState>,
+    offset: u32,
+    id: u32,
+}
+
+impl Drop for AllocationReleaseGuard {
+    fn drop(&mut self) {
+        // SAFETY: the owner token is dropped before its branded arena state;
+        // this guard is created from that token's exact allocator-issued ID.
+        unsafe { self.state.as_ref() }.release(self.offset, self.id);
+    }
+}
+
 impl<T: CompactValue> Drop for TruncateGuard<'_, T> {
     fn drop(&mut self) {
         if self.armed {
@@ -718,10 +796,12 @@ impl ArenaAllocation<'_, u8> {
 
 impl<T: CompactValue> Drop for ArenaAllocation<'_, T> {
     fn drop(&mut self) {
+        let _release = AllocationReleaseGuard {
+            state: self.state,
+            offset: self.offset,
+            id: self.id,
+        };
         self.truncate(0);
-        // SAFETY: the token is unique and the arena state outlives all branded
-        // allocations. This returns only its allocator-issued block.
-        unsafe { self.state.as_ref() }.release(self.offset, self.id);
     }
 }
 
@@ -831,7 +911,14 @@ fn state_layout(base: *mut u8, capacity: usize, reserved_prefix: usize) -> Resul
     let state_end = state_offset
         .checked_add(size_of::<ArenaState>())
         .ok_or(Error::OffsetOverflow)?;
-    let cursor = checked_align_up(state_end, BLOCK_ALIGNMENT)?;
+    // Backings promise byte alignment only, so align the absolute address
+    // instead of assuming the base pointer itself meets BLOCK_ALIGNMENT.
+    let cursor_address = base_address
+        .checked_add(state_end)
+        .ok_or(Error::OffsetOverflow)?;
+    let cursor = checked_align_up(cursor_address, BLOCK_ALIGNMENT)?
+        .checked_sub(base_address)
+        .ok_or(Error::OffsetOverflow)?;
     if cursor >= capacity || cursor as u64 > MAX_ARENA_BYTES {
         return Err(Error::InvalidCapacity);
     }
@@ -849,7 +936,7 @@ fn validate_free_list(inner: &ArenaInner, first_free_offset: usize) -> Result<()
             .checked_add(size_of::<FreeNode>())
             .ok_or(Error::InitializationError)?;
         if start < first_free_offset
-            || start % align_of::<FreeNode>() != 0
+            || (inner.base as usize + start) % align_of::<FreeNode>() != 0
             || node_end > inner.cursor
             || visited > inner.capacity / size_of::<FreeNode>()
         {

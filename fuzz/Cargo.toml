@@ -1,0 +1,63 @@
+[package]
+name = "compact_std_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+compact_std = { path = "../crates/compact_std", features = ["serde", "json", "toml"] }
+
+[[bin]]
+name = "allocator_ops"
+path = "fuzz_targets/allocator_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packed_bits"
+path = "fuzz_targets/packed_bits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hash_collisions"
+path = "fuzz_targets/hash_collisions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "serde_json_input"
+path = "fuzz_targets/serde_json_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "serde_toml_input"
+path = "fuzz_targets/serde_toml_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_bytes"
+path = "fuzz_targets/chunk_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frozen_graph_access"
+path = "fuzz_targets/frozen_graph_access.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

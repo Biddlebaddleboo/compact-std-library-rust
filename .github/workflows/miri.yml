@@ -1,0 +1,37 @@
+name: Miri unsafe-code checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Set up Miri
+        run: cargo miri setup
+      - name: Core allocator and packed memory
+        run: cargo miri test -p compact_core
+      - name: Collection ownership and ring operations
+        run: cargo miri test -p compact_collections --test containers
+      - name: Formatting panic, ZST, and alignment cases
+        run: cargo miri test -p compact_collections --test arena_traits
+      - name: Hash table collisions, removal, and panic safety
+        run: cargo miri test -p compact_collections --test hash_map
+      - name: Persistent backing reattachment
+        run: cargo miri test -p compact_backend_std --test integration
+      - name: Frozen storage and multithreaded reads
+        run: cargo miri test -p compact_std --all-features --test serde_direct frozen_configuration_is_immutable_and_shareable_across_threads
+      - name: Frozen payload interning
+        run: cargo miri test -p compact_std --all-features --test serde_direct frozen_builder_interns_equal_string_and_byte_payloads
+      - name: Serde partial construction and boundary inputs
+        run: cargo miri test -p compact_std --all-features --test serde_direct serde_edges_cover_empty_large_unicode_boundaries_and_partial_cleanup

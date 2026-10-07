@@ -199,7 +199,8 @@ fn compact_vec_deque_matches_std_across_wrapping_and_reallocation() {
     StdArena::with_capacity(16 * 1024, |arena| {
         let mut compact = CompactVecDeque::with_capacity(3, arena).unwrap();
         let mut standard = StdVecDeque::with_capacity(3);
-        for step in 0_i32..700 {
+        let steps = if cfg!(miri) { 80 } else { 700 };
+        for step in 0_i32..steps {
             match step % 7 {
                 0 => {
                     compact.push_back(step, arena).unwrap();
