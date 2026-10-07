@@ -355,8 +355,12 @@ cargo run --manifest-path fixtures/consumer/Cargo.toml
 cargo run --manifest-path fixtures/regular_rust_style/Cargo.toml
 cargo run --manifest-path fixtures/macro_layouts/Cargo.toml
 cargo run --manifest-path fixtures/arena_tracking/Cargo.toml
+cargo run --manifest-path fixtures/drop_in_patterns/Cargo.toml
+cargo run --manifest-path fixtures/v2_1_contract/Cargo.toml
 ```
 
 Macro compile-fail diagnostics live under `crates/compact_std/tests/ui`.
+`fixtures/v2_1_contract` is intentionally frozen at documented V2.1.0 syntax;
+leave it unchanged as future 2.x conveniences are added.
 Release-mode benchmark instructions and current measurements are recorded in
 [BENCHMARKS.md](BENCHMARKS.md).
