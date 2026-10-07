@@ -1241,11 +1241,11 @@ fn order_book(variant: &str, repetitions: usize) -> BenchResult<u64> {
                                     .order_count
                                     .saturating_sub(if update % 13 == 0 { 1 } else { 0 });
                             }
-                            compact_retain_levels(&mut book.bids);
-                            compact_retain_levels(&mut book.asks);
+                            book.bids.retain(|level| level.quantity != 0);
+                            book.asks.retain(|level| level.quantity != 0);
                             if round % 2 == 1 {
-                                book.bids = book.bids.try_clone()?;
-                                book.asks = book.asks.try_clone()?;
+                                book.bids = book.bids.try_clone_copy()?;
+                                book.asks = book.asks.try_clone_copy()?;
                             }
                         }
                     }
@@ -1311,8 +1311,8 @@ fn order_book(variant: &str, repetitions: usize) -> BenchResult<u64> {
                     .map(|level| level.price_micros ^ level.quantity ^ u64::from(level.flags))
                     .sum(),
                 OrderBookState::Compact(book) => {
-                    let mut bids = book.bids.try_clone()?;
-                    let mut asks = book.asks.try_clone()?;
+                    let mut bids = book.bids.try_clone_copy()?;
+                    let mut asks = book.asks.try_clone_copy()?;
                     let checksum: u64 = bids
                         .iter()
                         .chain(asks.iter())
@@ -1334,19 +1334,6 @@ fn order_book(variant: &str, repetitions: usize) -> BenchResult<u64> {
         vec![mutation],
         vec![read, snapshots],
     )
-}
-
-fn compact_retain_levels(levels: &mut CompactVec<PriceLevel>) {
-    let mut output = 0;
-    for input in 0..levels.len() {
-        if levels[input].quantity != 0 {
-            if output != input {
-                levels[output] = levels[input];
-            }
-            output += 1;
-        }
-    }
-    levels.truncate(output);
 }
 
 enum FileCatalogState {

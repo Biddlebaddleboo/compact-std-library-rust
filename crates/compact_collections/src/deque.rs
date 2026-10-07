@@ -189,6 +189,15 @@ impl<T: CompactValue> CompactVecDeque<T> {
     }
     /// Append a value at the back.
     pub fn push_back(&mut self, value: T) -> Result<()> {
+        if let Some(storage) = &mut self.storage {
+            let slots = storage.uninit_capacity_mut();
+            if (self.len as usize) < slots.len() {
+                let at = Self::physical_index(self.head as usize, self.len as usize, slots.len());
+                slots[at].write(MaybeUninit::new(value));
+                self.len += 1;
+                return Ok(());
+            }
+        }
         self.reserve(1)?;
         let head = self.head as usize;
         let logical = self.len();
@@ -204,6 +213,23 @@ impl<T: CompactValue> CompactVecDeque<T> {
     }
     /// Append a value at the front.
     pub fn push_front(&mut self, value: T) -> Result<()> {
+        if let Some(storage) = &mut self.storage {
+            let slots = storage.uninit_capacity_mut();
+            if (self.len as usize) < slots.len() {
+                let capacity = slots.len();
+                let head = if self.len == 0 {
+                    0
+                } else if self.head == 0 {
+                    (capacity - 1) as u32
+                } else {
+                    self.head - 1
+                };
+                slots[head as usize].write(MaybeUninit::new(value));
+                self.head = head;
+                self.len += 1;
+                return Ok(());
+            }
+        }
         self.reserve(1)?;
         let slots = self
             .storage

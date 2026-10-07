@@ -15,17 +15,27 @@ const EMPTY: u8 = 0;
 const FULL: u8 = 1;
 const TOMBSTONE: u8 = 2;
 
-fn control_group(
+fn classify_control_group(
     control: &[u8],
     start: usize,
-    mask: usize,
     count: usize,
-) -> [u8; CONTROL_GROUP_WIDTH] {
-    let mut group = [FULL; CONTROL_GROUP_WIDTH];
-    for (lane, value) in group.iter_mut().take(count).enumerate() {
-        *value = control[start.wrapping_add(lane) & mask];
+) -> hash_control::ControlGroupMask {
+    if count == CONTROL_GROUP_WIDTH && start <= control.len() - CONTROL_GROUP_WIDTH {
+        // The complete group is within the table, so let the classifier read
+        // the control bytes directly without lane-by-lane scratch copying.
+        let contiguous: &[u8; CONTROL_GROUP_WIDTH] = control[start..start + CONTROL_GROUP_WIDTH]
+            .try_into()
+            .expect("full control group has the requested width");
+        return hash_control::classify(contiguous);
     }
-    group
+
+    let mut group = [FULL; CONTROL_GROUP_WIDTH];
+    let first_count = count.min(control.len() - start);
+    group[..first_count].copy_from_slice(&control[start..start + first_count]);
+    if first_count < count {
+        group[first_count..count].copy_from_slice(&control[..count - first_count]);
+    }
+    hash_control::classify(&group)
 }
 
 fn first_empty_slot(control: &[u8], start: usize) -> Option<usize> {
@@ -34,8 +44,7 @@ fn first_empty_slot(control: &[u8], start: usize) -> Option<usize> {
     while consumed < control.len() {
         let count = (control.len() - consumed).min(CONTROL_GROUP_WIDTH);
         let cursor = start.wrapping_add(consumed) & mask;
-        let group = control_group(control, cursor, mask, count);
-        let classes = hash_control::classify(&group);
+        let classes = classify_control_group(control, cursor, count);
         let active = lane_mask(count);
         let empty = classes.empty & active;
         if empty != 0 {
@@ -483,8 +492,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         while consumed < control.len() {
             let count = (control.len() - consumed).min(CONTROL_GROUP_WIDTH);
             let cursor = start.wrapping_add(consumed) & mask;
-            let group = control_group(control, cursor, mask, count);
-            let classes = hash_control::classify(&group);
+            let classes = classify_control_group(control, cursor, count);
             let active = lane_mask(count);
             let empty = classes.empty & active;
             let full = classes.full & active;
@@ -863,7 +871,8 @@ unsafe impl<T: CompactValue + Hash + Eq, S: BuildHasher + CompactValue> CompactV
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactHashMap, CompactValue};
+    use super::{classify_control_group, CompactHashMap, CompactValue, EMPTY, FULL, TOMBSTONE};
+    use crate::hash_control::{self, ControlGroupMask, WIDTH};
     use compact_backend_std::{CageConfig, CompactRuntime};
     use core::hash::{BuildHasher, Hasher};
     use std::sync::OnceLock;
@@ -905,6 +914,43 @@ mod tests {
     }
     // SAFETY: this is a zero-sized native hasher builder.
     unsafe impl CompactValue for IdentityBuildHasher {}
+
+    #[test]
+    fn control_group_access_matches_lane_reference_for_every_wrap_and_partial_range() {
+        let states = [EMPTY, FULL, TOMBSTONE, 3];
+        for length in [8_usize, 16, 23, 24, 32] {
+            let control: Vec<u8> = (0..length)
+                .map(|index| states[(index * 3 + index / 2) % states.len()])
+                .collect();
+            for start in 0..length {
+                for count in 1..=length.min(WIDTH) {
+                    let mut expected = [FULL; WIDTH];
+                    for lane in 0..count {
+                        expected[lane] = control[(start + lane) % length];
+                    }
+                    let expected = hash_control::classify(&expected);
+                    let actual = classify_control_group(&control, start, count);
+                    assert_eq!(
+                        actual, expected,
+                        "length={length}, start={start}, count={count}"
+                    );
+                }
+            }
+        }
+
+        let mut all_states = [0_u8; WIDTH];
+        for (lane, state) in all_states.iter_mut().enumerate() {
+            *state = states[lane % states.len()];
+        }
+        assert_eq!(
+            classify_control_group(&all_states, 0, WIDTH),
+            ControlGroupMask {
+                empty: 0x1111,
+                full: 0x2222,
+                tombstone: 0x4444,
+            }
+        );
+    }
 
     fn assert_probe_matches_scalar(map: &CompactHashMap<u32, u32, IdentityBuildHasher>) {
         let capacity = map.capacity() as u32;

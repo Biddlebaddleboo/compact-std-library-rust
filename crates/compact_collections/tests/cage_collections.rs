@@ -194,6 +194,134 @@ fn bulk_vector_extend_preserves_prefixes_on_iterator_and_clone_panics() {
 }
 
 #[test]
+fn compact_vec_retain_matches_vec_and_recovers_after_predicate_panic() {
+    init();
+
+    let predicates: [fn(&u32) -> bool; 4] = [
+        |_| true,
+        |_| false,
+        |value| value % 2 == 0,
+        |value| (3..=8).contains(value),
+    ];
+    for predicate in predicates {
+        let input: Vec<u32> = (0..12).collect();
+        let mut expected = input.clone();
+        expected.retain(predicate);
+        let mut compact = CompactVec::try_from_iter(input).unwrap();
+        compact.retain(predicate);
+        assert_eq!(compact.as_slice(), expected);
+    }
+
+    let mut values = CompactVec::try_from_iter(0_u32..8).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        values.retain(|value| {
+            assert_ne!(*value, 4, "requested retain predicate panic");
+            value % 2 == 0
+        });
+    }));
+    assert!(result.is_err());
+    assert_eq!(values.as_slice(), [0, 2, 4, 5, 6, 7]);
+    values.push(8).unwrap();
+    values.retain(|_| true);
+    assert_eq!(values.as_slice(), [0, 2, 4, 5, 6, 7, 8]);
+}
+
+#[test]
+fn compact_vec_retain_drops_once_and_recovers_after_destructor_panic() {
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct DropProbe {
+        id: usize,
+        panic: bool,
+    }
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic, "requested retain value destructor panic");
+        }
+    }
+    unsafe impl CompactValue for DropProbe {}
+
+    init();
+    DROPS.store(0, Ordering::SeqCst);
+    let mut values = CompactVec::with_capacity(7).unwrap();
+    for id in 0..7 {
+        values.push(DropProbe { id, panic: false }).unwrap();
+    }
+    values.retain(|value| value.id % 2 == 0);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        values.iter().map(|value| value.id).collect::<Vec<_>>(),
+        [0, 2, 4, 6]
+    );
+    drop(values);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 7);
+
+    DROPS.store(0, Ordering::SeqCst);
+    let mut native: Vec<DropProbe> = (0..6).map(|id| DropProbe { id, panic: false }).collect();
+    let native_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        native.retain(|value| {
+            assert_ne!(value.id, 3, "requested retain predicate panic");
+            value.id % 2 == 0
+        });
+    }));
+    assert!(native_result.is_err());
+    let predicate_panic_values: Vec<_> = native.iter().map(|value| value.id).collect();
+    assert_eq!(predicate_panic_values, [0, 2, 3, 4, 5]);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    drop(native);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 6);
+
+    DROPS.store(0, Ordering::SeqCst);
+    let mut values = CompactVec::with_capacity(6).unwrap();
+    for id in 0..6 {
+        values.push(DropProbe { id, panic: false }).unwrap();
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        values.retain(|value| {
+            assert_ne!(value.id, 3, "requested retain predicate panic");
+            value.id % 2 == 0
+        });
+    }));
+    assert!(result.is_err());
+    assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        values.iter().map(|value| value.id).collect::<Vec<_>>(),
+        predicate_panic_values
+    );
+    drop(values);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 6);
+
+    DROPS.store(0, Ordering::SeqCst);
+    let mut native: Vec<DropProbe> = (0..7).map(|id| DropProbe { id, panic: id == 3 }).collect();
+    let native_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        native.retain(|value| value.id % 2 == 0);
+    }));
+    assert!(native_result.is_err());
+    let destructor_panic_values: Vec<_> = native.iter().map(|value| value.id).collect();
+    assert_eq!(destructor_panic_values, [0, 2, 4, 5, 6]);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+    drop(native);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 7);
+
+    DROPS.store(0, Ordering::SeqCst);
+    let mut values = CompactVec::with_capacity(7).unwrap();
+    for id in 0..7 {
+        values.push(DropProbe { id, panic: id == 3 }).unwrap();
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        values.retain(|value| value.id % 2 == 0);
+    }));
+    assert!(result.is_err());
+    assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        values.iter().map(|value| value.id).collect::<Vec<_>>(),
+        destructor_panic_values
+    );
+    drop(values);
+    assert_eq!(DROPS.load(Ordering::SeqCst), 7);
+}
+
+#[test]
 fn deque_ring_smallvec_and_bits_preserve_order_and_capacity_rules() {
     init();
     let mut deque = CompactVecDeque::with_capacity(4).unwrap();
@@ -257,6 +385,72 @@ fn deque_iterator_handles_wrapping_and_alternating_ends() {
     assert_eq!(iter.next(), Some(&4));
     assert_eq!(iter.next_back(), None);
     assert_eq!(iter.len(), 0);
+}
+
+#[test]
+fn deque_no_growth_push_paths_preserve_wrap_growth_and_zst_behavior() {
+    init();
+    let mut deque = CompactVecDeque::with_capacity(7).unwrap();
+    let capacity = deque.capacity();
+    let mut expected = std::collections::VecDeque::new();
+    let churn = if cfg!(miri) { 64 } else { 2_000 };
+
+    for value in 0..churn {
+        deque.push_back(value).unwrap();
+        expected.push_back(value);
+        assert_eq!(deque.pop_front(), expected.pop_front());
+        deque.push_front(value + 10_000).unwrap();
+        expected.push_front(value + 10_000);
+        if expected.len() == capacity || (value % 3 == 0 && !expected.is_empty()) {
+            assert_eq!(deque.pop_back(), expected.pop_back());
+        }
+        assert_eq!(
+            deque.iter().copied().collect::<Vec<_>>(),
+            expected.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(deque.capacity(), capacity);
+    }
+
+    while !expected.is_empty() {
+        assert_eq!(deque.pop_front(), expected.pop_front());
+    }
+    for value in 0..capacity {
+        deque.push_front(value as u32).unwrap();
+    }
+    deque.push_front(100).unwrap();
+    assert!(deque.capacity() > capacity);
+
+    let mut zst = CompactVecDeque::new();
+    zst.push_back(()).unwrap();
+    zst.push_front(()).unwrap();
+    assert_eq!(zst.len(), 2);
+    assert_eq!(zst.pop_front(), Some(()));
+    assert_eq!(zst.pop_back(), Some(()));
+}
+
+#[test]
+fn deque_drop_guard_finishes_after_a_nested_value_panics() {
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct PanicDrop {
+        panic: bool,
+    }
+    impl Drop for PanicDrop {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic, "requested deque value destructor panic");
+        }
+    }
+    unsafe impl CompactValue for PanicDrop {}
+
+    init();
+    DROPS.store(0, Ordering::SeqCst);
+    let mut deque = CompactVecDeque::with_capacity(5).unwrap();
+    for index in 0..5 {
+        deque.push_back(PanicDrop { panic: index == 2 }).unwrap();
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(deque)));
+    assert!(result.is_err());
+    assert_eq!(DROPS.load(Ordering::SeqCst), 5);
 }
 
 #[test]

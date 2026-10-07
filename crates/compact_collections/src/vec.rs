@@ -4,6 +4,7 @@ use core::borrow::{Borrow, BorrowMut};
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::ops::{Deref, DerefMut, Index, IndexMut};
+use core::ptr;
 use core::slice;
 
 use compact_backend_std::{CageAllocation, CompactRuntime};
@@ -123,6 +124,82 @@ impl<T: CompactValue> CompactVec<T> {
     /// Drop all values while retaining capacity.
     pub fn clear(&mut self) {
         self.truncate(0);
+    }
+
+    /// Retain only the elements selected by `keep`.
+    ///
+    /// The predicate runs once for each element, in vector order. If it
+    /// panics, the vector remains valid and contains the retained prefix of
+    /// already-visited elements followed by all elements not yet visited.
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let len = self.len();
+        if len == 0 {
+            return;
+        }
+
+        if !core::mem::needs_drop::<T>() {
+            let data = self.as_mut_slice().as_mut_ptr();
+            let mut guard = RetainNoDropGuard {
+                vector: self,
+                data,
+                original_len: len,
+                read: 0,
+                write: 0,
+                armed: true,
+            };
+
+            while guard.read < len {
+                let read = guard.read;
+                // SAFETY: `read` is within the original initialized prefix.
+                let should_keep = unsafe { keep(&*data.add(read)) };
+                if should_keep {
+                    if guard.write != read {
+                        // SAFETY: the source is initialized and the destination
+                        // is a vacancy in the compacted prefix. `copy` is valid
+                        // for overlapping slots; the stale source is outside
+                        // the final initialized prefix.
+                        unsafe { ptr::copy(data.add(read), data.add(guard.write), 1) };
+                    }
+                    guard.write += 1;
+                }
+                guard.read += 1;
+            }
+
+            guard.finish();
+            return;
+        }
+
+        // Stage values in a native scratch vector so predicates and rejected
+        // value destructors run in original left-to-right order while each
+        // value is outside the compact vector's initialized prefix.
+        let mut pending = std::vec::Vec::with_capacity(len);
+        while let Some(value) = self.pop() {
+            pending.push(value);
+        }
+        pending.reverse();
+        let mut guard = RetainDropGuard {
+            vector: self,
+            pending,
+            armed: true,
+        };
+        // `Vec::retain` provides the same forward predicate/drop ordering and
+        // repairs its initialized prefix if either the predicate or a value
+        // destructor unwinds. The outer guard moves its surviving values back.
+        guard.pending.retain(&mut keep);
+
+        let count = guard.pending.len();
+        let written = guard
+            .vector
+            .storage
+            .as_mut()
+            .expect("nonempty retain preserves its allocation")
+            .extend_from_iter(&mut guard.pending.drain(..), count)
+            .expect("retained values fit in the original vector capacity");
+        debug_assert_eq!(written, count);
+        guard.armed = false;
     }
 
     /// Reduce capacity to the current length.
@@ -292,6 +369,76 @@ impl<T: CompactValue> CompactVec<T> {
         let mut cloned = Self::with_capacity(values.len())?;
         cloned.try_extend_copy(values)?;
         Ok(cloned)
+    }
+}
+
+struct RetainNoDropGuard<T: CompactValue> {
+    vector: *mut CompactVec<T>,
+    data: *mut T,
+    original_len: usize,
+    read: usize,
+    write: usize,
+    armed: bool,
+}
+
+impl<T: CompactValue> RetainNoDropGuard<T> {
+    fn finish(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: the guard is created from the vector's exclusive borrow and
+        // the `needs_drop == false` branch ensures truncating stale source
+        // copies cannot skip user destructors.
+        let vector = unsafe { &mut *self.vector };
+        let remaining = self.original_len - self.read;
+        // SAFETY: the unprocessed tail is initialized, `write <= read`, and
+        // `ptr::copy` supports the overlapping compacting move.
+        unsafe {
+            ptr::copy(
+                self.data.add(self.read),
+                self.data.add(self.write),
+                remaining,
+            )
+        };
+        let final_len = self.write + remaining;
+        vector
+            .storage
+            .as_mut()
+            .expect("retaining a nonempty vector preserves its allocation")
+            .truncate(final_len);
+        self.armed = false;
+    }
+}
+
+impl<T: CompactValue> Drop for RetainNoDropGuard<T> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+struct RetainDropGuard<'a, T: CompactValue> {
+    vector: &'a mut CompactVec<T>,
+    pending: std::vec::Vec<T>,
+    armed: bool,
+}
+
+impl<T: CompactValue> Drop for RetainDropGuard<'_, T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let count = self.pending.len();
+        if count == 0 {
+            return;
+        }
+        let written = self
+            .vector
+            .storage
+            .as_mut()
+            .expect("retain preserves its backing allocation")
+            .extend_from_iter(&mut self.pending.drain(..), count)
+            .expect("retained values fit in the original vector capacity");
+        debug_assert_eq!(written, count);
     }
 }
 
