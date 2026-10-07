@@ -9,4 +9,4 @@ keywords = ["arena", "memory", "compact", "std"]
 categories = ["memory-management"]
 
 [dependencies]
-compact_core = { version = "0.1.0", path = "../compact_core" }
+compact_core = { version = "2.1.0", path = "../compact_core" }
