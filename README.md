@@ -1,80 +1,108 @@
 # compact-std-library-rust
 
-V1 provides a backend-independent, `no_std` compact arena core and a hosted
-adapter using ordinary Rust `std` allocations. It is a memory runtime
-foundation; it does not replace Rust's standard library or process allocator.
+`compact_std` provides familiar Rust collection APIs over a scoped compact
+arena. Storage uses 32-bit byte offsets; application code keeps ordinary Rust
+control flow and opts into compact layouts with procedural macros. The project
+does not replace Rust's standard library or process allocator.
 
 ## Workspace crates
 
-- `compact_core` defines the V1 ABI, scoped arena, four-byte offsets, native
-  borrows, checked layout helpers, and packed `u8`/`u16`/`u32`/`u64` fields.
-- `compact_backend_std` provides fixed stable backing storage and a closure
-  API for hosted applications.
+- `compact_core` is the backend-independent `no_std` runtime. It owns the V1
+  ABI, checked allocations, offset views, initialized byte ranges, and packed
+  bit access.
+- `compact_backend_std` provides fixed stable memory backed by `std`.
+- `compact_collections` provides `CompactBox`, `CompactVec`, `CompactString`,
+  `CompactBitVec`, slabs, nullable offsets, and interning.
+- `compact_macros` provides `#[compact]` and lexical `arena!` rewriting.
+- `compact_std` re-exports the runtime, collections, macros, and prelude.
 
-One arena can address at most 2^32 bytes. Offset zero is reserved as null;
-allocations use byte offsets and account for alignment. Offset zero is
-reserved, so the smallest usable backing is two bytes. Arena use is scoped to
-a callback, so safe offsets cannot be resolved through another arena. Core
-allocations accept `Copy` values and never run destructors. Uninitialized
-allocations are represented as `MaybeUninit<T>` until explicitly written.
+One arena addresses at most 2^32 bytes. Offset zero remains the null sentinel,
+`Offset32<T>` remains four bytes, and the core stays backend-independent. Arena
+allocations use `Copy` values so native destructors are never silently skipped.
+Compact strings and collections own only arena-relative byte storage.
 
-Arena bytes are an in-memory runtime representation. V1 does not define a
-persistent file format, cross-process representation, or cross-target packed
-word byte order. Packed fields use LSB-first bit numbering within native
-numeric words.
-
-## Hosted example
+## Regular Rust style
 
 ```rust
-use compact_backend_std::StdArena;
-use compact_core::{Offset32, Result};
+use compact_std::prelude::*;
 
-let result = StdArena::with_capacity(4096, |arena| -> Result<u32> {
-    let value: Offset32<'_, u32> = arena.alloc_value(41)?;
-    *arena.get_mut(value)? += 1;
-    Ok(*arena.get(value)?)
-})??;
+StdArena::with_capacity(4096, |arena| -> Result<()> {
+    arena!(arena, {
+        let mut values = Vec::new();
+        values.push(10_u32)?;
+        values.push(20)?;
+        assert_eq!(values.get(1)?, Some(&20));
 
-assert_eq!(result, 42);
-```
-
-`StdBacking` can also own memory across multiple scoped arena operations:
-
-```rust
-use compact_backend_std::StdBacking;
-
-let mut backing = StdBacking::with_capacity(4096)?;
-let value = backing.with_arena(|arena| {
-    let offset = arena.alloc_value(42_u32)?;
-    Ok::<_, compact_backend_std::CoreError>(*arena.get(offset)?)
+        let mut text = String::from("hello")?;
+        text.push_str(" compact")?;
+        assert_eq!(text.as_str()?, "hello compact");
+        Ok(())
+    })
 })??;
 ```
 
-The standard backend uses a fixed `Vec<MaybeUninit<u8>>` allocation. Moving the
-owner does not move its heap buffer; it never grows after construction. The
-logical V1 limit is 4 GiB, but an allocation still depends on host address
-space and allocator availability. This portable backend does not reserve huge
-sparse virtual ranges, so large requests may consume substantial virtual or
-physical memory depending on the platform allocator.
+`arena!` rewrites supported constructors and arena-dependent methods only
+inside its block. It does not install ambient state. `vec![]` is rejected in
+an arena block because it would allocate a native `Vec`; use `Vec::new()` and
+`push` instead.
 
-## Cargo dependencies
+`CompactVec<T>` has twelve-byte offset/length/capacity metadata and requires
+`T: Copy`. Capacity doubles on growth; because a monotonic arena cannot reclaim
+old buffers, total vector payload allocations remain below twice the final
+capacity. `CompactSmallVec<T, N>` keeps up to `N` values in its own inline
+storage, then promotes to a compact arena vector. `CompactString` stores up to
+twelve UTF-8 bytes inline in a sixteen-byte handle and grows into initialized
+arena byte storage. Borrowed `&[T]`,
+`&[u8]`, and `&str` views are zero-copy and scoped to arena borrows.
 
-Path dependencies during local development:
+## Generated compact layouts
 
-```toml
-[dependencies]
-compact_core = { path = "../compact-std-library-rust/crates/compact_core" }
-compact_backend_std = { path = "../compact-std-library-rust/crates/compact_backend_std" }
+```rust
+use compact_std::prelude::*;
+
+const MAX_RETRIES: u64 = 7;
+
+#[compact]
+struct Job {
+    #[max = MAX_RETRIES]
+    retries: u64,
+    active: bool,
+    name: String,
+}
 ```
 
-Git dependencies before a registry release:
+`Job` remains a native logical struct. `job.compact_in(arena)` returns a
+`JobCompact` handle with checked getters and setters. Booleans and explicitly
+bounded unsigned integers are packed LSB-first. String payloads are copied to
+arena bytes and borrowed back as `&str`. `#[hot]` and `#[cold]` fields receive
+separate arena ranges. Fieldless enums receive compact discriminant wrappers
+and can also be fields in other generated layouts.
 
-```toml
-[dependencies]
-compact_core = { git = "https://github.com/Biddlebaddleboo/compact-std-library-rust", package = "compact_core" }
-compact_backend_std = { git = "https://github.com/Biddlebaddleboo/compact-std-library-rust", package = "compact_backend_std" }
+`#[compact(soa)]` additionally generates a scalar-column collection; boolean
+columns use a bit vector. The current macro supports named, non-generic structs
+whose fields are `bool`, fixed-width integer scalars, `String`, or an enum
+implementing the generated `CompactEnum` contract. SoA currently supports only
+`Copy` scalar fields. Unsupported pointers, references, generic layouts, and
+payload enums produce compile errors. Bounds must be const
+expressions; signed bounded fields need an explicit minimum and are not yet
+supported.
+
+The compact interner is optional and linearly scans compact range descriptors,
+avoiding a separate hash table for small sets. `CompactSlab` uses generation-
+checked handles and retires a slot before its generation can wrap.
+
+## Validation
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check -p compact_core --no-default-features
+cargo run --manifest-path fixtures/regular_rust_style/Cargo.toml
+cargo run --manifest-path fixtures/macro_layouts/Cargo.toml
 ```
 
-The crates are not claimed to be published on crates.io. `fixtures/consumer`
-is a standalone Cargo project that checks the public imports and hosted use
-without relying on workspace-private APIs.
+`fixtures/consumer` checks low-level imports; `fixtures/regular_rust_style` and
+`fixtures/macro_layouts` exercise the facade and generated layouts. Macro
+compile-fail diagnostics live under `crates/compact_std/tests/ui`.

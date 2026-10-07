@@ -68,6 +68,279 @@ impl<'arena, 'memory> Arena<'arena, 'memory> {
         self.capacity() - self.cursor
     }
 
+    /// Inspect the used arena prefix without claiming that any byte is
+    /// initialized. Alignment padding and uninitialized allocations remain
+    /// represented as [`MaybeUninit<u8>`](MaybeUninit).
+    pub fn used_uninit_bytes(&self) -> &[MaybeUninit<u8>] {
+        // SAFETY: the prefix is within `region`; MaybeUninit permits every
+        // initialization state and the shared arena borrow prevents mutation.
+        unsafe { core::slice::from_raw_parts(self.region.as_ptr(), self.cursor) }
+    }
+
+    /// Allocate and initialize an exact byte range from `bytes`.
+    ///
+    /// Empty input returns the canonical null range and consumes no storage.
+    pub fn alloc_bytes(&mut self, bytes: &[u8]) -> Result<crate::ByteRange32<'arena>> {
+        let len = u32::try_from(bytes.len()).map_err(|_| Error::OffsetOverflow)?;
+        if bytes.is_empty() {
+            return Ok(crate::ByteRange32::empty());
+        }
+        let raw = self.allocate(bytes.len(), 1)?;
+        let destination = self.region.as_mut_ptr().cast::<u8>();
+        // SAFETY: allocate reserved this exact range, and the immutable source
+        // cannot overlap the arena's exclusive backing borrow.
+        unsafe {
+            destination
+                .add(raw as usize)
+                .copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
+        }
+        Ok(crate::ByteRange32::new(raw, len))
+    }
+
+    /// Allocate an initialized zero-filled byte range.
+    ///
+    /// Zero is a valid `u8` value, so the returned range is safe to read and
+    /// mutate through [`get_bytes`](Self::get_bytes) and
+    /// [`get_bytes_mut`](Self::get_bytes_mut).
+    pub fn alloc_zeroed_bytes(&mut self, len: usize) -> Result<crate::ByteRange32<'arena>> {
+        let compact_len = u32::try_from(len).map_err(|_| Error::OffsetOverflow)?;
+        if len == 0 {
+            return Ok(crate::ByteRange32::empty());
+        }
+        let raw = self.allocate(len, 1)?;
+        let destination = self.region.as_mut_ptr().cast::<u8>();
+        // SAFETY: allocate reserved `len` bytes and u8 accepts the all-zero
+        // bit pattern. The exclusive arena borrow guarantees unique access.
+        unsafe {
+            destination.add(raw as usize).write_bytes(0, len);
+        }
+        Ok(crate::ByteRange32::new(raw, compact_len))
+    }
+
+    /// Borrow the exact initialized bytes in a byte allocation.
+    pub fn get_bytes<'view>(&'view self, range: crate::ByteRange32<'arena>) -> Result<&'view [u8]> {
+        if range.is_empty() {
+            return Ok(&[]);
+        }
+        let start = self.checked_range::<u8>(range.offset, range.len())?;
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
+        // SAFETY: the branded descriptor came from an initialized byte
+        // allocation (or an unsafe constructor whose caller guarantees it),
+        // and checked_range validates its full extent.
+        Ok(unsafe { native::slice(byte_ptr.add(start), range.len()) })
+    }
+
+    /// Mutably borrow the exact initialized bytes in a byte allocation.
+    pub fn get_bytes_mut<'view>(
+        &'view mut self,
+        range: crate::ByteRange32<'arena>,
+    ) -> Result<&'view mut [u8]> {
+        if range.is_empty() {
+            return Ok(&mut []);
+        }
+        let start = self.checked_range::<u8>(range.offset, range.len())?;
+        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        // SAFETY: the descriptor validates the complete initialized byte
+        // range and the exclusive arena borrow excludes all other references.
+        Ok(unsafe { native::slice_mut(byte_ptr.add(start), range.len()) })
+    }
+
+    /// Mutably inspect an exact initialized allocation as raw bytes.
+    ///
+    /// # Safety
+    ///
+    /// `offset` and `byte_len` must describe one exact allocation whose every
+    /// byte is initialized, with no padding bytes that may be uninitialized.
+    /// The caller must ensure every byte pattern written through the returned
+    /// slice preserves the validity of the underlying value, and must ensure
+    /// no other reference to that value is live while the slice exists.
+    pub unsafe fn get_bytes_mut_unchecked<'view, T>(
+        &'view mut self,
+        offset: Offset32<'arena, T>,
+        byte_len: usize,
+    ) -> Result<&'view mut [u8]> {
+        let start = self.checked_range::<T>(offset.raw, byte_len)?;
+        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        // SAFETY: the caller guarantees initialized bytes and preserves type
+        // validity; checked_range proves arena extent/alignment and &mut self
+        // guarantees exclusive access.
+        Ok(unsafe { native::slice_mut(byte_ptr.add(start), byte_len) })
+    }
+
+    /// Copy initialized bytes between two ranges in this arena.
+    pub fn copy_bytes(
+        &mut self,
+        source: crate::ByteRange32<'arena>,
+        destination: crate::ByteRange32<'arena>,
+        len: usize,
+    ) -> Result<()> {
+        if len > source.len() || len > destination.len() {
+            return Err(Error::OutOfBounds);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let source_start = self.checked_range::<u8>(source.offset, source.len())?;
+        let destination_start = self.checked_range::<u8>(destination.offset, destination.len())?;
+        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        // SAFETY: both ranges are checked initialized byte allocations. `copy`
+        // permits overlap, and `&mut self` guarantees exclusive arena access.
+        unsafe {
+            core::ptr::copy(
+                byte_ptr.add(source_start),
+                byte_ptr.add(destination_start),
+                len,
+            );
+        }
+        Ok(())
+    }
+
+    /// Read a sequence whose initialized prefix is tracked by a higher-level
+    /// container invariant.
+    ///
+    /// # Safety
+    ///
+    /// The first `initialized_len` elements of `allocation` must have been
+    /// initialized as valid `T` values and must remain initialized for this
+    /// borrow. No other reference may mutate them during the returned borrow.
+    pub unsafe fn get_slice_assume_init<'view, T: Copy + 'view>(
+        &'view self,
+        allocation: OffsetSlice32<'arena, MaybeUninit<T>>,
+        initialized_len: usize,
+    ) -> Result<&'view [T]> {
+        if initialized_len > allocation.len() {
+            return Err(Error::OutOfBounds);
+        }
+        let byte_len = checked_slice_bytes::<T>(initialized_len)?;
+        let start = self.checked_range::<MaybeUninit<T>>(allocation.offset.raw, byte_len)?;
+        let byte_ptr = self.region.as_ptr().cast::<u8>();
+        // SAFETY: the caller proves initialization; this method proves extent
+        // and alignment and bounds the reference to `self`.
+        Ok(unsafe { native::slice(byte_ptr.add(start).cast::<T>(), initialized_len) })
+    }
+
+    /// Mutably borrow a sequence whose initialized prefix is tracked by a
+    /// higher-level container invariant.
+    ///
+    /// # Safety
+    ///
+    /// The first `initialized_len` elements must be valid initialized `T`
+    /// values. The caller must ensure no other references or handles expose
+    /// those elements while the returned exclusive slice is alive.
+    pub unsafe fn get_slice_mut_assume_init<'view, T: Copy + 'view>(
+        &'view mut self,
+        allocation: OffsetSlice32<'arena, MaybeUninit<T>>,
+        initialized_len: usize,
+    ) -> Result<&'view mut [T]> {
+        if initialized_len > allocation.len() {
+            return Err(Error::OutOfBounds);
+        }
+        let byte_len = checked_slice_bytes::<T>(initialized_len)?;
+        let start = self.checked_range::<MaybeUninit<T>>(allocation.offset.raw, byte_len)?;
+        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        // SAFETY: the caller proves initialization and unique access; this
+        // method proves extent/alignment and ties the result to `&mut self`.
+        Ok(unsafe { native::slice_mut(byte_ptr.add(start).cast::<T>(), initialized_len) })
+    }
+
+    /// Copy an initialized prefix into a second reserved slice without
+    /// creating overlapping native borrows of the arena.
+    ///
+    /// # Safety
+    ///
+    /// The first `initialized_len` source elements must be valid initialized
+    /// `T` values. The destination must not be observed as initialized until
+    /// after this call succeeds.
+    pub unsafe fn copy_slice_assume_init<T: Copy>(
+        &mut self,
+        source: OffsetSlice32<'arena, MaybeUninit<T>>,
+        initialized_len: usize,
+        destination: OffsetSlice32<'arena, MaybeUninit<T>>,
+    ) -> Result<()> {
+        if initialized_len > source.len() || initialized_len > destination.len() {
+            return Err(Error::OutOfBounds);
+        }
+        if initialized_len == 0 {
+            return Ok(());
+        }
+        let byte_len = checked_slice_bytes::<T>(initialized_len)?;
+        let source_start = self.checked_range::<MaybeUninit<T>>(source.offset.raw, byte_len)?;
+        let destination_len = checked_slice_bytes::<T>(destination.len())?;
+        let destination_start =
+            self.checked_range::<MaybeUninit<T>>(destination.offset.raw, destination_len)?;
+        if initialized_len != 0 {
+            let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+            // SAFETY: both ranges are checked and the source initialization is
+            // guaranteed by the caller. `copy` supports overlap; Copy values
+            // require no ownership transfer or destructor bookkeeping.
+            unsafe {
+                core::ptr::copy(
+                    byte_ptr.add(source_start).cast::<T>(),
+                    byte_ptr
+                        .add(destination_start)
+                        .cast::<MaybeUninit<T>>()
+                        .cast::<T>(),
+                    initialized_len,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Initialize one element of a reserved uninitialized slice.
+    pub fn write_uninit_at<T: Copy>(
+        &mut self,
+        allocation: OffsetSlice32<'arena, MaybeUninit<T>>,
+        index: usize,
+        value: T,
+    ) -> Result<()> {
+        if index >= allocation.len() {
+            return Err(Error::OutOfBounds);
+        }
+        let byte_len = checked_slice_bytes::<T>(allocation.len())?;
+        let start = self.checked_range::<MaybeUninit<T>>(allocation.offset.raw, byte_len)?;
+        let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+        // SAFETY: the checked allocation includes `index`; MaybeUninit<T> has
+        // the same size/alignment as T and writing it initializes that slot.
+        unsafe {
+            byte_ptr
+                .add(start)
+                .cast::<MaybeUninit<T>>()
+                .add(index)
+                .write(MaybeUninit::new(value));
+        }
+        Ok(())
+    }
+
+    /// Initialize a prefix of a reserved uninitialized slice by copying values.
+    pub fn write_uninit_prefix<T: Copy>(
+        &mut self,
+        allocation: OffsetSlice32<'arena, MaybeUninit<T>>,
+        values: &[T],
+    ) -> Result<OffsetSlice32<'arena, T>> {
+        if values.len() > allocation.len() {
+            return Err(Error::OutOfBounds);
+        }
+        let byte_len = checked_slice_bytes::<T>(allocation.len())?;
+        let start = self.checked_range::<MaybeUninit<T>>(allocation.offset.raw, byte_len)?;
+        if !values.is_empty() {
+            let byte_ptr = self.region.as_mut_ptr().cast::<u8>();
+            // SAFETY: the destination has room for the source prefix, the
+            // source is initialized, and arena storage is exclusively borrowed.
+            unsafe {
+                byte_ptr
+                    .add(start)
+                    .cast::<MaybeUninit<T>>()
+                    .cast::<T>()
+                    .copy_from_nonoverlapping(values.as_ptr(), values.len());
+            }
+        }
+        Ok(OffsetSlice32::new(
+            Offset32::new(allocation.offset.raw),
+            u32::try_from(values.len()).map_err(|_| Error::OffsetOverflow)?,
+        ))
+    }
+
     /// Reserve uninitialized storage for one `Copy` value.
     ///
     /// The returned type is `MaybeUninit<T>` so it cannot be resolved as an

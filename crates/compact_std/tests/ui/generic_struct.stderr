@@ -1,0 +1,5 @@
+error: generic #[compact] structs are not supported yet; use a concrete wrapper type
+ --> tests/ui/generic_struct.rs:4:11
+  |
+4 | struct Bad<T> {
+  |           ^^^

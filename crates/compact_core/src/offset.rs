@@ -102,6 +102,12 @@ impl<'arena, T> OffsetSlice32<'arena, T> {
         self.len == 0
     }
 
+    /// Construct the canonical empty descriptor. It cannot be resolved as an
+    /// allocation, but is useful for containers with zero capacity.
+    pub const fn empty() -> Self {
+        Self::new(Offset32::null(), 0)
+    }
+
     /// Reconstruct a slice descriptor from raw parts.
     ///
     /// # Safety

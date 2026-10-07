@@ -1,0 +1,5 @@
+error: vec! allocates a native Vec; use Vec::new() and push compact values inside arena!
+ --> tests/ui/native_vec_macro.rs:7:27
+  |
+7 |             let _values = vec![1, 2, 3];
+  |                           ^^^^^^^^^^^^^

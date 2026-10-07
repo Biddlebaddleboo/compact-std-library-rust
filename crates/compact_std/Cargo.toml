@@ -1,0 +1,18 @@
+[package]
+name = "compact_std"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Ergonomic facade for compact arena Rust"
+keywords = ["arena", "compact", "std"]
+categories = ["data-structures", "memory-management"]
+
+[dependencies]
+compact_core = { path = "../compact_core", version = "0.1.0" }
+compact_backend_std = { path = "../compact_backend_std", version = "0.1.0" }
+compact_collections = { path = "../compact_collections", version = "0.1.0" }
+compact_macros = { path = "../compact_macros", version = "0.1.0" }
+
+[dev-dependencies]
+trybuild = "1"

@@ -1,0 +1,5 @@
+error: #[compact] enum currently supports fieldless variants only
+ --> tests/ui/payload_enum.rs:6:5
+  |
+6 |     Full(u32),
+  |     ^^^^^^^^^

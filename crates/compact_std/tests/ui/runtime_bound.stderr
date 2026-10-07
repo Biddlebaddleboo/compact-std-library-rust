@@ -1,0 +1,24 @@
+error[E0435]: attempt to use a non-constant value in a constant
+ --> tests/ui/runtime_bound.rs:6:17
+  |
+3 | fn build(maximum: u64) {
+  |          ------- this would need to be a `const`
+...
+6 |         #[max = maximum]
+  |                 ^^^^^^^
+
+error[E0434]: can't capture dynamic environment in a fn item
+ --> tests/ui/runtime_bound.rs:6:17
+  |
+6 |         #[max = maximum]
+  |                 ^^^^^^^
+  |
+  = help: use the `|| { ... }` closure form instead
+
+warning: unused variable: `maximum`
+ --> tests/ui/runtime_bound.rs:3:10
+  |
+3 | fn build(maximum: u64) {
+  |          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_maximum`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default

@@ -1,0 +1,5 @@
+error: unsupported compact field type; use bool, an integer scalar, or String
+ --> tests/ui/unsupported_pointer.rs:5:14
+  |
+5 |     pointer: *const u8,
+  |              ^^^^^^^^^

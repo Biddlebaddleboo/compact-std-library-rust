@@ -1,0 +1,13 @@
+error[E0080]: evaluation panicked: #[max] exceeds the field type's maximum
+ --> tests/ui/max_exceeds_type.rs:3:1
+  |
+3 | #[compact]
+  | ^^^^^^^^^^ evaluation of `BadCompact::<'_>::__COMPACT_VALUE_BITS` failed here
+
+note: erroneous constant encountered
+ --> tests/ui/max_exceeds_type.rs:3:1
+  |
+3 | #[compact]
+  | ^^^^^^^^^^
+  |
+  = note: this note originates in the attribute macro `compact` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -9,6 +9,7 @@
 mod abi;
 mod arena;
 mod backing;
+mod bytes;
 mod error;
 mod layout;
 mod native;
@@ -20,10 +21,11 @@ pub use abi::{
 };
 pub use arena::{with_arena, Arena};
 pub use backing::StableBacking;
+pub use bytes::ByteRange32;
 pub use error::{Error, Result};
 pub use layout::{bits_required, checked_align_up, smallest_word, StorageWord};
 pub use offset::{Offset32, OffsetSlice32};
-pub use packed::{validate_bit_range, BitField, PackedWord};
+pub use packed::{read_bits, validate_bit_range, write_bits, BitField, PackedWord};
 
 #[cfg(test)]
 extern crate std;

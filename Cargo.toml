@@ -2,6 +2,9 @@
 members = [
     "crates/compact_core",
     "crates/compact_backend_std",
+    "crates/compact_collections",
+    "crates/compact_macros",
+    "crates/compact_std",
 ]
 resolver = "2"
 

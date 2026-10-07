@@ -2,6 +2,65 @@
 
 use crate::{Error, Result};
 
+/// Read up to 64 LSB-first bits from an initialized byte range.
+///
+/// Bit zero is the least significant bit of `bytes[0]`. Fields may cross byte
+/// boundaries. A zero-width field reads as zero when `bit_offset` is in the
+/// inclusive range `0..=bytes.len() * 8`.
+pub fn read_bits(bytes: &[u8], bit_offset: usize, width: u8) -> Result<u64> {
+    let total_bits = bytes.len().checked_mul(8).ok_or(Error::OffsetOverflow)?;
+    validate_byte_bit_range(total_bits, bit_offset, width)?;
+    let mut value = 0_u64;
+    for index in 0..width as usize {
+        let position = bit_offset + index;
+        if bytes[position / 8] & (1 << (position % 8)) != 0 {
+            value |= 1_u64 << index;
+        }
+    }
+    Ok(value)
+}
+
+/// Write up to 64 LSB-first bits to an initialized byte range, preserving
+/// every bit outside the selected field.
+pub fn write_bits(bytes: &mut [u8], bit_offset: usize, width: u8, value: u64) -> Result<()> {
+    let total_bits = bytes.len().checked_mul(8).ok_or(Error::OffsetOverflow)?;
+    validate_byte_bit_range(total_bits, bit_offset, width)?;
+    let value_mask = if width == 64 {
+        u64::MAX
+    } else if width == 0 {
+        0
+    } else {
+        (1_u64 << width) - 1
+    };
+    if value & !value_mask != 0 {
+        return Err(Error::ValueDoesNotFit);
+    }
+    for index in 0..width as usize {
+        let position = bit_offset + index;
+        let mask = 1_u8 << (position % 8);
+        let byte = &mut bytes[position / 8];
+        if value & (1_u64 << index) == 0 {
+            *byte &= !mask;
+        } else {
+            *byte |= mask;
+        }
+    }
+    Ok(())
+}
+
+fn validate_byte_bit_range(total_bits: usize, offset: usize, width: u8) -> Result<()> {
+    if width > 64 {
+        return Err(Error::InvalidBitRange);
+    }
+    let end = offset
+        .checked_add(width as usize)
+        .ok_or(Error::OffsetOverflow)?;
+    if end > total_bits {
+        return Err(Error::InvalidBitRange);
+    }
+    Ok(())
+}
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for u8 {}

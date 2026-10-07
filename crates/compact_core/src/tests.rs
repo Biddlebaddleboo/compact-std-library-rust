@@ -1,8 +1,8 @@
 use core::mem::{align_of, MaybeUninit};
 
 use crate::{
-    bits_required, checked_align_up, smallest_word, with_arena, BitField, Error, Offset32,
-    PackedWord, StableBacking, StorageWord,
+    bits_required, checked_align_up, smallest_word, with_arena, BitField, ByteRange32, Error,
+    Offset32, PackedWord, StableBacking, StorageWord,
 };
 
 struct TestBacking {
@@ -262,4 +262,52 @@ fn packed_operations_cover_each_word_and_preserve_neighbors() {
         BitField::new(7, 2, 16).unwrap().extract(0_u8),
         Err(Error::InvalidBitRange)
     );
+}
+
+#[test]
+fn initialized_byte_ranges_are_exact_zero_copy_views() {
+    let mut backing = TestBacking::new(64);
+    let base = backing.bytes.as_mut_ptr().cast::<u8>() as usize;
+    with_arena(&mut backing, |arena| {
+        let bytes = arena.alloc_bytes(b"abc\0tail").unwrap();
+        let view = arena.get_bytes(bytes).unwrap();
+        assert_eq!(view, b"abc\0tail");
+        assert_eq!(view.as_ptr() as usize, base + bytes.offset() as usize);
+
+        arena.get_bytes_mut(bytes).unwrap()[0] = b'A';
+        assert_eq!(arena.get_bytes(bytes).unwrap(), b"Abc\0tail");
+
+        let copied = arena.alloc_zeroed_bytes(bytes.len()).unwrap();
+        arena.copy_bytes(bytes, copied, bytes.len()).unwrap();
+        assert_eq!(arena.get_bytes(copied).unwrap(), b"Abc\0tail");
+        assert_eq!(arena.get_bytes(ByteRange32::empty()).unwrap(), b"");
+        assert!(arena.used_uninit_bytes().len() >= arena.used_bytes());
+    })
+    .unwrap();
+}
+
+#[test]
+fn byte_bit_helpers_cross_byte_boundaries_and_preserve_neighbors() {
+    let mut bytes = [0b1010_0101, 0b1100_0011, 0b0101_1010];
+    let original = bytes;
+    crate::write_bits(&mut bytes, 5, 9, 0b1_1010_1101).unwrap();
+    assert_eq!(crate::read_bits(&bytes, 5, 9), Ok(0b1_1010_1101));
+    for position in 0..24 {
+        if !(5..14).contains(&position) {
+            assert_eq!(
+                bytes[position / 8] & (1 << (position % 8)),
+                original[position / 8] & (1 << (position % 8))
+            );
+        }
+    }
+    assert_eq!(
+        crate::write_bits(&mut bytes, 5, 3, 8),
+        Err(Error::ValueDoesNotFit)
+    );
+    assert_eq!(crate::read_bits(&bytes, 24, 0), Ok(0));
+    assert_eq!(
+        crate::write_bits(&mut bytes, 24, 0, 1),
+        Err(Error::ValueDoesNotFit)
+    );
+    assert_eq!(crate::read_bits(&bytes, 23, 2), Err(Error::InvalidBitRange));
 }

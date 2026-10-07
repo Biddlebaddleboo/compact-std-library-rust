@@ -1,0 +1,15 @@
+[package]
+name = "compact_collections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Arena-owned compact collections"
+keywords = ["arena", "compact", "collections"]
+categories = ["data-structures", "memory-management"]
+
+[dependencies]
+compact_core = { path = "../compact_core", version = "0.1.0" }
+
+[dev-dependencies]
+compact_backend_std = { path = "../compact_backend_std", version = "0.1.0" }
