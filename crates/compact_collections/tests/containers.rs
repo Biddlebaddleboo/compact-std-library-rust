@@ -130,6 +130,8 @@ fn compact_bytes_promotes_retains_capacity_and_returns_inline() {
         bytes.push(b'!', arena).unwrap();
         assert!(bytes.capacity() >= 21);
         assert_eq!(bytes.as_slice(), b"0123456789abcdefghij!");
+        assert_eq!(bytes.as_ptr(), bytes.as_slice().as_ptr());
+        bytes.with_ffi_bytes(|view| assert_eq!(view, b"0123456789abcdefghij!"));
 
         let heap_capacity = bytes.capacity();
         bytes.truncate(7);
@@ -553,6 +555,9 @@ fn compact_string_transitions_between_inline_and_arena_storage() {
         let text_view = text.as_str(arena).unwrap();
         assert_eq!(text_view, "abcdefghijklé");
         assert_eq!(text_view.as_ptr(), text.as_bytes(arena).unwrap().as_ptr());
+        assert_eq!(text.as_ptr(arena).unwrap(), text_view.as_ptr());
+        text.with_ffi_bytes(arena, |bytes| assert_eq!(bytes, "abcdefghijklé".as_bytes()))
+            .unwrap();
         assert!(text.truncate_in(13, arena).is_err());
         text.truncate_in(12, arena).unwrap();
         assert_eq!(text.as_str(arena).unwrap(), "abcdefghijkl");

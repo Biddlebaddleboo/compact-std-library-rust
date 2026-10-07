@@ -238,6 +238,21 @@ can be copied back to native standard-library types when needed. `FrozenValue`
 is an unsafe extension contract; read [SAFETY.md](SAFETY.md) before
 implementing it for a custom type.
 
+## Native interface boundaries
+
+Keep application data compact while it stays in Rust, and define `#[repr(C)]`
+records for the fields that cross a native boundary. For a synchronous call,
+`CompactBytes::with_ffi_bytes` and `CompactString::with_ffi_bytes` lend the
+initialized bytes to the callback; the native callee must finish using the
+pointer before the callback returns. `as_ptr`, `as_slice`, and `as_str` expose
+ordinary borrowed views when the caller can keep the Rust owner alive.
+
+When native code must retain bytes after the call, copy them explicitly with
+`FfiByteBuffer::copy_from_slice`, then release the allocation exactly once with
+`compact_std_ffi_bytes_free`. The exported value contains a native pointer,
+length, and capacity; its fields are an ownership token and must not be changed
+or freed twice. Arena offsets are never native object identities.
+
 `FromIteratorIn`, `ExtendIn`, and `CloneIn` make allocation-aware collection
 operations explicit. `ToCompactStringIn` formats through
 `CompactStringWriter`, preserving arena exhaustion as a collection error.

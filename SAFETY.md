@@ -209,3 +209,18 @@ storage. Unix values are reconstructed with `OsStringExt::from_vec`; Windows
 wide units are reconstructed with `OsStringExt::from_wide`. Borrowed compact
 views only expose slices of that private storage, so callers cannot violate
 the platform encoding invariant.
+
+## Native interface boundary
+
+Pointers returned by compact `as_ptr` methods are borrowed views. They remain
+valid only while the owning compact value and its backing are alive and the
+value is not mutated or reallocated. `with_ffi_bytes` bounds a borrowed slice
+to a synchronous callback; native code must not retain its pointer after the
+callback returns.
+
+`FfiByteBuffer` transfers an ordinary native `Vec<u8>` allocation. Its pointer,
+length, and capacity must remain unchanged, and the matching
+`compact_std_ffi_bytes_free` function must reclaim it exactly once. The free
+operation is unsafe because arbitrary or repeated raw parts cannot be safely
+validated. Do not use arena offsets as native identities or free them through
+a native allocator.

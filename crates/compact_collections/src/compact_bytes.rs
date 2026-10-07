@@ -112,6 +112,23 @@ impl<'arena> CompactBytes<'arena> {
         }
     }
 
+    /// Return a pointer to the initialized bytes.
+    ///
+    /// The pointer is valid only while this buffer remains alive and is not
+    /// mutated or reallocated. Prefer [`with_ffi_bytes`](Self::with_ffi_bytes)
+    /// for a synchronous native call.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.as_slice().as_ptr()
+    }
+
+    /// Expose the byte slice for the duration of a synchronous native call.
+    ///
+    /// A native callee must not retain the pointer after `call` returns. Use
+    /// `compact_std::FfiByteBuffer` when the bytes must outlive this borrow.
+    pub fn with_ffi_bytes<R>(&self, call: impl FnOnce(&[u8]) -> R) -> R {
+        call(self.as_slice())
+    }
+
     /// Mutably borrow the initialized bytes.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         match &mut self.repr {

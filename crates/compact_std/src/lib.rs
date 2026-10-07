@@ -5,7 +5,10 @@
 //! shortened locally with [`arena!`]. No global or thread-local arena context
 //! is installed.
 
+pub mod ffi;
 pub mod prelude;
+
+pub use ffi::{compact_std_ffi_bytes_free, FfiByteBuffer};
 
 pub use compact_backend_std::{
     CompactStore, RootHandle, StdArena, StdBackendError, StdBacking, StoreRoot,

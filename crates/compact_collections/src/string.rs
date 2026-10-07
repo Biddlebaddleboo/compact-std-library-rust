@@ -99,6 +99,27 @@ impl<'arena> CompactString<'arena> {
         core::str::from_utf8(self.as_bytes(arena)?).map_err(|_| CollectionError::InvalidUtf8)
     }
 
+    /// Return a pointer to the initialized UTF-8 bytes.
+    ///
+    /// The pointer is valid only while this string remains alive and is not
+    /// mutated or reallocated. Prefer [`with_ffi_bytes`](Self::with_ffi_bytes)
+    /// for a synchronous native call.
+    pub fn as_ptr(&self, arena: &Arena<'arena, '_>) -> Result<*const u8> {
+        Ok(self.as_bytes(arena)?.as_ptr())
+    }
+
+    /// Expose the UTF-8 bytes for the duration of a synchronous native call.
+    ///
+    /// A native callee must not retain the pointer after `call` returns. Use
+    /// `compact_std::FfiByteBuffer` when the bytes must outlive this borrow.
+    pub fn with_ffi_bytes<R>(
+        &self,
+        arena: &Arena<'arena, '_>,
+        call: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
+        Ok(call(self.as_bytes(arena)?))
+    }
+
     /// Append UTF-8 text, preserving the old value if arena allocation fails.
     pub fn push_str_in(&mut self, value: &str, arena: &mut Arena<'arena, '_>) -> Result<()> {
         if value.is_empty() {

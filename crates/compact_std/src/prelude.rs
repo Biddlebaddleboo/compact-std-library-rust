@@ -7,10 +7,10 @@ pub use crate::{
     CompactHashSet, CompactInterner, CompactOption, CompactOsStr, CompactOsString, CompactPath,
     CompactPathBuf, CompactPathDisplay, CompactRing, CompactSlab, CompactSmallVec, CompactStore,
     CompactStringWriter, CompactValue, CompactVecDeque, CompactVecDequeIter, CoreError, ExtendIn,
-    FreezeIn, FromIteratorIn, FrozenArena, FrozenBuilder, FrozenBytes, FrozenError, FrozenMap,
-    FrozenOsString, FrozenPathBuf, FrozenResult, FrozenRoot, FrozenSet, FrozenString, FrozenValue,
-    FrozenVec, FrozenVecDeque, HashMap, HashSet, InternId, OsString, PathBuf, Result, RootHandle,
-    SlabHandle, StdArena, StdBacking, StoreRoot, String, ToCompactStringIn, Vec,
+    FfiByteBuffer, FreezeIn, FromIteratorIn, FrozenArena, FrozenBuilder, FrozenBytes, FrozenError,
+    FrozenMap, FrozenOsString, FrozenPathBuf, FrozenResult, FrozenRoot, FrozenSet, FrozenString,
+    FrozenValue, FrozenVec, FrozenVecDeque, HashMap, HashSet, InternId, OsString, PathBuf, Result,
+    RootHandle, SlabHandle, StdArena, StdBacking, StoreRoot, String, ToCompactStringIn, Vec,
     COMPACT_BYTES_INLINE_CAPACITY,
 };
 

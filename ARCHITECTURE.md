@@ -75,6 +75,16 @@ serialized bytes. String and byte payloads are interned during building with a
 fallible descriptor registry and linear content comparison. Their handles stay
 `Copy`, and the registry is discarded when the builder is committed.
 
+## Native interface boundary
+
+Compact owners expose borrowed slices and strings for synchronous native
+calls. A native callee may use those pointers only for the duration of the
+borrowed call. `FfiByteBuffer` is the explicit copied path for data that must
+outlive its compact owner: it transfers a native `Vec` allocation and requires
+one matching `compact_std_ffi_bytes_free` call. Native records should use
+`repr(C)` and contain ordinary copied values or pointers from these explicit
+views, never compact arena offsets.
+
 ## Allocation
 
 New tail allocations use a bump-style path. Released allocations become
