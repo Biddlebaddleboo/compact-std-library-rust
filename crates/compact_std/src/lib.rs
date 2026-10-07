@@ -26,9 +26,14 @@ pub use compact_core::{
     Error as CoreError, Offset32, OffsetSlice32, PackedWord, StableBacking, StorageWord,
     ABI_VERSION, MAX_ARENA_BYTES, MIN_ARENA_BYTES, NULL_OFFSET, OFFSET_WIDTH_BYTES,
 };
+pub use compact_frozen::{
+    freeze_in, FreezeIn, FrozenArena, FrozenBuilder, FrozenBytes, FrozenError, FrozenMap,
+    FrozenOsString, FrozenPathBuf, FrozenResult, FrozenRoot, FrozenSet, FrozenString, FrozenValue,
+    FrozenVec, FrozenVecDeque,
+};
 #[cfg(feature = "serde")]
 pub use compact_macros::CompactDeserialize;
-pub use compact_macros::{arena, compact};
+pub use compact_macros::{arena, compact, CompactFreeze};
 #[cfg(feature = "json")]
 pub use compact_serde::json;
 #[cfg(feature = "toml")]
@@ -60,6 +65,8 @@ pub mod __private {
     pub use compact_collections as collections;
     /// Public core contracts used by generated code.
     pub use compact_core as core;
+    /// Immutable frozen contracts used by generated freeze implementations.
+    pub use compact_frozen as frozen;
     /// Direct compact Serde contracts used by generated implementations.
     #[cfg(feature = "serde")]
     pub use compact_serde as serde;

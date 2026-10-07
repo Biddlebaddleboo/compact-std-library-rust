@@ -4,6 +4,7 @@ members = [
     "crates/compact_backend_std",
     "crates/compact_collections",
     "crates/compact_serde",
+    "crates/compact_frozen",
     "crates/compact_macros",
     "crates/compact_std",
 ]

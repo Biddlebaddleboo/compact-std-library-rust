@@ -1,0 +1,147 @@
+error[E0277]: `NonNull<compact_std::__private::compact_core::allocation::ArenaState>` cannot be sent between threads safely
+ --> tests/ui/mutable_owners_are_not_send.rs:6:19
+  |
+6 |     assert_send::<Arena<'static, 'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^ `NonNull<compact_std::__private::compact_core::allocation::ArenaState>` cannot be sent between threads safely
+  |
+  = help: within `Arena<'static, 'static>`, the trait `Send` is not implemented for `NonNull<compact_std::__private::compact_core::allocation::ArenaState>`
+note: required because it appears within the type `Arena<'static, 'static>`
+ --> $WORKSPACE/crates/compact_core/src/arena.rs
+  |
+  | pub struct Arena<'arena, 'memory> {
+  |            ^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/mutable_owners_are_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut ()` cannot be sent between threads safely
+ --> tests/ui/mutable_owners_are_not_send.rs:6:19
+  |
+6 |     assert_send::<Arena<'static, 'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^ `*mut ()` cannot be sent between threads safely
+  |
+  = help: within `Arena<'static, 'static>`, the trait `Send` is not implemented for `*mut ()`
+note: required because it appears within the type `PhantomData<*mut ()>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `Arena<'static, 'static>`
+ --> $WORKSPACE/crates/compact_core/src/arena.rs
+  |
+  | pub struct Arena<'arena, 'memory> {
+  |            ^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/mutable_owners_are_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `NonNull<compact_std::__private::compact_core::allocation::ArenaState>` cannot be sent between threads safely
+ --> tests/ui/mutable_owners_are_not_send.rs:7:19
+  |
+7 |     assert_send::<ArenaAllocation<'static, u32>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `NonNull<compact_std::__private::compact_core::allocation::ArenaState>` cannot be sent between threads safely
+  |
+  = help: within `ArenaAllocation<'static, u32>`, the trait `Send` is not implemented for `NonNull<compact_std::__private::compact_core::allocation::ArenaState>`
+note: required because it appears within the type `ArenaAllocation<'static, u32>`
+ --> $WORKSPACE/crates/compact_core/src/allocation.rs
+  |
+  | pub struct ArenaAllocation<'arena, T: CompactValue> {
+  |            ^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/mutable_owners_are_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut u32` cannot be sent between threads safely
+ --> tests/ui/mutable_owners_are_not_send.rs:7:19
+  |
+7 |     assert_send::<ArenaAllocation<'static, u32>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut u32` cannot be sent between threads safely
+  |
+  = help: within `ArenaAllocation<'static, u32>`, the trait `Send` is not implemented for `*mut u32`
+note: required because it appears within the type `PhantomData<*mut u32>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `ArenaAllocation<'static, u32>`
+ --> $WORKSPACE/crates/compact_core/src/allocation.rs
+  |
+  | pub struct ArenaAllocation<'arena, T: CompactValue> {
+  |            ^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/mutable_owners_are_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `NonNull<compact_std::__private::compact_core::allocation::ArenaState>` cannot be sent between threads safely
+ --> tests/ui/mutable_owners_are_not_send.rs:8:19
+  |
+8 |     assert_send::<Vec<'static, u32>>();
+  |                   ^^^^^^^^^^^^^^^^^ `NonNull<compact_std::__private::compact_core::allocation::ArenaState>` cannot be sent between threads safely
+  |
+  = help: within `CompactVec<'static, u32>`, the trait `Send` is not implemented for `NonNull<compact_std::__private::compact_core::allocation::ArenaState>`
+note: required because it appears within the type `ArenaAllocation<'static, u32>`
+ --> $WORKSPACE/crates/compact_core/src/allocation.rs
+  |
+  | pub struct ArenaAllocation<'arena, T: CompactValue> {
+  |            ^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<ArenaAllocation<'static, u32>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `CompactVec<'static, u32>`
+ --> $WORKSPACE/crates/compact_collections/src/vec.rs
+  |
+  | pub struct CompactVec<'arena, T: CompactValue> {
+  |            ^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/mutable_owners_are_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut u32` cannot be sent between threads safely
+ --> tests/ui/mutable_owners_are_not_send.rs:8:19
+  |
+8 |     assert_send::<Vec<'static, u32>>();
+  |                   ^^^^^^^^^^^^^^^^^ `*mut u32` cannot be sent between threads safely
+  |
+  = help: within `CompactVec<'static, u32>`, the trait `Send` is not implemented for `*mut u32`
+note: required because it appears within the type `PhantomData<*mut u32>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `ArenaAllocation<'static, u32>`
+ --> $WORKSPACE/crates/compact_core/src/allocation.rs
+  |
+  | pub struct ArenaAllocation<'arena, T: CompactValue> {
+  |            ^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<ArenaAllocation<'static, u32>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `CompactVec<'static, u32>`
+ --> $WORKSPACE/crates/compact_collections/src/vec.rs
+  |
+  | pub struct CompactVec<'arena, T: CompactValue> {
+  |            ^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/mutable_owners_are_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut u32` cannot be sent between threads safely
+ --> tests/ui/mutable_owners_are_not_send.rs:9:19
+  |
+9 |     assert_send::<CompactStore<u32>>();
+  |                   ^^^^^^^^^^^^^^^^^ `*mut u32` cannot be sent between threads safely
+  |
+  = help: within `CompactStore<u32>`, the trait `Send` is not implemented for `*mut u32`
+note: required because it appears within the type `PhantomData<*mut u32>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `CompactStore<u32>`
+ --> $WORKSPACE/crates/compact_backend_std/src/store.rs
+  |
+  | pub struct CompactStore<T: StoreRoot> {
+  |            ^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/mutable_owners_are_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`

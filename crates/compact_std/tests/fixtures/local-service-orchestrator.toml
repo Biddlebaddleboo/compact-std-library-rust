@@ -2,6 +2,8 @@ system_id = "orchestrator.local"
 port = 8088
 names = ["api", "worker"]
 validation = ["ready", "healthy"]
+[metadata]
+workers = 4
 [paths]
 configPath = "/etc/orchestrator/service.toml"
 logPath = "/var/log/orchestrator"

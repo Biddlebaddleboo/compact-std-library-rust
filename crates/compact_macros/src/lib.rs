@@ -6,6 +6,7 @@ extern crate proc_macro;
 mod arena;
 mod compact;
 mod compact_deserialize;
+mod compact_freeze;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, Item};
@@ -42,6 +43,15 @@ pub fn compact(attributes: TokenStream, input: TokenStream) -> TokenStream {
 pub fn compact_deserialize(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
     compact_deserialize::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Generate an immutable frozen companion type for a named compact struct or
+/// unit enum.
+#[proc_macro_derive(CompactFreeze)]
+pub fn compact_freeze(input: TokenStream) -> TokenStream {
+    compact_freeze::expand(syn::parse_macro_input!(input as syn::DeriveInput))
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

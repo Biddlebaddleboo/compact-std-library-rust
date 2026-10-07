@@ -128,6 +128,28 @@ ownership model. Do not bypass their non-thread-safe design with unsafe
 `Send` or `Sync` implementations unless the entire allocator and lifetime
 model has been redesigned and re-audited.
 
+## Frozen values
+
+`FrozenArena` is a distinct immutable representation, not a mutable arena with
+thread-safety overrides. It is built only by trusted `FrozenBuilder` and
+`freeze_in` paths. Its storage is a private vector of aligned words; after
+finish, safe APIs expose only shared references to initialized ranges. There
+is no safe mutable access or arbitrary-byte mapping API.
+
+`FrozenValue` is unsafe because frozen storage relocates values by copying
+their initialized bytes and later shares immutable references across threads.
+An implementation must be `Copy + Send + Sync + 'static`, have alignment no
+greater than 64 bytes, and contain no references, owning pointers, interior
+mutability, address-sensitive state, or destructor obligations. Every stored
+value must already be valid. Violating this contract can cause undefined
+behavior. Library-owned frozen descriptors and generated companion structs
+implement it only from fields that satisfy the same contract.
+
+Arena identities are allocated during builder creation so copied handles
+cannot be accepted by another frozen arena even if a backing address is later
+reused. The identity lock is not used by frozen reads. No mutable arena owner
+or allocation token implements `Send` or `Sync` as part of this feature.
+
 ## Persistence and IPC
 
 Do not persist raw arena bytes as a durable format.

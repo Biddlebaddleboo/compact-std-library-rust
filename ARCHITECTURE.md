@@ -55,6 +55,24 @@ CompactValue + 'static`, so roots have no destructor to skip when their
 generative lifetime is erased. Arena-branded references and handles cannot
 escape either callback. Dropping the store releases the whole backing.
 
+### Frozen immutable graphs
+
+`FrozenArena` uses a separate immutable backing. `FreezeIn` traverses live
+compact values and copies payloads into a fresh offset space, then stores a
+typed root. The frozen backing has no free list, allocation headers, or
+`ArenaAllocation` tokens. Handles include a process-unique arena identity plus
+offset and length, so a handle from another or already-dropped arena is rejected
+before access. The backing contains only `FrozenValue` items, which are
+`Copy + Send + Sync` and have no destructor obligations. `FrozenArena` therefore
+gets `Send + Sync` from its fields without changing the mutable arena's
+single-owner threading contract. Frozen reads need no lock.
+
+Generated `CompactFreeze` companion structs contain only frozen handles and
+copy-safe scalars. The source graph remains borrowed and intact during the
+copy. Frozen maps and sets are compact sequences with linear lookup in this
+phase; the format is in-process only and is never constructed from arbitrary
+serialized bytes.
+
 ## Allocation
 
 New tail allocations use a bump-style path. Released allocations become

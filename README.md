@@ -39,6 +39,7 @@ may change without changing documented V2.1.0 source syntax or behavior.
 - `compact_backend_std` provides stable backing memory using `std`.
 - `compact_collections` provides arena-owned compact collections and handles.
 - `compact_serde` provides direct arena-aware Serde deserialization.
+- `compact_frozen` copies compact graphs into immutable shared backing.
 - `compact_macros` provides `#[compact]` and lexical `arena!` rewriting.
 - `compact_std` is the std-backed convenience facade that re-exports the
   runtime, collections, macros, and prelude.
@@ -205,6 +206,35 @@ Unsupported Serde attributes and unsupported enum payloads produce compile
 errors. Path and OS string inputs use the format's UTF-8 string representation.
 The JSON and TOML modules are optional features, so applications can use the
 core Serde traits without pulling in either parser.
+
+## Frozen configuration graphs
+
+`#[derive(CompactFreeze)]` generates a lifetime-free companion made from
+immutable frozen handles. `freeze_in` copies the live compact graph into a new
+backing and returns its arena and typed root:
+
+```rust
+let (frozen, root) = freeze_in(&config, arena)?;
+let frozen = std::sync::Arc::new(frozen);
+let config = root.get(&frozen)?;
+let id = config.system_id().as_str(&frozen)?;
+```
+
+`FrozenArena` owns only immutable values and offset descriptors. It has no
+allocator state or per-value reclamation, so `Arc<FrozenArena>` supports
+lock-free reads from worker threads. Frozen handles validate their arena
+identity before resolving an offset. The mutable source remains valid after a
+successful copy and if freezing fails.
+
+The derive supports named structs with scalars, `Option`, tuples, arrays,
+nested derived structs, and `CompactString`, `CompactBytes`, `CompactVec`,
+`CompactVecDeque`, `CompactHashMap`, `CompactHashSet`, `CompactOsString`, and
+`CompactPathBuf` fields. Unit enums must also implement `Copy`. Frozen maps and
+sets currently use linear lookup.
+`FrozenPathBuf` and `FrozenOsString` preserve platform-native code units and
+can be copied back to native standard-library types when needed. `FrozenValue`
+is an unsafe extension contract; read [SAFETY.md](SAFETY.md) before
+implementing it for a custom type.
 
 `FromIteratorIn`, `ExtendIn`, and `CloneIn` make allocation-aware collection
 operations explicit. `ToCompactStringIn` formats through

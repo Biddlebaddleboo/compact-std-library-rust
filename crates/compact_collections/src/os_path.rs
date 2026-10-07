@@ -116,6 +116,15 @@ pub struct CompactOsStr<'view> {
 }
 
 impl<'view> CompactOsStr<'view> {
+    /// Borrow the exact target-local bytes used by this compact OS string.
+    ///
+    /// Unix stores raw OS bytes. Windows stores UTF-16 code units in
+    /// little-endian byte order. The result is not a portable file format.
+    #[doc(hidden)]
+    pub fn as_encoded_bytes(self) -> &'view [u8] {
+        self.raw
+    }
+
     /// Convert to a native owned OS string without lossy conversion.
     pub fn to_os_string(self) -> OsString {
         native_os_string(self.raw)

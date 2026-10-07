@@ -1,0 +1,13 @@
+[package]
+name = "compact_frozen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Immutable frozen representations for compact arena values"
+keywords = ["arena", "compact", "frozen"]
+categories = ["data-structures", "memory-management"]
+
+[dependencies]
+compact_core = { path = "../compact_core", version = "2.1.0" }
+compact_collections = { path = "../compact_collections", version = "2.1.0" }
