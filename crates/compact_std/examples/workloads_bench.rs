@@ -136,8 +136,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ids = builder.store_slice(&ids)?;
     let graph = builder.finish(CatalogRoot { title, ids })?;
     black_box((
-        graph.str(graph.root().title)?,
-        graph.slice(graph.root().ids)?.len(),
+        graph.str(&graph.root().title)?,
+        graph.slice(&graph.root().ids)?.len(),
     ));
     report("frozen catalog", started, before);
     drop(graph);

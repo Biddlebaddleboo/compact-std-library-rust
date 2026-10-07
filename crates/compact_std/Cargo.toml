@@ -9,12 +9,12 @@ keywords = ["cage", "compact", "std"]
 categories = ["data-structures", "memory-management"]
 
 [dependencies]
-compact_serde = { path = "../compact_serde", version = "2.3.0", optional = true }
-compact_frozen = { path = "../compact_frozen", version = "2.3.0" }
-compact_core = { path = "../compact_core", version = "2.3.0" }
-compact_backend_std = { path = "../compact_backend_std", version = "2.3.0" }
-compact_collections = { path = "../compact_collections", version = "2.3.0" }
-compact_macros = { path = "../compact_macros", version = "2.3.0" }
+compact_serde = { path = "../compact_serde", version = "2.4.0", optional = true }
+compact_frozen = { path = "../compact_frozen", version = "2.4.0" }
+compact_core = { path = "../compact_core", version = "2.4.0" }
+compact_backend_std = { path = "../compact_backend_std", version = "2.4.0" }
+compact_collections = { path = "../compact_collections", version = "2.4.0" }
+compact_macros = { path = "../compact_macros", version = "2.4.0" }
 
 [features]
 default = []

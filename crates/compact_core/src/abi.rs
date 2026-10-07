@@ -1,4 +1,4 @@
-//! V2.3 compact cage representation rules.
+//! V2.4 compact cage representation rules.
 
 /// The compact runtime ABI version understood by this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,7 +11,7 @@ pub struct CompactAbiVersion {
 }
 
 /// Current compact runtime ABI version.
-pub const ABI_VERSION: CompactAbiVersion = CompactAbiVersion { major: 2, minor: 3 };
+pub const ABI_VERSION: CompactAbiVersion = CompactAbiVersion { major: 2, minor: 4 };
 
 /// Maximum logical span of the process cage.
 pub const MAX_CAGE_BYTES: u64 = 1_u64 << 32;

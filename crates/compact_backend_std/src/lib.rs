@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("compact_backend_std requires a 64-bit process ABI");
+
 mod cage;
 mod scratch;
 

@@ -1,109 +1,116 @@
-# Safety contracts
+# V2.4 safety contracts
 
-This document describes the unsafe invariants for the V2.3 process-wide cage.
-The crate-level APIs are safe only while these invariants hold.
+The safe APIs rely on the invariants below. Unsafe code is concentrated in the
+cage kernel and in narrowly scoped container guards/iterators.
 
 ## Compact values
 
-Implementing `CompactValue` is unsafe. A value must remain valid when moved
-between aligned cage slots with raw reads and writes. It must not be
-self-referential, address-sensitive, or require pinning. It must not store
-native pointers or references. Its destructor must be valid while the process
-cage remains alive.
+Implementing `CompactValue` is unsafe. Implementors must contain no retained
+native pointers or references, self-references, address-sensitive state, or
+pinning requirements. They must remain valid when moved with raw reads and
+writes between correctly aligned cage slots. Nested owners must also be
+cage-safe, and destructors must remain valid while the process cage exists.
+Integer scalars are allowed; an integer used as a disguised native pointer is
+not.
 
-Raw pointers and references are not compact offsets. Store an `Offset32<T>` or
-another compact descriptor when a value needs to name cage data. Resolve that
-offset only while an owner or graph holds the target alive.
+The trait cannot prove these facts for manual implementations. Generated code
+enforces the structural bounds it controls. `CageAllocation<T>` is non-copyable
+and ties safe slice/value borrows to its owner borrow.
 
-## Runtime and allocator
+## Cage pointers and allocator
 
-The process runtime is initialized once. Its backing allocation must remain at
-the same address until process termination. The runtime owns the sole retained
-native cage base pointer. Cage capacity is bounded by the 32-bit offset space,
-and offset zero is reserved.
+The cage backing is one stable raw allocation kept alive by `OnceLock`; the
+runtime retains its single native base pointer and releases it with the same
+eight-byte-aligned layout. The canonical resolver forms temporary pointers
+from `base + offset32`; collections do not retain those pointers. Unchecked
+resolvers are unsafe because the caller must prove the target is live,
+initialized, in bounds, and remains owned for the returned lifetime.
 
-Allocator metadata is protected by one mutex. No user code or value destructor
-runs while the allocator lock is held. A live owner exclusively controls its
-allocation header's initialized count and contents. Shared reads are permitted
-only through shared borrows; mutation requires the unique owner borrow.
+`CageState` has manual `Send` and `Sync` implementations because its raw base
+pointer cannot express the cage's range ownership in Rust's type system. The
+allocator mutex protects allocator scalars and free-list writes. Live data
+ranges are disjoint; owner headers are changed through an exclusive owner
+borrow or inside an allocator critical section. Unique owners govern data
+mutation, and `CageAllocation<T>` inherits thread-safety bounds from `T`
+through `PhantomData`.
 
-An allocation offset is issued only after the allocator reserves a complete
-block and writes its aligned header. The owner cannot be safely copied. On
-drop, it lowers the initialized count before each destructor call and releases
-the block exactly once. Free ranges are merged only after the owner has
-finished destruction.
+Allocator scalars and the intrusive free-list head are protected by one mutex.
+No user code or destructor runs under that lock. Free blocks contain initialized
+`u32` links and lengths, are sorted by offset, do not overlap, and are coalesced
+on release. Live and free extents account for the entire high-water prefix.
+There is no native allocation registry. Safe owners are valid because their
+offsets are private, issued by allocation, and transferred by Rust moves.
 
-The process never moves or resets cage storage. Consequently a safe reference
-formed from an owner remains backed for the reference lifetime. Unsafe offset
-resolution functions require callers to prove that an offset names an
-initialized value or byte range, that it is in bounds, and that its owner
-remains alive and borrowed for the returned lifetime.
+The live header is exactly four `u32` fields: block length, alignment prefix,
+capacity, and initialized count. Its start is derived from the owner offset and
+prefix. Typed accesses verify the header's capacity fits the reserved block.
+Offset arithmetic is checked before allocation metadata is updated.
 
-## Owner transfer and destruction
+`CageAllocation<T>` receives automatic `Send`/`Sync` behavior from `T` through
+its `PhantomData<T>`. Moving an owner between threads is safe when `T: Send`;
+shared reads require `T: Sync`. Mutation remains governed by exclusive Rust
+borrows. The allocator mutex synchronizes allocation and release, not the
+contents of live values.
 
-`CageAllocation<T>` uses raw reads and writes to move initialized values
-between cage slots. Every move clears the source initialized count before
-transferring elements, then records the destination count after all writes.
-Operations that can invoke user destructors use guards so unwinding does not
-drop an element twice or leave later initialized elements untracked.
+## Initialization, movement, and destruction
 
-Collections that store `MaybeUninit<T>` maintain their own initialized-slot
-state. Their `Drop` implementations clear each logical slot before dropping
-its value. Relocation allocates replacement storage first, then moves values
-without invoking user code between source removal and destination
-initialization.
+The header's initialized count is authoritative. `push` writes a slot before
+publishing the new count. `pop` removes the slot from the initialized prefix
+before reading it. Truncation lowers the count before each destructor call; a
+guard drops the remaining prefix if a destructor panics. Owner drop keeps the
+block live until all initialized values have been handled.
 
-Compact collection wrappers may themselves be stored as `CompactValue` only
-because their fields are compact offsets/scalars or inline `CompactValue`
-elements. Their destructors retain sole ownership of nested allocations.
+Relocation allocates the destination first. Once moving starts, raw reads and
+writes do not invoke user code. The source count is cleared before transfer and
+the destination count is published after all values are written. Collections
+that store `MaybeUninit<T>` maintain their own logical initialized-slot state
+and clear that state before moving or dropping an element.
 
-## Scratch regions
+`CompactVecDeque`, `CompactSmallVec`, and hash collections use drop guards so
+one panicking destructor does not cause a later element to be dropped twice.
+The guards hold temporary raw pointers tied to an exclusive borrow and never
+store pointers in compact state.
 
-Scratch storage is one ordinary cage allocation. Each returned mutable slice
-or value is bounded by a mutable borrow of its `ScratchRegion`; it cannot
-outlive the region through safe code. Scratch byte storage is initialized
-before returning a byte slice. Typed scratch values must be `Copy`, satisfy
-`CompactValue`, fit in the reserved extent, and require alignment no greater
-than the `u64` backing alignment.
+## Scratch
 
-Scratch does not run destructors for arbitrary stored values. Its typed API is
-restricted to `Copy` values, and byte access returns initialized bytes.
+Scratch is one normal cage owner. Its controller tracks a `u32` cursor and
+capacity. Returned references borrow the controller. Byte slices are
+zero-initialized before exposure. Typed scratch values are restricted to
+`Copy + CompactValue` with alignment no greater than eight; scratch does not
+accept arbitrary destructor-bearing values.
 
 ## Frozen graphs
 
-Implementing `FrozenValue` is unsafe. Values must be `Copy + Send + Sync +
-'static`, pointer-free, immutable, free of destructor obligations, and aligned
-to at most eight bytes. Their bytes must represent valid values after copying
-into the graph's aligned storage. The derive requires every field type to
-implement `FrozenValue`, in addition to the root type meeting the trait's
-supertrait bounds.
+Implementing `FrozenValue` is unsafe. Values are `Copy + Send + Sync + 'static`,
+pointer-free, immutable, have no destructor obligations, and are aligned to at
+most eight bytes. Their bytes must remain valid after copying to graph storage.
 
-Frozen descriptors include a graph identifier, offset, and length. Graph
-reads check that the identifier matches, arithmetic does not overflow, the
-range stays inside the completed graph, and typed offsets satisfy alignment
-before creating a reference. Graph storage is immutable after `finish` and is
-released when its unique `FrozenGraph` owner is dropped.
+Frozen typed-slice, string, and byte descriptors retain only an offset and
+length. Access methods take a reference to a descriptor stored inside the
+graph, verify that the descriptor itself lies in the graph's owned byte range,
+then validate the target range and typed alignment. This rejects a descriptor
+reference from another graph without retaining graph identity. Returned
+references borrow the graph, whose one cage allocation remains alive.
 
-## Packed values and macros
+## Collections and macros
 
-`#[compact]` accepts only field types for which its generated representation
-has a defined encoder and decoder. Accessors bounds-check bit ranges, validate
-declared maxima, and reject invalid enum discriminants. The macro does not
-emit native pointers. Its generated compact companion types implement
-`CompactValue` because they contain packed bytes and supported compact string
-owners only.
+Collection owners retain offsets, `u32` counts/indices, inline data, and
+per-slab stale-handle metadata. Native references in iterators and OS/path
+views are temporary borrow state. Hash table control bytes identify initialized
+entries; a slot is marked vacant before its pair is moved or dropped.
 
-## FFI
+`#[compact]` generated values contain packed bytes and cage-safe owners. The
+macro rejects unsupported retained fields rather than introducing pointers,
+arena arguments, or native allocation. `FrozenValue` derive requires every
+field to implement the unsafe frozen contract.
 
-Native pointers returned by scoped FFI callbacks are valid only for the
-callback's borrow. The caller must not retain them, free them, or use them
-after the owner is dropped or relocated. `FfiByteBuffer` owns a native `Vec`
-allocation and must be released exactly once with the matching free function.
-Never pass a cage offset as a native pointer.
+## Native interfaces and persistence
 
-## Persistence
+FFI callbacks may use a native pointer only while the scoped owner borrow is
+live. `FfiByteBuffer` is an explicit native copy and must be released exactly
+once by its matching free function. Never pass a cage offset as a native
+pointer or retain a callback pointer across owner relocation or drop.
 
-Raw cage bytes are not a persistent file, IPC, network, or cross-process
-format. They contain runtime layout and target-native representations. Use a
-defined external serialization format when data must survive process exit or
-move across process or machine boundaries.
+Raw cage bytes are process-local runtime representation. They are not a file,
+IPC, network, or cross-target format. Serialize logical data through a defined
+external format when it must outlive the process or move between machines.

@@ -1,4 +1,7 @@
-use compact_std::{CompactRuntime, FrozenBuilder, FrozenGraph, FrozenString, FrozenVec};
+use compact_std::{
+    CompactRuntime, FrozenBuilder, FrozenBytes, FrozenGraph, FrozenString, FrozenVec,
+};
+use core::mem::size_of;
 use std::sync::OnceLock;
 
 static INIT: OnceLock<()> = OnceLock::new();
@@ -85,6 +88,16 @@ fn packed_layouts_encode_and_update() {
 struct CatalogRoot {
     title: FrozenString,
     ids: FrozenVec<u32>,
+    empty: FrozenString,
+    unicode: FrozenString,
+    bytes: FrozenBytes,
+}
+
+#[test]
+fn frozen_descriptors_keep_eight_byte_representations() {
+    assert_eq!(size_of::<FrozenString>(), 8);
+    assert_eq!(size_of::<FrozenBytes>(), 8);
+    assert_eq!(size_of::<FrozenVec<u32>>(), 8);
 }
 
 #[test]
@@ -93,22 +106,39 @@ fn frozen_graph_owns_one_immutable_offset_domain() {
     let mut builder = FrozenBuilder::new().unwrap();
     let title = builder.store_str("edge-router").unwrap();
     let ids = builder.store_slice(&[4_u32, 8, 15, 16, 23, 42]).unwrap();
-    let graph: FrozenGraph<CatalogRoot> = builder.finish(CatalogRoot { title, ids }).unwrap();
-    assert_eq!(graph.str(graph.root().title).unwrap(), "edge-router");
+    let empty = builder.store_str("").unwrap();
+    let unicode = builder.store_str("café 🦀").unwrap();
+    let bytes = builder.store_bytes(&[0, 255, 1, 128]).unwrap();
+    let graph: FrozenGraph<CatalogRoot> = builder
+        .finish(CatalogRoot {
+            title,
+            ids,
+            empty,
+            unicode,
+            bytes,
+        })
+        .unwrap();
+    assert_eq!(graph.str(&graph.root().title).unwrap(), "edge-router");
     assert_eq!(
-        graph.slice(graph.root().ids).unwrap(),
+        graph.slice(&graph.root().ids).unwrap(),
         &[4, 8, 15, 16, 23, 42]
     );
+    assert_eq!(graph.str(&graph.root().empty).unwrap(), "");
+    assert_eq!(graph.str(&graph.root().unicode).unwrap(), "café 🦀");
+    assert_eq!(graph.bytes(&graph.root().bytes).unwrap(), &[0, 255, 1, 128]);
     assert!(graph.used_bytes() >= 8);
 
     let other = FrozenBuilder::new().unwrap();
     let other_graph = other.finish(0_u32).unwrap();
-    assert!(other_graph.str(title).is_err());
+    assert!(other_graph.str(&title).is_err());
+    assert!(other_graph.str(&graph.root().title).is_err());
+    let copied = graph.root().title;
+    assert!(graph.str(&copied).is_err());
 
     std::thread::scope(|scope| {
         for _ in 0..4 {
             let graph = &graph;
-            scope.spawn(move || assert_eq!(graph.str(graph.root().title).unwrap(), "edge-router"));
+            scope.spawn(move || assert_eq!(graph.str(&graph.root().title).unwrap(), "edge-router"));
         }
     });
 }

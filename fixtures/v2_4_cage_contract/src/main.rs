@@ -58,13 +58,13 @@ fn main() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     let title = builder.store_str("catalog")?;
     let ids = builder.store_slice(&[3_u32, 5, 8])?;
     let graph = builder.finish(CatalogRoot { title, ids })?;
-    assert_eq!(graph.str(graph.root().title)?, "catalog");
-    assert_eq!(graph.slice(graph.root().ids)?, &[3, 5, 8]);
+    assert_eq!(graph.str(&graph.root().title)?, "catalog");
+    assert_eq!(graph.slice(&graph.root().ids)?, &[3, 5, 8]);
 
     let bytes = CompactBytes::from_slice(b"ffi")?;
     bytes.with_ffi_bytes(|view| assert_eq!(view, b"ffi"));
 
     let _ = compact_std::json::from_str::<CompactVec<CompactString>>(r#"["a","b"]"#)?;
-    println!("V2.3 cage bytes used: {}", CompactRuntime::used_bytes()?);
+    println!("V2.4 cage bytes used: {}", CompactRuntime::used_bytes()?);
     Ok(())
 }

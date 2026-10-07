@@ -6,13 +6,21 @@ use core::mem::MaybeUninit;
 ///
 /// # Safety
 ///
-/// Implementors must be valid at their ordinary Rust alignment in cage
-/// storage, and moving a value with `ptr::read`/`ptr::write` to another slot
-/// must preserve its invariants. A value must not depend on its own address,
-/// require pinning, or contain native pointers or references. Cage references
-/// must be represented as compact offsets and resolved only while their owner
-/// is borrowed. Its destructor must be safe to run while the process cage
-/// remains alive.
+/// Implementors must satisfy all of the following:
+///
+/// - contain no retained native pointers or references, including pointers
+///   disguised as integers when correctness depends on their address;
+/// - contain no self-reference, address-sensitive state, or pinning requirement;
+/// - remain valid when transferred with `ptr::read`/`ptr::write` to another
+///   correctly aligned cage slot;
+/// - use only cage-safe representations for nested ownership and links;
+/// - remain safe to destroy while the process cage is alive.
+///
+/// Cage-relative offsets are resolved to native pointers only as temporary
+/// views whose lifetimes are tied to a safe owner's borrow. Implementations do
+/// not need to prove kernel-owned pointer arithmetic or initialization facts in
+/// safe Rust; those are upheld by the unsafe cage kernel. Manual unsafe impls
+/// remain the implementor's responsibility.
 pub unsafe trait CompactValue {}
 
 macro_rules! compact_values {

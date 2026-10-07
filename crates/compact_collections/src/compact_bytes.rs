@@ -8,7 +8,7 @@ use core::ops::{Deref, DerefMut, Index, IndexMut};
 
 use crate::{CollectionError, Result};
 
-/// Inline payload selected for the V2.3 byte wrapper.
+/// Inline payload selected for the V2.4 byte wrapper.
 pub const COMPACT_BYTES_INLINE_CAPACITY: usize = 20;
 
 enum BytesRepr {

@@ -10,13 +10,17 @@ use crate::{CollectionError, Result};
 /// A compact vector that stores up to `N` values inline before promoting to the cage.
 pub struct CompactSmallVec<T: CompactValue, const N: usize> {
     inline: [MaybeUninit<T>; N],
-    inline_len: usize,
+    inline_len: u32,
     heap: Option<CageAllocation<T>>,
 }
 
 impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
     /// Construct an empty small vector.
     pub fn new() -> Self {
+        assert!(
+            N <= u32::MAX as usize,
+            "inline capacity exceeds compact count range"
+        );
         Self {
             inline: core::array::from_fn(|_| MaybeUninit::uninit()),
             inline_len: 0,
@@ -25,7 +29,9 @@ impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
     }
     /// Return the initialized element count.
     pub fn len(&self) -> usize {
-        self.heap.as_ref().map_or(self.inline_len, |h| h.len())
+        self.heap
+            .as_ref()
+            .map_or(self.inline_len as usize, |h| h.len())
     }
     /// Return available inline or cage capacity.
     pub fn capacity(&self) -> usize {
@@ -61,7 +67,8 @@ impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
         let mut replacement = CompactRuntime::alloc_owned_slice::<T>(capacity)?;
         // SAFETY: exactly `inline_len` inline slots are initialized and become moved.
         unsafe {
-            replacement.move_from_uninit_slice(self.inline.as_mut_ptr(), self.inline_len)?;
+            replacement
+                .move_from_uninit_slice(self.inline.as_mut_ptr(), self.inline_len as usize)?;
         }
         self.inline_len = 0;
         self.heap = Some(replacement);
@@ -69,8 +76,8 @@ impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
     }
     /// Append a value.
     pub fn push(&mut self, value: T) -> Result<()> {
-        if self.heap.is_none() && self.inline_len < N {
-            self.inline[self.inline_len].write(value);
+        if self.heap.is_none() && (self.inline_len as usize) < N {
+            self.inline[self.inline_len as usize].write(value);
             self.inline_len += 1;
             return Ok(());
         }
@@ -87,7 +94,9 @@ impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
             return heap.as_slice();
         }
         // SAFETY: inline prefix is tracked by inline_len.
-        unsafe { core::slice::from_raw_parts(self.inline.as_ptr().cast::<T>(), self.inline_len) }
+        unsafe {
+            core::slice::from_raw_parts(self.inline.as_ptr().cast::<T>(), self.inline_len as usize)
+        }
     }
     /// Mutably borrow all initialized values.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
@@ -96,7 +105,10 @@ impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
         }
         // SAFETY: inline prefix is uniquely borrowed and tracked by inline_len.
         unsafe {
-            core::slice::from_raw_parts_mut(self.inline.as_mut_ptr().cast::<T>(), self.inline_len)
+            core::slice::from_raw_parts_mut(
+                self.inline.as_mut_ptr().cast::<T>(),
+                self.inline_len as usize,
+            )
         }
     }
     /// Return an initialized value by index.
@@ -117,7 +129,7 @@ impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
         }
         self.inline_len -= 1;
         // SAFETY: the former final slot was initialized and is now removed from the prefix.
-        Some(unsafe { self.inline[self.inline_len].assume_init_read() })
+        Some(unsafe { self.inline[self.inline_len as usize].assume_init_read() })
     }
     /// Drop values after `len`.
     pub fn truncate(&mut self, len: usize) {
@@ -125,10 +137,10 @@ impl<T: CompactValue, const N: usize> CompactSmallVec<T, N> {
             heap.truncate(len);
             return;
         }
-        while self.inline_len > len {
+        while self.inline_len as usize > len {
             self.inline_len -= 1;
             // SAFETY: length is lowered before the destructor is called.
-            unsafe { self.inline[self.inline_len].assume_init_drop() };
+            unsafe { self.inline[self.inline_len as usize].assume_init_drop() };
         }
     }
     /// Drop all values and keep current storage.

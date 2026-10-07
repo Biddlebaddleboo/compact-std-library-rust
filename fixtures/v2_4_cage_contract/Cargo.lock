@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "compact_backend_std"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "compact_core",
 ]
 
 [[package]]
 name = "compact_collections"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "compact_backend_std",
  "compact_core",
@@ -19,11 +19,11 @@ dependencies = [
 
 [[package]]
 name = "compact_core"
-version = "2.3.0"
+version = "2.4.0"
 
 [[package]]
 name = "compact_frozen"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "compact_backend_std",
  "compact_core",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "compact_macros"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "compact_serde"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "compact_backend_std",
  "compact_collections",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "compact_std"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "compact_backend_std",
  "compact_collections",
@@ -234,8 +234,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
-name = "v2_3_cage_contract"
-version = "2.3.0"
+name = "v2_4_cage_contract"
+version = "2.4.0"
 dependencies = [
  "compact_std",
 ]

@@ -9,4 +9,4 @@ keywords = ["cage", "memory", "compact", "std"]
 categories = ["memory-management"]
 
 [dependencies]
-compact_core = { version = "2.3.0", path = "../compact_core" }
+compact_core = { version = "2.4.0", path = "../compact_core" }

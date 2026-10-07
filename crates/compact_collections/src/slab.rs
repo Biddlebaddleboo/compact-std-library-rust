@@ -54,9 +54,21 @@ impl<T: CompactValue> CompactSlab<T> {
     /// Create a slab with the requested number of slots.
     pub fn with_capacity(capacity: usize) -> Result<Self> {
         let capacity = u32::try_from(capacity).map_err(|_| CollectionError::CapacityOverflow)?;
-        let slab_id = NEXT_SLAB_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| CollectionError::Core(compact_core::Error::OffsetOverflow))?;
+        let mut slab_id = NEXT_SLAB_ID.load(Ordering::Relaxed);
+        loop {
+            let next_id = slab_id
+                .checked_add(1)
+                .ok_or(CollectionError::Core(compact_core::Error::OffsetOverflow))?;
+            match NEXT_SLAB_ID.compare_exchange_weak(
+                slab_id,
+                next_id,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => slab_id = current,
+            }
+        }
         let mut slots = CompactRuntime::alloc_owned_slice::<Slot<T>>(capacity as usize)?;
         for index in 0..capacity {
             slots.push(Slot {

@@ -1,6 +1,6 @@
 [package]
-name = "v2_3_cage_contract"
-version = "2.3.0"
+name = "v2_4_cage_contract"
+version = "2.4.0"
 edition = "2021"
 publish = false
 

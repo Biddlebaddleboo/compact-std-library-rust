@@ -1,107 +1,146 @@
-# V2.3 architecture
+# V2.4 architecture
 
-V2.3 has one process-wide compact cage. The cage is a stable byte allocation;
-all retained compact addresses are 32-bit offsets into that allocation. Native
-Rust references, allocator bookkeeping, syscalls, and FFI continue to use
-ordinary native pointers.
+V2.4 keeps a normal 64-bit Rust process and one stable process-wide cage.
+Native references, `usize`, libc, syscalls, and third-party dependencies keep
+the platform ABI. Retained cage addresses, owners, links, and descriptors use
+32-bit offsets or counts.
 
-## Runtime
+## Runtime and allocator
 
-`CompactRuntime::init(CageConfig::new(capacity))` creates the cage once using
-a process-wide `OnceLock`. The requested capacity must be at least 64 bytes and
-must fit the 32-bit address domain. Initialization fails if the runtime is
-already initialized, and the backing remains alive until process termination.
-No public reset or teardown operation exists.
+`CompactRuntime::init` creates the cage once through a process-wide `OnceLock`.
+The backing allocation stays at one address until process exit; there is no
+reset or public teardown. Runtime state retains one native base pointer, its
+configured capacity, and one mutex protecting allocator scalars. Reading live
+values does not acquire that mutex.
 
-Runtime state contains the one native base pointer, capacity, and a mutex for
-allocator metadata. The allocator uses a monotonic cursor and coalescing free
-ranges. Allocation, resize, and release update that metadata under the lock.
-Reading or mutating a live value through its unique owner does not acquire the
-allocator lock. Cage exhaustion is an error; allocations never silently move
-to the native heap.
+The allocator contains a `u32` high-water cursor, `u32` live-byte count, and a
+`u32` free-list head. Free blocks hold an eight-byte `{ next, len }` node at
+their start. The list is sorted by offset. Allocation is deterministic
+first-fit; a range is split when its remainder can hold a node. Release merges
+neighboring blocks and contracts the high-water tail. There is no native map,
+set, or heap allocation for allocator bookkeeping.
 
-## Offsets and owners
+The common live header is four `u32` fields and is exactly 16 bytes:
 
-`Offset32<T>` is a four-byte non-owning descriptor. `OffsetSlice32<T>` and
-`ByteRange32` store an offset and length in eight bytes. Zero is reserved for
-null. Safe code cannot construct an arbitrary non-null offset; the unchecked
-constructors require the caller to prove that the target is live and remains
-owned.
+| Field | Meaning |
+| --- | --- |
+| `block_len` | Full reserved extent, including alignment prefix |
+| `prefix` | Bytes from block start to the header |
+| `capacity` | Typed element capacity |
+| `initialized` | Initialized element count |
 
-`CageAllocation<T>` is a unique four-byte owner. It contains an offset and a
-zero-sized type marker, while the allocation header stores the block extent,
-alignment prefix, element capacity, and initialized length. `Option` uses the
-zero offset niche and remains four bytes. Dropping an owner drops its
-initialized values and returns its block to the allocator.
+The block start is derived from the data offset, header size, and prefix. The
+header stores no magic value, native pointer, or redundant block-start offset.
+The cage config is limited to the `u32` cursor range; the compact offset domain
+itself remains 32 bits.
 
-`CompactBox<T>` and `CompactVec<T>` each contain one optional owner and are
-four bytes. `CompactVecDeque<T>` adds a head and length and is twelve bytes.
-Inline-first types, hash tables, slabs, and path/string wrappers include the
-extra metadata required by their behavior. Collection methods return
-allocation errors explicitly.
+## Pointer resolution and ownership
 
-The cage base is not stored in compact values or owners. Access resolves an
-owner offset against the base in runtime state for the duration of a Rust
-borrow. Compact byte offsets are not native addresses and must not cross an
-FFI boundary as pointers.
+The kernel has one conversion from a cage offset to a temporary native pointer:
 
-## Collection storage
+```text
+retained:  offset32
+borrowed:  cage_base + offset32 -> pointer/reference
+after:     no pointer retained by cage-aware state
+```
 
-Owning collections keep their payloads in cage allocations. Types that need
-initialized-prefix tracking use the allocation header; circular queues track
-their head and logical length; hash tables use compact control bytes and
-`MaybeUninit` entry slots. Hash maps use randomized SipHash keys by default.
-Slab generations protect independently copyable slot handles from reuse.
+`CageAllocation<T>` stores one nonzero offset and a zero-sized type marker. It
+is non-copyable, so Rust move semantics transfer its unique ownership. Its
+capacity and initialized length live in the allocation header. `Drop` lowers
+the initialized count before each destructor call and then returns the block to
+the intrusive free list.
 
-`CompactValue` is the unsafe relocation contract. Values must be valid at
-their normal alignment in the cage, must not depend on their address or
-pinning, must not contain native pointers or references, and must be safe to
-destroy while the cage exists. The caller of an unsafe implementation is
-responsible for upholding these conditions.
+Safe owner methods tie returned references to the owner borrow. The public
+unchecked offset resolvers are unsafe and require the caller to prove liveness,
+initialization, bounds, and the returned borrow lifetime. Compact offsets are
+not C, Swift, JNI, or syscall pointers.
 
-## Scratch allocation
+## Representation table
 
-`ScratchRegion` owns one cage block and advances a stack-held byte cursor.
-Capacity is rounded to whole `u64` slots. Byte slices are zero-filled;
-`alloc_value` accepts `Copy + CompactValue` values with alignment at most
-eight. Returned mutable references borrow the region, and dropping it returns
-the whole block to the cage.
+| Type | Size |
+| --- | ---: |
+| `Offset32<T>` | 4 B |
+| `OffsetSlice32<T>` | 8 B |
+| `ByteRange32` | 8 B |
+| `CageAllocation<T>` | 4 B |
+| `Option<CageAllocation<T>>` | 4 B |
+| `CompactBox<T>` | 4 B |
+| `CompactVec<T>` | 4 B |
+| `CompactVecDeque<T>` | 12 B |
+| `AllocationHeader` | 16 B |
+| `FreeNode` | 8 B |
+| `FrozenVec<T>` | 8 B |
+| `FrozenString` | 8 B |
+| `FrozenBytes` | 8 B |
+
+`usize` remains valid for ordinary scalar values and temporary indexing. The
+rule applies to retained addressing and links, not every integer field.
+
+## Collections
+
+Vectors keep capacity and initialized length in their allocation header, so
+the owner remains four bytes. Deques add a `u32` head and length. Hash tables
+keep controls and entries in cage allocations; their length and tombstone
+counts are `u32`. The randomized SipHash builder retains only two integer keys.
+
+Small vectors keep an inline initialized count as `u32`; their inline array is
+part of the wrapper. Strings and bytes use inline payloads, then promote to a
+four-byte cage owner. OS strings and paths store exact platform bytes in
+`CompactBytes`; native `OsString`/`PathBuf` values are temporary conversions.
+
+Slab handles contain a slot index, generation, and slab identity, all `u32`.
+The generation rejects stale handles after slot reuse. The slab ID remains
+because handles are copyable and can be presented to any slab; it rejects a
+valid-looking handle from another slab. This identity is local to slabs and is
+not attached to ordinary cage owners.
+
+## Scratch regions
+
+`ScratchRegion` owns one block in the same cage. Its controller stores a `u32`
+cursor and capacity. It returns zero-filled byte slices or aligned
+`Copy + CompactValue` values with alignment at most eight. Returned borrows
+cannot outlive the controller. Scratch does not run destructors for arbitrary
+values.
 
 ## Frozen graphs
 
-`FrozenBuilder` uses a temporary native construction buffer. `finish` copies
-the completed bytes into one `CageAllocation<u64>` and returns a
-`FrozenGraph<T>` that owns that single block. The builder and its temporary
-buffer are then dropped. Frozen descriptors contain offsets, lengths, and a
-graph identity; reads validate identity, alignment, and range before forming
-a reference.
+`FrozenBuilder` uses a temporary native `Vec<u64>` and copies the completed
+graph into one cage allocation. The retained typed-slice, string, and byte
+descriptors each contain only `{ offset: u32, len: u32 }`.
 
-Frozen data is immutable after finishing. `FrozenValue` requires `Copy`,
-`Send`, `Sync`, `'static`, alignment no greater than eight, no native pointers
-or interior mutability, and no destructor. The graph can therefore be shared
-for lock-free reads. Unique graph identifiers prevent a descriptor from one
-graph being accepted by another.
+Graph reads accept a reference to a descriptor stored inside that graph. The
+kernel checks that the descriptor reference lies within the graph's owned byte
+range, then checks its target range and alignment. This temporary in-graph
+reference provides graph identity without storing a graph ID in each
+descriptor. A copied descriptor outside the graph is rejected, as is a
+reference to a descriptor in a different graph. Returned data borrows the
+`FrozenGraph` and can be shared for immutable parallel reads.
 
-## Serde and packed layouts
+`FrozenValue` remains an unsafe contract: values are `Copy + Send + Sync +
+'static`, pointer-free, immutable, have no destructor, and are aligned to at
+most eight bytes. The derive enforces the field trait bounds for generated
+types.
 
-Direct Serde visitors create supported compact values in the initialized
-process cage. They own each partial value as it is built, so a parse or
-allocation error drops the partial result. The parser helpers need no
-allocation-context argument.
+## Serde, macros, and native boundaries
 
-`#[compact]` emits packed byte storage and checked accessors for supported
-structs and fieldless enums. It uses bit offsets and widths rather than
-references to runtime storage. `#[compact(soa)]` can also emit primitive
-column storage.
+Direct Serde visitors construct compact fields in the initialized process
+cage. Partial values own their allocations and are dropped on parse or
+allocation errors. Parser APIs need no runtime argument.
 
-## Native boundary
+`#[compact]` emits packed bytes and checked accessors. It does not rewrite
+lifetimes or add arena/runtime parameters. Generated retained state contains
+compact values, offsets, packed scalars, or inline payloads.
 
-An FFI callback receives a temporary native borrow resolved from the compact
-owner. The pointer is valid only during that borrow and while the owner is not
-relocated or dropped. `FfiByteBuffer` is an explicit native allocation for
-interfaces that retain memory; it is freed through its matching library
-function.
+FFI callbacks receive temporary native borrows resolved from an owner. A
+foreign caller that needs retained memory receives an explicit native copy
+through `FfiByteBuffer`; a cage offset is never exported as a pointer.
 
-Compact cage bytes are process-local runtime representation, not a stable
-serialization or cross-process ABI. Use an external serialization format for
-persistent or transferred data.
+## Portable implementation
+
+The V2.4 kernel uses ordinary Rust and atomics/mutexes. No assembly or
+architecture-specific implementation was needed to meet the representation or
+correctness goals. The portable Rust implementation is the reference path.
+
+Compact cage bytes are process-local runtime representation, not a stable file,
+IPC, network, or cross-target format. Use an external serialization format for
+data that must persist or move between processes or machines.

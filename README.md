@@ -4,9 +4,9 @@
 compact cage. Compact addresses are 32-bit byte offsets; Rust references and
 native interfaces continue to use ordinary native pointers.
 
-## V2.3 contract
+## V2.4 contract
 
-V2.3 uses one cage address space per process. Initialize it once with an
+V2.4 uses one cage address space per process. Initialize it once with an
 explicit capacity before creating compact values:
 
 ```rust
@@ -51,9 +51,10 @@ the cage base once; an offset is resolved only while an owner or graph keeps
 its allocation alive.
 
 `CageAllocation<T>` is a unique, non-copy owner represented by one four-byte
-offset. It tracks capacity and initialized length in allocation metadata,
-runs destructors exactly once, and returns released blocks to the synchronized
-cage allocator. `CompactBox<T>` and `CompactVec<T>` are four bytes. Other
+offset. Its 16-byte allocation header tracks block length, alignment prefix,
+capacity, and initialized length. Released blocks store sorted `u32` free-list
+links in the cage and coalesce without native allocator collections.
+`CompactBox<T>` and `CompactVec<T>` are four bytes. Other
 collections add only the metadata their layout requires.
 
 Compact storage is an in-process runtime representation. It is not a durable
@@ -103,7 +104,7 @@ time.
 Enable the optional parser features as needed:
 
 ```toml
-compact_std = { version = "2.3.0", features = ["json", "toml"] }
+compact_std = { version = "2.4.0", features = ["json", "toml"] }
 ```
 
 `json::from_str`, `json::from_slice`, and `toml::from_str` build supported
@@ -137,15 +138,17 @@ fn frozen_example() -> std::result::Result<(), std::boxed::Box<dyn std::error::E
     let mut builder = FrozenBuilder::new()?;
     let ids = builder.store_slice(&[3_u32, 5, 8])?;
     let graph = builder.finish(Catalog { ids })?;
-    assert_eq!(graph.slice(graph.root().ids)?, &[3, 5, 8]);
+    assert_eq!(graph.slice(&graph.root().ids)?, &[3, 5, 8]);
     Ok(())
 }
 ```
 
-Frozen descriptors validate their graph identity and bounds. Frozen values
-must be copyable, pointer-free, immutable, and have alignment no greater than
-eight bytes. A completed graph can be shared for concurrent reads when its
-root satisfies the `FrozenValue` contract.
+Frozen slice, string, and byte descriptors are eight bytes. Access takes a
+borrow of a descriptor stored inside the graph, which binds the view to that
+graph without retaining a graph ID. Copies outside the graph are rejected.
+Frozen values must be copyable, pointer-free, immutable, and have alignment no
+greater than eight bytes. A completed graph can be shared for concurrent reads
+when its root satisfies the `FrozenValue` contract.
 
 ## Native interfaces
 

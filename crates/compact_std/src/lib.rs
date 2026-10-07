@@ -1,4 +1,4 @@
-//! Single-dependency facade for the V2.3 process-wide compact cage.
+//! Single-dependency facade for the V2.4 process-wide compact cage.
 
 pub mod ffi;
 pub mod prelude;

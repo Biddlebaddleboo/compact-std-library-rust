@@ -125,8 +125,8 @@ pub struct CompactHashMap<
 > {
     control: Option<CageAllocation<u8>>,
     entries: Option<CageAllocation<MaybeUninit<(K, V)>>>,
-    len: usize,
-    tombstones: usize,
+    len: u32,
+    tombstones: u32,
     hash_builder: S,
 }
 
@@ -151,7 +151,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     }
     /// Return the number of key-value pairs.
     pub const fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
     /// Return the number of available hash slots.
     pub fn capacity(&self) -> usize {
@@ -292,8 +292,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     }
     /// Ensure room for at least `additional` more entries.
     pub fn reserve(&mut self, additional: usize) -> Result<()> {
-        let required = self
-            .len
+        let required = (self.len as usize)
             .checked_add(additional)
             .ok_or(CollectionError::CapacityOverflow)?;
         let mut slots = self.capacity().max(8);
@@ -302,7 +301,9 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
                 .checked_mul(2)
                 .ok_or(CollectionError::CapacityOverflow)?;
         }
-        if self.capacity() == 0 || slots > self.capacity() || self.tombstones > self.capacity() / 4
+        if self.capacity() == 0
+            || slots > self.capacity()
+            || self.tombstones as usize > self.capacity() / 4
         {
             self.rehash(slots)?;
         }
@@ -317,7 +318,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
             return Ok(());
         }
         let mut slots = 8_usize;
-        while self.len.saturating_mul(8) >= slots.saturating_mul(7) {
+        while (self.len as usize).saturating_mul(8) >= slots.saturating_mul(7) {
             slots = slots
                 .checked_mul(2)
                 .ok_or(CollectionError::CapacityOverflow)?;
@@ -333,7 +334,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
             control: self.control.as_ref().map_or(&[], |c| c.as_slice()),
             entries: self.entries.as_ref().map_or(&[], |e| e.as_slice()),
             index: 0,
-            remaining: self.len,
+            remaining: self.len as usize,
         }
     }
     /// Mutably iterate over values and immutably borrow keys.
@@ -348,7 +349,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
             entries: entries.as_mut_ptr(),
             slots: entries.len(),
             index: 0,
-            remaining: self.len,
+            remaining: self.len as usize,
             marker: PhantomData,
         }
     }
@@ -425,7 +426,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     }
     fn ensure_insert_capacity(&mut self) -> Result<()> {
         if self.capacity() == 0
-            || (self.len + self.tombstones + 1).saturating_mul(8)
+            || ((self.len as usize + self.tombstones as usize + 1).saturating_mul(8))
                 >= self.capacity().saturating_mul(7)
         {
             self.reserve(1)?;

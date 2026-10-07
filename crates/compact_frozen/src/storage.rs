@@ -8,9 +8,6 @@ use core::mem::{align_of, size_of};
 use core::ptr;
 use core::slice;
 use core::str;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-static NEXT_GRAPH_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Errors returned while constructing or reading a frozen graph.
 #[derive(Debug)]
@@ -23,8 +20,6 @@ pub enum FrozenError {
     InvalidUtf8,
     /// Graph offsets exceed the 32-bit cage address domain.
     OffsetOverflow,
-    /// The process exhausted unique frozen graph identifiers.
-    IdentityExhausted,
 }
 
 /// Result type used by frozen graph operations.
@@ -41,7 +36,6 @@ impl fmt::Display for FrozenError {
             Self::InvalidHandle => f.write_str("frozen descriptor is outside its graph"),
             Self::InvalidUtf8 => f.write_str("frozen string contains invalid UTF-8"),
             Self::OffsetOverflow => f.write_str("frozen graph exceeds the 32-bit offset domain"),
-            Self::IdentityExhausted => f.write_str("frozen graph identity space is exhausted"),
         }
     }
 }
@@ -77,13 +71,12 @@ unsafe impl<T: FrozenValue> FrozenValue for Option<T> {}
 unsafe impl<A: FrozenValue, B: FrozenValue> FrozenValue for (A, B) {}
 unsafe impl<A: FrozenValue, B: FrozenValue, C: FrozenValue> FrozenValue for (A, B, C) {}
 
-/// A typed slice descriptor relative to one frozen graph.
+/// An eight-byte typed slice descriptor stored inside one frozen graph.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrozenVec<T: FrozenValue> {
     offset: u32,
     len: u32,
-    graph_id: u32,
     marker: PhantomData<T>,
 }
 unsafe impl<T: FrozenValue> FrozenValue for FrozenVec<T> {}
@@ -98,13 +91,12 @@ impl<T: FrozenValue> FrozenVec<T> {
     }
 }
 
-/// An immutable UTF-8 string descriptor relative to one graph.
+/// An eight-byte immutable UTF-8 string descriptor stored inside one graph.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrozenString {
     offset: u32,
     len: u32,
-    graph_id: u32,
 }
 unsafe impl FrozenValue for FrozenString {}
 impl FrozenString {
@@ -117,13 +109,12 @@ impl FrozenString {
         self.len == 0
     }
 }
-/// Immutable bytes descriptor relative to one graph.
+/// An eight-byte immutable byte descriptor stored inside one graph.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrozenBytes {
     offset: u32,
     len: u32,
-    graph_id: u32,
 }
 unsafe impl FrozenValue for FrozenBytes {}
 impl FrozenBytes {
@@ -156,20 +147,11 @@ unsafe impl<T: FrozenValue> FrozenValue for FrozenSet<T> {}
 /// Mutable native construction buffer for a frozen graph.
 pub struct FrozenBuilder {
     words: Vec<u64>,
-    graph_id: u32,
 }
 impl FrozenBuilder {
     /// Create an empty builder. The first eight bytes stay reserved for null.
     pub fn new() -> FrozenResult<Self> {
-        let graph_id = NEXT_GRAPH_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                next.checked_add(1)
-            })
-            .map_err(|_| FrozenError::IdentityExhausted)?;
-        Ok(Self {
-            words: vec![0],
-            graph_id,
-        })
+        Ok(Self { words: vec![0] })
     }
 
     /// Copy a slice of frozen values into this graph.
@@ -188,7 +170,6 @@ impl FrozenBuilder {
         Ok(FrozenVec {
             offset: offset as u32,
             len: u32::try_from(values.len()).map_err(|_| FrozenError::OffsetOverflow)?,
-            graph_id: self.graph_id,
             marker: PhantomData,
         })
     }
@@ -199,7 +180,6 @@ impl FrozenBuilder {
         Ok(FrozenString {
             offset: bytes.offset,
             len: bytes.len,
-            graph_id: self.graph_id,
         })
     }
     /// Store arbitrary bytes.
@@ -218,7 +198,6 @@ impl FrozenBuilder {
         Ok(FrozenBytes {
             offset: offset as u32,
             len: u32::try_from(value.len()).map_err(|_| FrozenError::OffsetOverflow)?,
-            graph_id: self.graph_id,
         })
     }
     /// Store a platform-local OS string representation.
@@ -244,13 +223,16 @@ impl FrozenBuilder {
     pub fn finish<T: FrozenValue>(mut self, root: T) -> FrozenResult<FrozenGraph<T>> {
         let root = self.store_slice(core::slice::from_ref(&root))?;
         let capacity = self.words.len();
+        let used_bytes = capacity
+            .checked_mul(size_of::<u64>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or(FrozenError::OffsetOverflow)?;
         let mut storage = CompactRuntime::alloc_owned_slice::<u64>(capacity)?;
         storage.extend_copy(&self.words)?;
         Ok(FrozenGraph {
             storage,
-            used_bytes: capacity * size_of::<u64>(),
+            used_bytes,
             root_offset: root.offset,
-            graph_id: self.graph_id,
             marker: PhantomData,
         })
     }
@@ -289,9 +271,8 @@ impl FrozenBuilder {
 /// Immutable graph owning exactly one cage allocation.
 pub struct FrozenGraph<T: FrozenValue> {
     storage: CageAllocation<u64>,
-    used_bytes: usize,
+    used_bytes: u32,
     root_offset: u32,
-    graph_id: u32,
     marker: PhantomData<T>,
 }
 impl<T: FrozenValue> FrozenGraph<T> {
@@ -302,14 +283,15 @@ impl<T: FrozenValue> FrozenGraph<T> {
     }
     /// Return bytes owned by the graph, including alignment padding.
     pub const fn used_bytes(&self) -> usize {
-        self.used_bytes
+        self.used_bytes as usize
     }
     /// Read a typed frozen slice descriptor.
-    pub fn slice<U: FrozenValue>(&self, values: FrozenVec<U>) -> FrozenResult<&[U]> {
+    pub fn slice<U: FrozenValue>(&self, values: &FrozenVec<U>) -> FrozenResult<&[U]> {
+        self.check_descriptor(values)?;
         let bytes = (values.len as usize)
             .checked_mul(size_of::<U>())
             .ok_or(FrozenError::InvalidHandle)?;
-        self.check_range(values.graph_id, values.offset, bytes)?;
+        self.check_range(values.offset, bytes)?;
         if values.len == 0 {
             return Ok(&[]);
         }
@@ -319,68 +301,90 @@ impl<T: FrozenValue> FrozenGraph<T> {
         // SAFETY: the builder wrote every element at this aligned, in-bounds range.
         Ok(unsafe {
             slice::from_raw_parts(
-                self.byte_ptr(values.offset).cast::<U>(),
+                self.byte_ptr(values.offset)?.as_ptr().cast::<U>(),
                 values.len as usize,
             )
         })
     }
     /// Read a frozen UTF-8 string.
-    pub fn str(&self, value: FrozenString) -> FrozenResult<&str> {
-        self.check_range(value.graph_id, value.offset, value.len as usize)?;
+    pub fn str(&self, value: &FrozenString) -> FrozenResult<&str> {
+        self.check_descriptor(value)?;
+        self.check_range(value.offset, value.len as usize)?;
         // SAFETY: the descriptor is bounds-checked; construction stored the original str bytes.
-        str::from_utf8(unsafe {
-            slice::from_raw_parts(self.byte_ptr(value.offset), value.len as usize)
-        })
+        str::from_utf8(
+            self.byte_ptr(value.offset)?
+                .get(..value.len as usize)
+                .ok_or(FrozenError::InvalidHandle)?,
+        )
         .map_err(|_| FrozenError::InvalidUtf8)
     }
     /// Read frozen bytes.
-    pub fn bytes(&self, value: FrozenBytes) -> FrozenResult<&[u8]> {
-        self.check_range(value.graph_id, value.offset, value.len as usize)?;
-        // SAFETY: the descriptor is bounds-checked against the owned graph block.
-        Ok(unsafe { slice::from_raw_parts(self.byte_ptr(value.offset), value.len as usize) })
+    pub fn bytes(&self, value: &FrozenBytes) -> FrozenResult<&[u8]> {
+        self.check_descriptor(value)?;
+        self.check_range(value.offset, value.len as usize)?;
+        self.byte_ptr(value.offset)?
+            .get(..value.len as usize)
+            .ok_or(FrozenError::InvalidHandle)
     }
     /// Read a frozen OS string as its target-local bytes.
-    pub fn os_string_bytes(&self, value: FrozenOsString) -> FrozenResult<&[u8]> {
-        self.bytes(value.0)
+    pub fn os_string_bytes(&self, value: &FrozenOsString) -> FrozenResult<&[u8]> {
+        self.check_descriptor(value)?;
+        self.bytes(&value.0)
     }
     /// Read a frozen path as its target-local bytes.
-    pub fn path_bytes(&self, value: FrozenPathBuf) -> FrozenResult<&[u8]> {
-        self.bytes(value.0)
+    pub fn path_bytes(&self, value: &FrozenPathBuf) -> FrozenResult<&[u8]> {
+        self.check_descriptor(value)?;
+        self.bytes(&value.0)
     }
     /// Read key-value entries from a frozen map descriptor.
     pub fn map_entries<K: FrozenValue, V: FrozenValue>(
         &self,
-        value: FrozenMap<K, V>,
+        value: &FrozenMap<K, V>,
     ) -> FrozenResult<&[(K, V)]> {
-        self.slice(value.0)
+        self.check_descriptor(value)?;
+        self.slice(&value.0)
     }
     /// Read entries from a frozen set descriptor.
-    pub fn set_entries<U: FrozenValue>(&self, value: FrozenSet<U>) -> FrozenResult<&[U]> {
-        self.slice(value.0)
+    pub fn set_entries<U: FrozenValue>(&self, value: &FrozenSet<U>) -> FrozenResult<&[U]> {
+        self.check_descriptor(value)?;
+        self.slice(&value.0)
     }
 
     fn reference<U: FrozenValue>(&self, offset: u32) -> FrozenResult<&U> {
-        self.check_range(self.graph_id, offset, size_of::<U>())?;
+        self.check_range(offset, size_of::<U>())?;
         if offset as usize % align_of::<U>() != 0 {
             return Err(FrozenError::InvalidHandle);
         }
         // SAFETY: bounds and alignment are checked against builder-created bytes.
-        Ok(unsafe { &*self.byte_ptr(offset).cast::<U>() })
+        Ok(unsafe { &*self.byte_ptr(offset)?.as_ptr().cast::<U>() })
     }
-    fn check_range(&self, graph_id: u32, offset: u32, bytes: usize) -> FrozenResult<()> {
-        let end = (offset as usize)
-            .checked_add(bytes)
+    fn check_descriptor<U>(&self, descriptor: &U) -> FrozenResult<()> {
+        let base = self.storage.as_byte_slice().as_ptr() as usize;
+        let graph_end = base
+            .checked_add(self.used_bytes as usize)
             .ok_or(FrozenError::InvalidHandle)?;
-        if graph_id != self.graph_id || offset == 0 || end > self.used_bytes {
+        let descriptor_start = descriptor as *const U as usize;
+        let descriptor_end = descriptor_start
+            .checked_add(size_of::<U>())
+            .ok_or(FrozenError::InvalidHandle)?;
+        if descriptor_start < base || descriptor_end > graph_end {
             return Err(FrozenError::InvalidHandle);
         }
         Ok(())
     }
-    fn byte_ptr(&self, offset: u32) -> *const u8 {
+    fn check_range(&self, offset: u32, bytes: usize) -> FrozenResult<()> {
+        let end = (offset as usize)
+            .checked_add(bytes)
+            .ok_or(FrozenError::InvalidHandle)?;
+        if offset == 0 || end > self.used_bytes as usize {
+            return Err(FrozenError::InvalidHandle);
+        }
+        Ok(())
+    }
+    fn byte_ptr(&self, offset: u32) -> FrozenResult<&[u8]> {
         self.storage
-            .as_slice()
-            .as_ptr()
-            .cast::<u8>()
-            .wrapping_add(offset as usize)
+            .as_byte_slice()
+            .get(offset as usize..)
+            .ok_or(FrozenError::InvalidHandle)
     }
 }

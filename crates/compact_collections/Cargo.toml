@@ -9,9 +9,9 @@ keywords = ["cage", "compact", "collections"]
 categories = ["data-structures", "memory-management"]
 
 [dependencies]
-compact_backend_std = { path = "../compact_backend_std", version = "2.3.0" }
-compact_core = { path = "../compact_core", version = "2.3.0" }
+compact_backend_std = { path = "../compact_backend_std", version = "2.4.0" }
+compact_core = { path = "../compact_core", version = "2.4.0" }
 
 [dev-dependencies]
-compact_backend_std = { path = "../compact_backend_std", version = "2.3.0" }
+compact_backend_std = { path = "../compact_backend_std", version = "2.4.0" }
 proptest = "=1.6.0"

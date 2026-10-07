@@ -18,5 +18,11 @@ fuzz_target!(|input: &[u8]| {
     }
     let Ok(names) = builder.store_slice(&strings) else { return; };
     let Ok(graph) = builder.finish(CompactGraph { names }) else { return; };
-    if let Ok(names) = graph.slice(graph.root().names) { for name in names { let _ = graph.str(*name); } }
+    if let Ok(names) = graph.slice(&graph.root().names) {
+        for name in names {
+            let _ = graph.str(name);
+        }
+    }
+    let other = FrozenBuilder::new().unwrap().finish(0_u32).unwrap();
+    assert!(other.slice(&graph.root().names).is_err());
 });
