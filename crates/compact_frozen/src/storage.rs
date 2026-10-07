@@ -139,6 +139,7 @@ fn allocate_arena_id() -> FrozenResult<usize> {
 pub struct FrozenBuilder {
     id: usize,
     words: Vec<FrozenWord>,
+    interned_bytes: Vec<FrozenBytes>,
     used: usize,
 }
 
@@ -148,6 +149,7 @@ impl FrozenBuilder {
         Ok(Self {
             id: allocate_arena_id()?,
             words: Vec::new(),
+            interned_bytes: Vec::new(),
             // Zero is reserved as the null offset, matching the mutable arena.
             used: 1,
         })
@@ -181,19 +183,53 @@ impl FrozenBuilder {
         })
     }
 
-    /// Copy UTF-8 text into immutable frozen storage.
+    /// Store UTF-8 text in immutable frozen storage, reusing an identical
+    /// byte payload already stored by this builder.
     pub fn store_str(&mut self, value: &str) -> FrozenResult<FrozenString> {
-        let bytes = self.store_slice(value.as_bytes())?;
-        Ok(FrozenString {
-            bytes: FrozenBytes { bytes },
-        })
+        let bytes = self.store_bytes(value.as_bytes())?;
+        Ok(FrozenString { bytes })
     }
 
-    /// Copy arbitrary bytes into immutable frozen storage.
+    /// Store arbitrary bytes in immutable frozen storage, reusing an
+    /// identical payload already stored by this builder.
     pub fn store_bytes(&mut self, value: &[u8]) -> FrozenResult<FrozenBytes> {
-        Ok(FrozenBytes {
+        if let Some(existing) = self
+            .interned_bytes
+            .iter()
+            .copied()
+            .find(|existing| self.bytes_for_interned(*existing) == value)
+        {
+            return Ok(existing);
+        }
+
+        // Reserve the descriptor before storing the payload so a registry
+        // allocation failure cannot leave an untracked canonical copy.
+        self.interned_bytes
+            .try_reserve(1)
+            .map_err(FrozenError::Allocation)?;
+        let bytes = FrozenBytes {
             bytes: self.store_slice(value)?,
-        })
+        };
+        self.interned_bytes.push(bytes);
+        Ok(bytes)
+    }
+
+    fn bytes_for_interned(&self, bytes: FrozenBytes) -> &[u8] {
+        let handle = bytes.bytes;
+        debug_assert_eq!(handle.id, self.id);
+        let len = handle.len as usize;
+        if len == 0 {
+            return &[];
+        }
+        let offset = handle.offset as usize;
+        debug_assert_ne!(offset, 0);
+        debug_assert!(offset.checked_add(len).is_some_and(|end| end <= self.used));
+        let base = self.words.as_ptr().cast::<u8>();
+        // SAFETY: only descriptors returned by this builder enter the
+        // interning table. Their byte slices were initialized by store_slice,
+        // remain within `used`, and the builder's backing is immutable during
+        // this lookup.
+        unsafe { core::slice::from_raw_parts(base.add(offset), len) }
     }
 
     /// Store the root value and commit this builder into a frozen arena.

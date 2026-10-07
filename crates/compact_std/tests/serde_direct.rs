@@ -268,3 +268,24 @@ fn frozen_backing_checks_identity_and_supports_zst_and_max_alignment() {
         Err(FrozenError::InvalidHandle)
     ));
 }
+
+#[test]
+fn frozen_builder_interns_equal_string_and_byte_payloads() {
+    let mut builder = FrozenBuilder::new().unwrap();
+    let first = builder.store_str("shared catalog entry").unwrap();
+    let copied = first;
+    let second = builder.store_str("shared catalog entry").unwrap();
+    let bytes = builder.store_bytes(b"shared catalog entry").unwrap();
+    let empty_a = builder.store_str("").unwrap();
+    let empty_b = builder.store_str("").unwrap();
+    let (arena, _root) = builder.finish_root(first).unwrap();
+
+    let canonical = first.as_str(&arena).unwrap().as_ptr();
+    assert_eq!(copied.as_str(&arena).unwrap().as_ptr(), canonical);
+    assert_eq!(second.as_str(&arena).unwrap().as_ptr(), canonical);
+    assert_eq!(bytes.as_slice(&arena).unwrap().as_ptr(), canonical.cast());
+    assert_eq!(
+        empty_a.as_str(&arena).unwrap().as_ptr(),
+        empty_b.as_str(&arena).unwrap().as_ptr()
+    );
+}

@@ -71,7 +71,9 @@ Generated `CompactFreeze` companion structs contain only frozen handles and
 copy-safe scalars. The source graph remains borrowed and intact during the
 copy. Frozen maps and sets are compact sequences with linear lookup in this
 phase; the format is in-process only and is never constructed from arbitrary
-serialized bytes.
+serialized bytes. String and byte payloads are interned during building with a
+fallible descriptor registry and linear content comparison. Their handles stay
+`Copy`, and the registry is discarded when the builder is committed.
 
 ## Allocation
 

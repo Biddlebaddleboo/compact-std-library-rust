@@ -224,7 +224,9 @@ let id = config.system_id().as_str(&frozen)?;
 allocator state or per-value reclamation, so `Arc<FrozenArena>` supports
 lock-free reads from worker threads. Frozen handles validate their arena
 identity before resolving an offset. The mutable source remains valid after a
-successful copy and if freezing fails.
+successful copy and if freezing fails. Frozen string, byte, OS-string, and path
+handles are `Copy`; the builder interns equal byte payloads so repeated
+configuration and catalog strings share one immutable range.
 
 The derive supports named structs with scalars, `Option`, tuples, arrays,
 nested derived structs, and `CompactString`, `CompactBytes`, `CompactVec`,
