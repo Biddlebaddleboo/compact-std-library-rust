@@ -50,6 +50,8 @@ pub type Box<'arena, T> = CompactBox<'arena, T>;
 pub type String<'arena> = CompactString<'arena>;
 /// Compact vector alias.
 pub type Vec<'arena, T> = CompactVec<'arena, T>;
+/// Compact double-ended queue alias.
+pub type VecDeque<'arena, T> = CompactVecDeque<'arena, T>;
 /// Hash map alias with randomized hashing by default.
 pub type HashMap<'arena, K, V, S = std::collections::hash_map::RandomState> =
     CompactHashMap<'arena, K, V, S>;

@@ -1029,7 +1029,7 @@ fn classify_type_path(path: &Path) -> LocalKind {
         "String" | "CompactString" => LocalKind::String,
         "Box" | "CompactBox" => LocalKind::Box,
         "CompactBytes" => LocalKind::Bytes,
-        "CompactVecDeque" => LocalKind::VecDeque,
+        "VecDeque" | "CompactVecDeque" => LocalKind::VecDeque,
         "CompactSmallVec" => LocalKind::SmallVec,
         "HashMap" | "CompactHashMap" => LocalKind::HashMap,
         "HashSet" | "CompactHashSet" => LocalKind::HashSet,
@@ -1073,6 +1073,10 @@ fn classify_constructor(expression: &ExprCall) -> LocalKind {
             )
             | ("PathBuf", "new" | "from" | "from_path" | "new_in")
             | (
+                "VecDeque",
+                "new" | "with_capacity" | "new_in" | "with_capacity_in"
+            )
+            | (
                 "HashMap" | "HashSet",
                 "new" | "with_hasher" | "with_capacity" | "with_capacity_and_hasher"
             )
@@ -1086,6 +1090,7 @@ fn classify_constructor(expression: &ExprCall) -> LocalKind {
             "Box" => LocalKind::Box,
             "OsString" => LocalKind::OsString,
             "PathBuf" => LocalKind::PathBuf,
+            "VecDeque" => LocalKind::VecDeque,
             "HashMap" => LocalKind::HashMap,
             "HashSet" => LocalKind::HashSet,
             _ => LocalKind::Unknown,
@@ -1112,6 +1117,7 @@ fn constructor_owner(path: &Path) -> Option<(&'static str, bool)> {
         "Box" | "CompactBox" => "Box",
         "OsString" | "CompactOsString" => "OsString",
         "PathBuf" | "CompactPathBuf" => "PathBuf",
+        "VecDeque" | "CompactVecDeque" => "VecDeque",
         "HashMap" | "CompactHashMap" => "HashMap",
         "HashSet" | "CompactHashSet" => "HashSet",
         _ => return None,
@@ -1130,6 +1136,8 @@ fn constructor_owner(path: &Path) -> Option<(&'static str, bool)> {
                     | "String"
                     | "Box"
                     | "CompactVec"
+                    | "VecDeque"
+                    | "CompactVecDeque"
                     | "CompactString"
                     | "CompactBox"
                     | "OsString"
@@ -1145,7 +1153,14 @@ fn constructor_owner(path: &Path) -> Option<(&'static str, bool)> {
         [root, module, alias] if root == "compact_std" && module == "prelude" => {
             matches!(
                 alias.as_str(),
-                "Vec" | "String" | "Box" | "HashMap" | "HashSet" | "OsString" | "PathBuf"
+                "Vec"
+                    | "String"
+                    | "Box"
+                    | "HashMap"
+                    | "HashSet"
+                    | "OsString"
+                    | "PathBuf"
+                    | "VecDeque"
             )
         }
         [root, module, alias] if root == "std" || root == "alloc" => false,
@@ -1166,6 +1181,8 @@ fn rewrite_constructor(call: &ExprCall, arena: &Ident) -> Option<Expr> {
     let new_method = match (owner, method.as_str(), call.args.len()) {
         ("Vec", "new", 0) => "new_in",
         ("Vec", "with_capacity", 1) => "with_capacity_in",
+        ("VecDeque", "new", 0) => "new_in",
+        ("VecDeque", "with_capacity", 1) => "with_capacity_in",
         ("String", "new", 0) => "new_in",
         ("String", "from", 1) => "from_str_in",
         ("Box", "new", 1) => "new_in",
@@ -1200,12 +1217,34 @@ fn rewrite_method(call: &mut ExprMethodCall, kind: &LocalKind, arena: &Ident) {
         (LocalKind::Vec, "reserve") => Some("reserve_in"),
         (LocalKind::Vec, "shrink_to_fit") => Some("shrink_to_fit_in"),
         (LocalKind::Vec, "get" | "get_mut" | "as_slice" | "as_mut_slice" | "iter") => None,
+        (LocalKind::VecDeque, "push_back") => Some("push_back_in"),
+        (LocalKind::VecDeque, "push_front") => Some("push_front_in"),
+        (LocalKind::VecDeque, "pop_back") => Some("pop_back_in"),
+        (LocalKind::VecDeque, "pop_front") => Some("pop_front_in"),
+        (LocalKind::VecDeque, "reserve") => Some("reserve_in"),
+        (LocalKind::VecDeque, "shrink_to_fit") => Some("shrink_to_fit_in"),
+        (
+            LocalKind::VecDeque,
+            "get" | "get_mut" | "front" | "front_mut" | "back" | "back_mut" | "iter",
+        ) => None,
         (LocalKind::String, "push_str") => Some("push_str_in"),
         (LocalKind::String, "push_char") => Some("push_char_in"),
         (LocalKind::String, "truncate") => Some("truncate_in"),
         (LocalKind::String, "shrink_to_fit") => Some("shrink_to_fit_in"),
         (LocalKind::String, "as_str" | "as_bytes") => None,
         (LocalKind::Box, "get" | "get_mut") => None,
+        (
+            LocalKind::HashMap,
+            "insert" | "get" | "get_mut" | "get_key_value" | "contains_key" | "remove"
+            | "remove_entry" | "iter" | "iter_mut" | "keys" | "values" | "values_mut" | "entry"
+            | "reserve" | "shrink_to_fit",
+        ) => None,
+        (
+            LocalKind::HashSet,
+            "insert" | "get" | "contains" | "remove" | "iter" | "reserve" | "shrink_to_fit",
+        ) => None,
+        (LocalKind::OsString, "push") => None,
+        (LocalKind::PathBuf, "push" | "pop" | "join" | "set_file_name" | "set_extension") => None,
         _ => return,
     };
     if let Some(name) = replacement {
@@ -1219,6 +1258,37 @@ fn rewrite_method(call: &mut ExprMethodCall, kind: &LocalKind, arena: &Ident) {
                 "get" | "get_mut" | "as_slice" | "as_mut_slice" | "iter"
             ) | (LocalKind::String, "as_str" | "as_bytes")
                 | (LocalKind::Box, "get" | "get_mut")
+                | (
+                    LocalKind::VecDeque,
+                    "get" | "get_mut" | "front" | "front_mut" | "back" | "back_mut" | "iter"
+                )
+                | (
+                    LocalKind::HashMap,
+                    "insert"
+                        | "get"
+                        | "get_mut"
+                        | "get_key_value"
+                        | "contains_key"
+                        | "remove"
+                        | "remove_entry"
+                        | "iter"
+                        | "iter_mut"
+                        | "keys"
+                        | "values"
+                        | "values_mut"
+                        | "entry"
+                        | "reserve"
+                        | "shrink_to_fit"
+                )
+                | (
+                    LocalKind::HashSet,
+                    "insert" | "get" | "contains" | "remove" | "iter" | "reserve" | "shrink_to_fit"
+                )
+                | (LocalKind::OsString, "push")
+                | (
+                    LocalKind::PathBuf,
+                    "push" | "pop" | "join" | "set_file_name" | "set_extension"
+                )
         );
     if needs_arena && !has_explicit_arena_arg(call, arena) {
         call.args.push(syn::parse_quote!(#arena));
@@ -1235,7 +1305,11 @@ fn method_needs_compact_resolution(method: &str) -> bool {
     matches!(
         method,
         "push"
+            | "push_back"
+            | "push_front"
             | "pop"
+            | "pop_back"
+            | "pop_front"
             | "reserve"
             | "shrink_to_fit"
             | "push_str"
@@ -1246,8 +1320,26 @@ fn method_needs_compact_resolution(method: &str) -> bool {
             | "as_slice"
             | "as_mut_slice"
             | "iter"
+            | "front"
+            | "front_mut"
+            | "back"
+            | "back_mut"
             | "as_str"
             | "as_bytes"
+            | "insert"
+            | "contains"
+            | "contains_key"
+            | "get_key_value"
+            | "remove"
+            | "remove_entry"
+            | "iter_mut"
+            | "keys"
+            | "values"
+            | "values_mut"
+            | "entry"
+            | "join"
+            | "set_file_name"
+            | "set_extension"
     )
 }
 
@@ -1282,6 +1374,44 @@ fn method_mutates(kind: &LocalKind, method: &str) -> bool {
                 | "shrink_to_fit_in"
         ),
         LocalKind::Box => matches!(method, "get_mut"),
+        LocalKind::VecDeque => matches!(
+            method,
+            "push_back"
+                | "push_back_in"
+                | "push_front"
+                | "push_front_in"
+                | "pop_back"
+                | "pop_back_in"
+                | "pop_front"
+                | "pop_front_in"
+                | "reserve"
+                | "reserve_in"
+                | "truncate"
+                | "clear"
+                | "get_mut"
+                | "front_mut"
+                | "back_mut"
+                | "shrink_to_fit"
+                | "shrink_to_fit_in"
+        ),
+        LocalKind::HashMap => matches!(
+            method,
+            "insert"
+                | "get_mut"
+                | "remove"
+                | "remove_entry"
+                | "entry"
+                | "reserve"
+                | "shrink_to_fit"
+                | "retain"
+                | "clear"
+        ),
+        LocalKind::HashSet => matches!(
+            method,
+            "insert" | "remove" | "reserve" | "shrink_to_fit" | "retain" | "clear"
+        ),
+        LocalKind::OsString => matches!(method, "push" | "clear"),
+        LocalKind::PathBuf => matches!(method, "push" | "pop" | "set_file_name" | "set_extension"),
         _ => false,
     }
 }

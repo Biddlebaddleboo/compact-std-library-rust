@@ -1,0 +1,10 @@
+[package]
+name = "drop_in_patterns_fixture"
+version = "2.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+compact_std = { path = "../../crates/compact_std", features = ["serde", "json", "toml"] }

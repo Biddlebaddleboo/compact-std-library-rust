@@ -6,12 +6,12 @@ pub use crate::{
     CompactFreeze, CompactHashMap, CompactHashMapEntry, CompactHashMapIter, CompactHashMapIterMut,
     CompactHashSet, CompactInterner, CompactOption, CompactOsStr, CompactOsString, CompactPath,
     CompactPathBuf, CompactPathDisplay, CompactRing, CompactSlab, CompactSmallVec, CompactStore,
-    CompactStringWriter, CompactValue, CompactVecDeque, CompactVecDequeIter, CoreError, ExtendIn,
-    FfiByteBuffer, FreezeIn, FromIteratorIn, FrozenArena, FrozenBuilder, FrozenBytes, FrozenError,
-    FrozenMap, FrozenOsString, FrozenPathBuf, FrozenResult, FrozenRoot, FrozenSet, FrozenString,
-    FrozenValue, FrozenVec, FrozenVecDeque, HashMap, HashSet, InternId, OsString, PathBuf, Result,
-    RootHandle, SlabHandle, StdArena, StdBacking, StoreRoot, String, ToCompactStringIn, Vec,
-    COMPACT_BYTES_INLINE_CAPACITY,
+    CompactString, CompactStringWriter, CompactValue, CompactVec, CompactVecDeque,
+    CompactVecDequeIter, CoreError, ExtendIn, FfiByteBuffer, FreezeIn, FromIteratorIn, FrozenArena,
+    FrozenBuilder, FrozenBytes, FrozenError, FrozenMap, FrozenOsString, FrozenPathBuf,
+    FrozenResult, FrozenRoot, FrozenSet, FrozenString, FrozenValue, FrozenVec, FrozenVecDeque,
+    HashMap, HashSet, InternId, OsString, PathBuf, Result, RootHandle, SlabHandle, StdArena,
+    StdBacking, StoreRoot, String, ToCompactStringIn, Vec, VecDeque, COMPACT_BYTES_INLINE_CAPACITY,
 };
 
 #[cfg(feature = "serde")]

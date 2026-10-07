@@ -1,0 +1,8 @@
+system_id = "rideshare-edge"
+config_path = "/etc/rideshare/service.toml"
+names = ["api", "dispatcher", "worker"]
+features = ["health-check", "chunk-reassembly"]
+
+[labels]
+environment = "staging"
+region = "us-west"
