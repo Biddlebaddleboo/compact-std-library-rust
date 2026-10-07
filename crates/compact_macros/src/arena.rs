@@ -7,7 +7,7 @@ use quote::quote;
 use syn::parse::{Parse, ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::visit_mut::{self, VisitMut};
-use syn::{Block, Expr, ExprCall, ExprMethodCall, Ident, PathArguments, Result, Token};
+use syn::{Block, Expr, ExprCall, ExprMethodCall, Ident, Path, Result, Token, Type};
 
 pub(crate) struct ArenaInput {
     arena: Ident,
@@ -30,7 +30,8 @@ pub(crate) fn expand(input: ArenaInput) -> Result<TokenStream> {
     let mut block = input.block;
     let mut rewrite = ArenaRewrite {
         arena: input.arena,
-        locals: HashMap::new(),
+        scopes: vec![HashMap::new()],
+        closure_boundaries: Vec::new(),
         errors: Vec::new(),
     };
     rewrite.visit_block_mut(&mut block);
@@ -45,66 +46,128 @@ pub(crate) fn expand(input: ArenaInput) -> Result<TokenStream> {
     Ok(quote!(#block))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum LocalKind {
+    Unknown,
+    Ambiguous,
+    KnownNonCompact,
+    Moved,
     Vec,
     String,
+    Box,
+    Tuple(Vec<LocalKind>),
+}
+
+impl LocalKind {
+    fn is_compact(&self) -> bool {
+        matches!(self, Self::Vec | Self::String | Self::Box)
+    }
+
+    fn owns_compact_value(&self) -> bool {
+        self.is_compact()
+            || matches!(self, Self::Tuple(values) if values.iter().any(Self::owns_compact_value))
+    }
 }
 
 struct ArenaRewrite {
     arena: Ident,
-    locals: HashMap<String, LocalKind>,
+    /// One map per lexical scope; inner entries shadow outer bindings.
+    scopes: Vec<HashMap<String, LocalKind>>,
+    /// Scope depth at which each active closure's parameters and locals begin.
+    closure_boundaries: Vec<(usize, bool)>,
     errors: Vec<syn::Error>,
 }
 
 impl VisitMut for ArenaRewrite {
     fn visit_block_mut(&mut self, block: &mut Block) {
+        self.scopes.push(HashMap::new());
         for statement in &mut block.stmts {
             if let syn::Stmt::Local(local) = statement {
-                let kind = local
-                    .init
-                    .as_ref()
-                    .and_then(|init| classify_constructor(&init.expr));
-                visit_mut::visit_local_mut(self, local);
-                if let (Some(kind), syn::Pat::Ident(pattern)) = (kind, &local.pat) {
-                    self.locals.insert(pattern.ident.to_string(), kind);
-                }
+                self.visit_local_binding(local);
             } else {
                 self.visit_stmt_mut(statement);
             }
         }
+        self.scopes.pop();
     }
 
     fn visit_expr_mut(&mut self, expression: &mut Expr) {
-        if let Expr::Assign(assignment) = expression {
-            if let Expr::Index(index) = assignment.left.as_ref() {
-                if let Some(indexed) = self.rewrite_vector_index(index, true) {
-                    *assignment.left = indexed;
-                    self.visit_expr_mut(&mut assignment.right);
+        match expression {
+            Expr::Assign(assignment) => {
+                self.visit_assignment(assignment);
+                return;
+            }
+            Expr::Binary(binary) if is_compound_assignment(&binary.op) => {
+                if let Expr::Index(index) = binary.left.as_mut() {
+                    if let Some(rewritten) = self.rewrite_vector_index(index, true) {
+                        *binary.left = rewritten;
+                    }
+                }
+                visit_mut::visit_expr_binary_mut(self, binary);
+                return;
+            }
+            Expr::Reference(reference) if reference.mutability.is_some() => {
+                if let Expr::Index(index) = reference.expr.as_mut() {
+                    if let Some(rewritten) = self.rewrite_vector_index(index, true) {
+                        *reference.expr = rewritten;
+                    }
+                }
+                if let Expr::Path(path) = reference.expr.as_ref() {
+                    self.reject_captured_mutation(path, reference);
+                }
+                visit_mut::visit_expr_reference_mut(self, reference);
+                return;
+            }
+            Expr::Index(index) => {
+                if let Some(rewritten) = self.rewrite_vector_index(index, false) {
+                    *expression = rewritten;
+                    self.visit_expr_mut(expression);
                     return;
                 }
             }
-        }
-        if let Expr::Index(indexed) = expression {
-            if let Some(rewritten) = self.rewrite_vector_index(indexed, false) {
-                *expression = rewritten;
+            Expr::If(if_expr) => {
+                self.visit_if(if_expr);
                 return;
             }
-        }
-        if let Expr::Call(call) = expression {
-            if let Some(rewritten) = rewrite_constructor(call, &self.arena) {
-                *expression = rewritten;
+            Expr::Match(match_expr) => {
+                self.visit_match(match_expr);
+                return;
             }
-        }
-        if let Expr::MethodCall(call) = expression {
-            if let Expr::Path(receiver) = call.receiver.as_ref() {
-                if receiver.qself.is_none() && receiver.path.segments.len() == 1 {
-                    let local = receiver.path.segments[0].ident.to_string();
-                    if let Some(kind) = self.locals.get(&local).copied() {
-                        rewrite_method(call, kind, &self.arena);
-                    }
+            Expr::ForLoop(loop_expr) => {
+                self.visit_for_loop(loop_expr);
+                return;
+            }
+            Expr::While(loop_expr) => {
+                self.visit_while_loop(loop_expr);
+                return;
+            }
+            Expr::Loop(loop_expr) => {
+                self.visit_loop(loop_expr);
+                return;
+            }
+            Expr::Closure(closure) => {
+                self.visit_closure(closure);
+                return;
+            }
+            Expr::Call(call) => {
+                if let Some(rewritten) = rewrite_constructor(call, &self.arena) {
+                    *expression = rewritten;
+                    self.visit_expr_mut(expression);
+                } else {
+                    visit_mut::visit_expr_call_mut(self, call);
                 }
+                return;
             }
+            Expr::MethodCall(call) => {
+                self.rewrite_method_call(call);
+                visit_mut::visit_expr_method_call_mut(self, call);
+                return;
+            }
+            Expr::Path(path) => {
+                self.visit_path_use(path);
+                return;
+            }
+            _ => {}
         }
         visit_mut::visit_expr_mut(self, expression);
     }
@@ -139,20 +202,436 @@ impl VisitMut for ArenaRewrite {
                 mac.tokens = quote!(#expressions);
             }
         }
-        visit_mut::visit_macro_mut(self, mac);
+        // Unknown macro token streams are deliberately left alone.
     }
 }
 
 impl ArenaRewrite {
+    fn visit_local_binding(&mut self, local: &mut syn::Local) {
+        let mut kind = local
+            .init
+            .as_ref()
+            .map(|initializer| self.classify_expr(&initializer.expr, true))
+            .unwrap_or(LocalKind::Unknown);
+        if let Some(annotation) = pattern_annotation(&local.pat) {
+            let annotated = classify_type(annotation);
+            if annotated != LocalKind::Unknown {
+                kind = annotated;
+            }
+        }
+
+        if let Some(initializer) = &mut local.init {
+            self.visit_expr_mut(&mut initializer.expr);
+            if let Some((_, diverge)) = &mut initializer.diverge {
+                self.visit_expr_mut(diverge);
+            }
+        }
+        visit_mut::visit_pat_mut(self, &mut local.pat);
+        self.bind_pattern(&local.pat, kind);
+    }
+
+    fn visit_assignment(&mut self, assignment: &mut syn::ExprAssign) {
+        if let Expr::Index(index) = assignment.left.as_ref() {
+            if let Some(rewritten) = self.rewrite_vector_index(index, true) {
+                *assignment.left = rewritten;
+                self.visit_expr_mut(&mut assignment.left);
+                self.visit_expr_mut(&mut assignment.right);
+                return;
+            }
+        }
+
+        let updated = if let Expr::Path(path) = assignment.left.as_ref() {
+            if let Some(name) = self.path_local_name(path) {
+                if let Some((kind, depth)) = self.lookup(&name) {
+                    if self.captured_at(depth) && kind.owns_compact_value() {
+                        self.errors.push(syn::Error::new_spanned(
+                            &*assignment,
+                            "arena! cannot track reassignment of a compact value captured by a closure; use explicit `_in` APIs inside the closure",
+                        ));
+                    }
+                }
+                Some((name, self.classify_expr(&assignment.right, true)))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        visit_mut::visit_expr_assign_mut(self, assignment);
+        if let Some((name, kind)) = updated {
+            self.assign(&name, kind);
+        }
+    }
+
+    fn rewrite_method_call(&mut self, call: &mut ExprMethodCall) {
+        let Expr::Path(receiver) = call.receiver.as_ref() else {
+            return;
+        };
+        let Some(name) = self.path_local_name(receiver) else {
+            return;
+        };
+        let Some((kind, depth)) = self.lookup(&name) else {
+            return;
+        };
+        if matches!(kind, LocalKind::Vec)
+            && matches!(call.method.to_string().as_str(), "push" | "push_in")
+        {
+            if let Some(value) = call.args.first() {
+                self.classify_expr(value, true);
+            }
+        }
+        if self.captured_at(depth) && method_mutates(&kind, &call.method.to_string()) {
+            self.errors.push(syn::Error::new_spanned(
+                call,
+                "arena! cannot rewrite a mutating method on a compact value captured by a closure; use the explicit `_in` method inside the closure",
+            ));
+            return;
+        }
+        if let Some((_, move_capture)) = self.closure_boundaries.last().copied() {
+            if move_capture && self.captured_at(depth) && kind.owns_compact_value() {
+                // The path visitor below reports this ownership boundary and
+                // marks the outer binding moved for subsequent syntax.
+            }
+        }
+
+        if kind.is_compact() {
+            rewrite_method(call, &kind, &self.arena);
+        } else if matches!(kind, LocalKind::Unknown | LocalKind::Ambiguous)
+            && method_needs_compact_resolution(&call.method.to_string())
+            && !has_explicit_arena_arg(call, &self.arena)
+        {
+            self.errors.push(syn::Error::new_spanned(
+                call,
+                format!(
+                    "arena! cannot prove `{name}` is a compact collection; add an explicit compact type annotation or call the corresponding `*_in(..., arena)` API"
+                ),
+            ));
+        }
+    }
+
+    fn visit_if(&mut self, expression: &mut syn::ExprIf) {
+        self.visit_expr_mut(&mut expression.cond);
+        let baseline = self.scopes.clone();
+
+        self.scopes = baseline.clone();
+        self.visit_block_mut(&mut expression.then_branch);
+        let then_state = self.scopes.clone();
+
+        self.scopes = baseline.clone();
+        let else_state = if let Some((_, branch)) = &mut expression.else_branch {
+            self.visit_expr_mut(branch);
+            self.scopes.clone()
+        } else {
+            baseline.clone()
+        };
+        self.scopes = join_states(&then_state, &else_state);
+    }
+
+    fn visit_match(&mut self, expression: &mut syn::ExprMatch) {
+        let matched_kind = self.classify_expr(&expression.expr, true);
+        self.visit_expr_mut(&mut expression.expr);
+        let baseline = self.scopes.clone();
+        let mut branches = Vec::with_capacity(expression.arms.len());
+        for arm in &mut expression.arms {
+            self.scopes = baseline.clone();
+            self.scopes.push(HashMap::new());
+            self.bind_pattern(&arm.pat, matched_kind.clone());
+            if let Some((_, guard)) = &mut arm.guard {
+                self.visit_expr_mut(guard);
+            }
+            self.visit_expr_mut(&mut arm.body);
+            self.scopes.pop();
+            branches.push(self.scopes.clone());
+        }
+        self.scopes = branches
+            .into_iter()
+            .reduce(|left, right| join_states(&left, &right))
+            .unwrap_or(baseline);
+    }
+
+    fn visit_for_loop(&mut self, expression: &mut syn::ExprForLoop) {
+        self.visit_expr_mut(&mut expression.expr);
+        let baseline = self.scopes.clone();
+        self.scopes = baseline.clone();
+        self.scopes.push(HashMap::new());
+        self.bind_unknown_pattern(&expression.pat);
+        self.visit_block_mut(&mut expression.body);
+        self.scopes.pop();
+        let body_state = self.scopes.clone();
+        self.scopes = join_states(&baseline, &body_state);
+    }
+
+    fn visit_while_loop(&mut self, expression: &mut syn::ExprWhile) {
+        self.visit_expr_mut(&mut expression.cond);
+        let condition_state = self.scopes.clone();
+        self.scopes = condition_state.clone();
+        self.visit_block_mut(&mut expression.body);
+        let body_state = self.scopes.clone();
+        self.scopes = join_states(&condition_state, &body_state);
+    }
+
+    fn visit_loop(&mut self, expression: &mut syn::ExprLoop) {
+        let baseline = self.scopes.clone();
+        self.scopes = baseline.clone();
+        self.visit_block_mut(&mut expression.body);
+        let body_state = self.scopes.clone();
+        self.scopes = join_states(&baseline, &body_state);
+    }
+
+    fn visit_closure(&mut self, expression: &mut syn::ExprClosure) {
+        let move_capture = expression.capture.is_some();
+        self.scopes.push(HashMap::new());
+        let boundary = self.scopes.len();
+        self.closure_boundaries.push((boundary, move_capture));
+        for input in &mut expression.inputs {
+            self.bind_unknown_pattern(input);
+        }
+        self.visit_expr_mut(&mut expression.body);
+        self.closure_boundaries.pop();
+        self.scopes.pop();
+    }
+
+    fn visit_path_use(&mut self, path: &syn::ExprPath) {
+        let Some(name) = self.path_local_name(path) else {
+            return;
+        };
+        let Some((kind, depth)) = self.lookup(&name) else {
+            return;
+        };
+        if let Some((_, true)) = self.closure_boundaries.last().copied() {
+            if self.captured_at(depth) && kind.owns_compact_value() {
+                self.errors.push(syn::Error::new_spanned(
+                    path,
+                    "arena! cannot track a compact value captured by a `move` closure; use explicit `_in` APIs and keep the value outside the closure",
+                ));
+                self.assign(&name, LocalKind::Moved);
+            }
+        }
+    }
+
+    fn reject_captured_mutation(&mut self, path: &syn::ExprPath, span: &impl quote::ToTokens) {
+        let Some(name) = self.path_local_name(path) else {
+            return;
+        };
+        let Some((kind, depth)) = self.lookup(&name) else {
+            return;
+        };
+        if self.captured_at(depth) && kind.owns_compact_value() {
+            self.errors.push(syn::Error::new_spanned(
+                span,
+                "arena! cannot rewrite a mutable borrow of a compact value captured by a closure; use the explicit `_in` APIs inside the closure",
+            ));
+        }
+    }
+
+    fn classify_expr(&mut self, expression: &Expr, consume: bool) -> LocalKind {
+        match expression {
+            Expr::Try(wrapper) => self.classify_expr(&wrapper.expr, consume),
+            Expr::Paren(wrapper) => self.classify_expr(&wrapper.expr, consume),
+            Expr::Group(wrapper) => self.classify_expr(&wrapper.expr, consume),
+            Expr::Call(call) => {
+                let kind = classify_constructor(call);
+                if kind == LocalKind::Box {
+                    if let Some(value) = call.args.first() {
+                        self.classify_expr(value, true);
+                    }
+                }
+                kind
+            }
+            Expr::Path(path) => {
+                let Some(name) = self.path_local_name(path) else {
+                    return LocalKind::Unknown;
+                };
+                let Some((kind, depth)) = self.lookup(&name) else {
+                    return LocalKind::Unknown;
+                };
+                if consume && kind.owns_compact_value() {
+                    if self.captured_at(depth) {
+                        self.errors.push(syn::Error::new_spanned(
+                            path,
+                            "arena! cannot move a compact value into a closure; use explicit `_in` APIs inside the closure",
+                        ));
+                    }
+                    self.assign(&name, LocalKind::Moved);
+                }
+                kind
+            }
+            Expr::Tuple(tuple) => LocalKind::Tuple(
+                tuple
+                    .elems
+                    .iter()
+                    .map(|element| self.classify_expr(element, consume))
+                    .collect(),
+            ),
+            Expr::Block(block) => classify_block_tail(self, &block.block, consume),
+            Expr::If(if_expr) => {
+                let then_kind = classify_block_tail(self, &if_expr.then_branch, consume);
+                let else_kind = if let Some((_, otherwise)) = &if_expr.else_branch {
+                    self.classify_expr(otherwise, consume)
+                } else {
+                    LocalKind::KnownNonCompact
+                };
+                join_kind(then_kind, else_kind)
+            }
+            Expr::Match(match_expr) => match_expr
+                .arms
+                .iter()
+                .map(|arm| self.classify_expr(&arm.body, consume))
+                .reduce(join_kind)
+                .unwrap_or(LocalKind::Unknown),
+            _ => LocalKind::Unknown,
+        }
+    }
+
+    fn bind_pattern(&mut self, pattern: &syn::Pat, kind: LocalKind) {
+        match pattern {
+            syn::Pat::Ident(pattern) if pattern.subpat.is_none() => {
+                self.insert(pattern.ident.to_string(), kind);
+            }
+            syn::Pat::Ident(pattern) => {
+                self.insert(pattern.ident.to_string(), LocalKind::Unknown);
+                if let Some((_, subpat)) = &pattern.subpat {
+                    self.bind_unknown_pattern(subpat);
+                }
+            }
+            syn::Pat::Tuple(pattern) => {
+                self.bind_tuple_elements(&pattern.elems, kind);
+            }
+            syn::Pat::TupleStruct(pattern) => {
+                self.bind_tuple_elements(&pattern.elems, kind);
+            }
+            syn::Pat::Paren(pattern) => self.bind_pattern(&pattern.pat, kind),
+            syn::Pat::Type(pattern) => {
+                let annotated = classify_type(&pattern.ty);
+                self.bind_pattern(
+                    &pattern.pat,
+                    if annotated == LocalKind::Unknown {
+                        kind
+                    } else {
+                        annotated
+                    },
+                );
+            }
+            syn::Pat::Struct(pattern) => {
+                for field in &pattern.fields {
+                    self.bind_unknown_pattern(&field.pat);
+                }
+            }
+            syn::Pat::Reference(pattern) => {
+                self.bind_pattern(&pattern.pat, LocalKind::Unknown);
+            }
+            syn::Pat::Or(pattern) => {
+                if let Some(first) = pattern.cases.first() {
+                    self.bind_unknown_pattern(first);
+                }
+            }
+            syn::Pat::Slice(pattern) => {
+                for child in &pattern.elems {
+                    self.bind_unknown_pattern(child);
+                }
+            }
+            syn::Pat::Wild(_) | syn::Pat::Rest(_) => {}
+            other => self.bind_unknown_pattern(other),
+        }
+    }
+
+    fn bind_tuple_elements(&mut self, patterns: &Punctuated<syn::Pat, Token![,]>, kind: LocalKind) {
+        let LocalKind::Tuple(values) = kind else {
+            for pattern in patterns {
+                self.bind_unknown_pattern(pattern);
+            }
+            return;
+        };
+        let rest = patterns
+            .iter()
+            .position(|pattern| matches!(pattern, syn::Pat::Rest(_)));
+        let mapping_is_valid = match rest {
+            Some(_) => values.len() >= patterns.len().saturating_sub(1),
+            None => values.len() == patterns.len(),
+        };
+        if !mapping_is_valid {
+            for pattern in patterns {
+                self.bind_unknown_pattern(pattern);
+            }
+            return;
+        }
+        let suffix_count = rest.map_or(0, |rest| patterns.len() - rest - 1);
+        for (index, pattern) in patterns.iter().enumerate() {
+            if matches!(pattern, syn::Pat::Rest(_)) {
+                continue;
+            }
+            let value_index = match rest {
+                Some(rest) if index > rest => values.len() - suffix_count + index - rest - 1,
+                _ => index,
+            };
+            self.bind_pattern(pattern, values[value_index].clone());
+        }
+    }
+
+    fn bind_unknown_pattern(&mut self, pattern: &syn::Pat) {
+        match pattern {
+            syn::Pat::Ident(pattern) => {
+                self.insert(pattern.ident.to_string(), LocalKind::Unknown);
+                if let Some((_, subpat)) = &pattern.subpat {
+                    self.bind_unknown_pattern(subpat);
+                }
+            }
+            syn::Pat::Tuple(pattern) => {
+                for child in &pattern.elems {
+                    self.bind_unknown_pattern(child);
+                }
+            }
+            syn::Pat::TupleStruct(pattern) => {
+                for child in &pattern.elems {
+                    self.bind_unknown_pattern(child);
+                }
+            }
+            syn::Pat::Struct(pattern) => {
+                for field in &pattern.fields {
+                    self.bind_unknown_pattern(&field.pat);
+                }
+            }
+            syn::Pat::Paren(pattern) => self.bind_unknown_pattern(&pattern.pat),
+            syn::Pat::Type(pattern) => self.bind_unknown_pattern(&pattern.pat),
+            syn::Pat::Reference(pattern) => self.bind_unknown_pattern(&pattern.pat),
+            syn::Pat::Or(pattern) => {
+                if let Some(first) = pattern.cases.first() {
+                    self.bind_unknown_pattern(first);
+                }
+            }
+            syn::Pat::Slice(pattern) => {
+                for child in &pattern.elems {
+                    self.bind_unknown_pattern(child);
+                }
+            }
+            syn::Pat::Wild(_) | syn::Pat::Rest(_) => {}
+            _ => {}
+        }
+    }
+
     fn rewrite_vector_index(&mut self, index: &syn::ExprIndex, mutable: bool) -> Option<Expr> {
         let Expr::Path(receiver) = index.expr.as_ref() else {
             return None;
         };
-        if receiver.qself.is_some() || receiver.path.segments.len() != 1 {
+        let name = self.path_local_name(receiver)?;
+        let (kind, depth) = self.lookup(&name)?;
+        if !matches!(kind, LocalKind::Vec) {
+            if matches!(kind, LocalKind::Unknown | LocalKind::Ambiguous) {
+                self.errors.push(syn::Error::new_spanned(
+                    index,
+                    format!(
+                        "arena! cannot prove `{name}` is a compact Vec for indexing; add an explicit compact type annotation or use `get_in`/`get_mut_in`"
+                    ),
+                ));
+            }
             return None;
         }
-        let name = receiver.path.segments[0].ident.to_string();
-        if !matches!(self.locals.get(&name), Some(LocalKind::Vec)) {
+        if mutable && self.captured_at(depth) {
+            self.errors.push(syn::Error::new_spanned(
+                index,
+                "arena! cannot rewrite mutable indexing of a compact value captured by a closure; use explicit `_in` APIs inside the closure",
+            ));
             return None;
         }
         let receiver = &index.expr;
@@ -170,56 +649,207 @@ impl ArenaRewrite {
                 ))?
         })
     }
+
+    fn path_local_name(&self, path: &syn::ExprPath) -> Option<String> {
+        if path.qself.is_some() || path.path.segments.len() != 1 {
+            return None;
+        }
+        Some(path.path.segments[0].ident.to_string())
+    }
+
+    fn insert(&mut self, name: String, kind: LocalKind) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name, kind);
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<(LocalKind, usize)> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, scope)| scope.get(name).cloned().map(|kind| (kind, depth)))
+    }
+
+    fn assign(&mut self, name: &str, kind: LocalKind) {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_owned(), kind);
+                return;
+            }
+        }
+        self.insert(name.to_owned(), kind);
+    }
+
+    fn captured_at(&self, depth: usize) -> bool {
+        self.closure_boundaries
+            .last()
+            .is_some_and(|(boundary, _)| depth < *boundary)
+    }
 }
 
-fn classify_constructor(expression: &Expr) -> Option<LocalKind> {
-    let mut expression = expression;
-    loop {
-        expression = match expression {
-            Expr::Try(wrapper) => &wrapper.expr,
-            Expr::Paren(wrapper) => &wrapper.expr,
-            Expr::Group(wrapper) => &wrapper.expr,
-            _ => break,
-        };
+fn classify_block_tail(rewrite: &mut ArenaRewrite, block: &Block, consume: bool) -> LocalKind {
+    match block.stmts.last() {
+        Some(syn::Stmt::Expr(expression, None)) => rewrite.classify_expr(expression, consume),
+        _ => LocalKind::KnownNonCompact,
     }
-    let Expr::Call(call) = expression else {
-        return None;
-    };
-    let Expr::Path(path) = call.func.as_ref() else {
-        return None;
-    };
-    let segments = &path.path.segments;
-    if segments.len() != 2
-        || segments
-            .iter()
-            .any(|segment| !matches!(segment.arguments, PathArguments::None))
+}
+
+fn join_states(
+    left: &[HashMap<String, LocalKind>],
+    right: &[HashMap<String, LocalKind>],
+) -> Vec<HashMap<String, LocalKind>> {
+    left.iter()
+        .zip(right)
+        .map(|(left_scope, right_scope)| {
+            let mut joined = HashMap::new();
+            for name in left_scope.keys().chain(right_scope.keys()) {
+                let left_kind = left_scope.get(name).cloned().unwrap_or(LocalKind::Unknown);
+                let right_kind = right_scope.get(name).cloned().unwrap_or(LocalKind::Unknown);
+                joined.insert(name.clone(), join_kind(left_kind, right_kind));
+            }
+            joined
+        })
+        .collect()
+}
+
+fn join_kind(left: LocalKind, right: LocalKind) -> LocalKind {
+    if left == right {
+        return left;
+    }
+    if left.owns_compact_value()
+        || right.owns_compact_value()
+        || matches!(left, LocalKind::Ambiguous)
+        || matches!(right, LocalKind::Ambiguous)
     {
-        return None;
+        LocalKind::Ambiguous
+    } else {
+        LocalKind::Unknown
     }
-    let owner = segments[0].ident.to_string();
-    let method = segments[1].ident.to_string();
-    match (owner.as_str(), method.as_str()) {
-        ("Vec", "new" | "with_capacity") => Some(LocalKind::Vec),
-        ("String", "new" | "from") => Some(LocalKind::String),
+}
+
+fn pattern_annotation(pattern: &syn::Pat) -> Option<&Type> {
+    match pattern {
+        syn::Pat::Type(pattern) => Some(&pattern.ty),
         _ => None,
     }
+}
+
+fn classify_type(ty: &Type) -> LocalKind {
+    match ty {
+        Type::Paren(ty) => classify_type(&ty.elem),
+        Type::Group(ty) => classify_type(&ty.elem),
+        Type::Tuple(ty) => LocalKind::Tuple(ty.elems.iter().map(classify_type).collect()),
+        Type::Path(ty) if ty.qself.is_none() => classify_type_path(&ty.path),
+        _ => LocalKind::Unknown,
+    }
+}
+
+fn classify_type_path(path: &Path) -> LocalKind {
+    let names: Vec<_> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    let last = names.last().map(String::as_str).unwrap_or_default();
+    if is_std_type_path(&names) {
+        return LocalKind::KnownNonCompact;
+    }
+    match last {
+        "Vec" | "CompactVec" => LocalKind::Vec,
+        "String" | "CompactString" => LocalKind::String,
+        "Box" | "CompactBox" => LocalKind::Box,
+        "Option" | "Result" | "HashMap" | "HashSet" => LocalKind::KnownNonCompact,
+        _ => LocalKind::Unknown,
+    }
+}
+
+fn is_std_type_path(names: &[String]) -> bool {
+    names.starts_with(&["std".to_owned(), "vec".to_owned()])
+        || names.starts_with(&["std".to_owned(), "string".to_owned()])
+        || names.starts_with(&["std".to_owned(), "boxed".to_owned()])
+        || names.starts_with(&["::std".to_owned()])
+}
+
+fn classify_constructor(expression: &ExprCall) -> LocalKind {
+    let Expr::Path(path) = expression.func.as_ref() else {
+        return LocalKind::Unknown;
+    };
+    let Some((owner, compact)) = constructor_owner(&path.path) else {
+        return LocalKind::Unknown;
+    };
+    let method = path.path.segments.last().unwrap().ident.to_string();
+    let recognized = matches!(
+        (owner, method.as_str()),
+        (
+            "Vec",
+            "new" | "with_capacity" | "new_in" | "with_capacity_in"
+        ) | ("String", "new" | "from" | "new_in" | "from_str_in")
+            | ("Box", "new" | "new_in")
+    );
+    if !recognized {
+        LocalKind::Unknown
+    } else if compact {
+        match owner {
+            "Vec" => LocalKind::Vec,
+            "String" => LocalKind::String,
+            "Box" => LocalKind::Box,
+            _ => LocalKind::Unknown,
+        }
+    } else {
+        LocalKind::KnownNonCompact
+    }
+}
+
+fn constructor_owner(path: &Path) -> Option<(&'static str, bool)> {
+    let segments = &path.segments;
+    if segments.len() < 2 {
+        return None;
+    }
+    let owner_segment = &segments[segments.len() - 2];
+    let method_segment = segments.last()?;
+    if !matches!(method_segment.arguments, syn::PathArguments::None) {
+        return None;
+    }
+    let owner = owner_segment.ident.to_string();
+    let owner = match owner.as_str() {
+        "Vec" | "CompactVec" => "Vec",
+        "String" | "CompactString" => "String",
+        "Box" | "CompactBox" => "Box",
+        _ => return None,
+    };
+    let prefix: Vec<_> = segments
+        .iter()
+        .take(segments.len() - 1)
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    let compact = match prefix.as_slice() {
+        [_] => true,
+        [root, alias] if root == "compact_std" => {
+            matches!(
+                alias.as_str(),
+                "Vec" | "String" | "Box" | "CompactVec" | "CompactString" | "CompactBox"
+            )
+        }
+        [root, module, alias] if root == "compact_std" && module == "prelude" => {
+            matches!(alias.as_str(), "Vec" | "String" | "Box")
+        }
+        [root, module, alias] if root == "std" || root == "alloc" => false,
+        _ => false,
+    };
+    Some((owner, compact))
 }
 
 fn rewrite_constructor(call: &ExprCall, arena: &Ident) -> Option<Expr> {
     let Expr::Path(path) = call.func.as_ref() else {
         return None;
     };
-    let segments = &path.path.segments;
-    if segments.len() != 2
-        || segments
-            .iter()
-            .any(|segment| !matches!(segment.arguments, PathArguments::None))
-    {
+    let (owner, compact) = constructor_owner(&path.path)?;
+    if !compact {
         return None;
     }
-    let owner = segments[0].ident.to_string();
-    let method = segments[1].ident.to_string();
-    let new_method = match (owner.as_str(), method.as_str(), call.args.len()) {
+    let method = path.path.segments.last()?.ident.to_string();
+    let new_method = match (owner, method.as_str(), call.args.len()) {
         ("Vec", "new", 0) => "new_in",
         ("Vec", "with_capacity", 1) => "with_capacity_in",
         ("String", "new", 0) => "new_in",
@@ -240,30 +870,112 @@ fn rewrite_constructor(call: &ExprCall, arena: &Ident) -> Option<Expr> {
     }))
 }
 
-fn rewrite_method(call: &mut ExprMethodCall, kind: LocalKind, arena: &Ident) {
+fn rewrite_method(call: &mut ExprMethodCall, kind: &LocalKind, arena: &Ident) {
     let method = call.method.to_string();
     let replacement = match (kind, method.as_str()) {
         (LocalKind::Vec, "push") => Some("push_in"),
         (LocalKind::Vec, "pop") => Some("pop_in"),
         (LocalKind::Vec, "reserve") => Some("reserve_in"),
+        (LocalKind::Vec, "shrink_to_fit") => Some("shrink_to_fit_in"),
         (LocalKind::Vec, "get" | "get_mut" | "as_slice" | "as_mut_slice" | "iter") => None,
         (LocalKind::String, "push_str") => Some("push_str_in"),
         (LocalKind::String, "push_char") => Some("push_char_in"),
         (LocalKind::String, "truncate") => Some("truncate_in"),
+        (LocalKind::String, "shrink_to_fit") => Some("shrink_to_fit_in"),
         (LocalKind::String, "as_str" | "as_bytes") => None,
+        (LocalKind::Box, "get" | "get_mut") => None,
         _ => return,
     };
     if let Some(name) = replacement {
         call.method = Ident::new(name, call.method.span());
     }
-    let requires_arena = replacement.is_some()
-        || (matches!(kind, LocalKind::Vec)
-            && matches!(
-                method.as_str(),
+    let needs_arena = replacement.is_some()
+        || matches!(
+            (kind, method.as_str()),
+            (
+                LocalKind::Vec,
                 "get" | "get_mut" | "as_slice" | "as_mut_slice" | "iter"
-            ))
-        || (matches!(kind, LocalKind::String) && matches!(method.as_str(), "as_str" | "as_bytes"));
-    if requires_arena {
+            ) | (LocalKind::String, "as_str" | "as_bytes")
+                | (LocalKind::Box, "get" | "get_mut")
+        );
+    if needs_arena && !has_explicit_arena_arg(call, arena) {
         call.args.push(syn::parse_quote!(#arena));
     }
+}
+
+fn has_explicit_arena_arg(call: &ExprMethodCall, arena: &Ident) -> bool {
+    call.args.last().is_some_and(|argument| {
+        matches!(argument, Expr::Path(path) if path.qself.is_none() && path.path.is_ident(arena))
+    })
+}
+
+fn method_needs_compact_resolution(method: &str) -> bool {
+    matches!(
+        method,
+        "push"
+            | "pop"
+            | "reserve"
+            | "shrink_to_fit"
+            | "push_str"
+            | "push_char"
+            | "truncate"
+            | "get"
+            | "get_mut"
+            | "as_slice"
+            | "as_mut_slice"
+            | "iter"
+            | "as_str"
+            | "as_bytes"
+    )
+}
+
+fn method_mutates(kind: &LocalKind, method: &str) -> bool {
+    match kind {
+        LocalKind::Vec => matches!(
+            method,
+            "push"
+                | "push_in"
+                | "pop"
+                | "pop_in"
+                | "reserve"
+                | "reserve_in"
+                | "truncate"
+                | "clear"
+                | "get_mut"
+                | "as_mut_slice"
+                | "shrink_to_fit"
+                | "shrink_to_fit_in"
+        ),
+        LocalKind::String => matches!(
+            method,
+            "push"
+                | "push_char"
+                | "push_char_in"
+                | "push_str"
+                | "push_str_in"
+                | "truncate"
+                | "truncate_in"
+                | "clear"
+                | "shrink_to_fit"
+                | "shrink_to_fit_in"
+        ),
+        LocalKind::Box => matches!(method, "get_mut"),
+        _ => false,
+    }
+}
+
+fn is_compound_assignment(operator: &syn::BinOp) -> bool {
+    matches!(
+        operator,
+        syn::BinOp::AddAssign(_)
+            | syn::BinOp::SubAssign(_)
+            | syn::BinOp::MulAssign(_)
+            | syn::BinOp::DivAssign(_)
+            | syn::BinOp::RemAssign(_)
+            | syn::BinOp::BitXorAssign(_)
+            | syn::BinOp::BitAndAssign(_)
+            | syn::BinOp::BitOrAssign(_)
+            | syn::BinOp::ShlAssign(_)
+            | syn::BinOp::ShrAssign(_)
+    )
 }

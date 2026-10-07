@@ -31,6 +31,12 @@ struct Position {
     active: bool,
 }
 
+fn make_numbers<'arena>(
+    arena: &mut Arena<'arena, '_>,
+) -> Result<Vec<'arena, i32>> {
+    Ok(Vec::new_in(arena))
+}
+
 fn main() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
     StdArena::with_capacity(16 * 1024, |arena| -> Result<()> {
         arena!(arena, {
@@ -65,6 +71,22 @@ fn main() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
             values[0] = 11;
             assert_eq!(values[0], 11);
 
+            let original = Vec::new();
+            let mut moved_values = original;
+            moved_values.push(17_i32)?;
+            assert_eq!(moved_values[0], 17);
+
+            let mut shadowed = Vec::new();
+            {
+                let shadowed = std::vec::Vec::<u8>::new();
+                assert!(shadowed.is_empty());
+            }
+            shadowed.push(19_i32)?;
+
+            let mut helper_values: Vec<'_, i32> = make_numbers(arena)?;
+            helper_values.push(23_i32)?;
+            assert_eq!(helper_values[0], 23);
+
             let mut reserved = Vec::with_capacity(2)?;
             reserved.push(1_u8)?;
             assert_eq!(reserved.get(0)?, Some(&1));
@@ -83,6 +105,9 @@ fn main() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
             assert_eq!(message.as_str()?, "compact!");
             let greeting = String::from("hello")?;
             assert_eq!(greeting.as_str()?, "hello");
+            let moving_message = String::from("moved string")?;
+            let message_after_move = moving_message;
+            assert_eq!(message_after_move.as_str()?, "moved string");
 
             let boxed = Box::new(55_u32)?;
             assert_eq!(*boxed.get(arena)?, 55);

@@ -1,0 +1,5 @@
+error: arena! cannot track a compact value captured by a `move` closure; use explicit `_in` APIs and keep the value outside the closure
+ --> tests/ui/arena_move_closure.rs:7:32
+  |
+7 |             let read = move || values.len();
+  |                                ^^^^^^

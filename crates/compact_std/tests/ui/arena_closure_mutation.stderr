@@ -1,0 +1,5 @@
+error: arena! cannot rewrite a mutating method on a compact value captured by a closure; use the explicit `_in` method inside the closure
+ --> tests/ui/arena_closure_mutation.rs:8:17
+  |
+8 |                 values.push(1)?;
+  |                 ^^^^^^^^^^^^^^
