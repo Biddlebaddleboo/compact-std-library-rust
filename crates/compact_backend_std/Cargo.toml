@@ -8,5 +8,8 @@ description = "Process-wide compact cage runtime"
 keywords = ["cage", "memory", "compact", "std"]
 categories = ["memory-management"]
 
+[features]
+allocator-telemetry = []
+
 [dependencies]
 compact_core = { version = "2.4.0", path = "../compact_core" }

@@ -8,10 +8,18 @@ use core::mem::{align_of, size_of, MaybeUninit};
 use core::ptr::NonNull;
 use core::slice;
 use std::alloc::{alloc, dealloc, Layout};
+use std::cell::Cell;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const INITIAL_CURSOR: u32 = 8;
 const FREE_NODE_BYTES: u32 = size_of::<FreeNode>() as u32;
+const BLOCK_SIZE_BUCKETS: usize = 129;
+const RELEASE_BATCH_CAPACITY: usize = 64;
+const SIZE_CLASSES: [u32; 4] = [32, 40, 112, 528];
+const SIZE_CLASS_CACHE_CAPACITY: u32 = 32;
+const MAX_SIZE_CLASS_EXTENTS: usize = SIZE_CLASSES.len() * SIZE_CLASS_CACHE_CAPACITY as usize;
+const MAX_MERGE_EXTENTS: usize = RELEASE_BATCH_CAPACITY + MAX_SIZE_CLASS_EXTENTS;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -29,6 +37,71 @@ struct FreeNode {
     len: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ReleaseExtent {
+    start: u32,
+    len: u32,
+}
+
+struct ReleaseCollector {
+    extents: [ReleaseExtent; RELEASE_BATCH_CAPACITY],
+    len: usize,
+}
+
+impl ReleaseCollector {
+    fn new() -> Self {
+        Self {
+            extents: [ReleaseExtent::default(); RELEASE_BATCH_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, extent: ReleaseExtent) {
+        if self.len == RELEASE_BATCH_CAPACITY {
+            self.flush();
+        }
+        if self.len < RELEASE_BATCH_CAPACITY {
+            self.extents[self.len] = extent;
+            self.len += 1;
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        if release_many(&mut self.extents[..self.len]).is_err() {
+            // A bad member must not prevent the remaining valid descriptors
+            // from being returned during destructor unwinding.
+            for index in 0..self.len {
+                let mut one = [self.extents[index]];
+                let _ = release_many(&mut one);
+            }
+        }
+        self.len = 0;
+    }
+}
+
+thread_local! {
+    static ACTIVE_RELEASE_COLLECTOR: Cell<*mut ReleaseCollector> = const {
+        Cell::new(core::ptr::null_mut())
+    };
+}
+
+struct ReleaseBatchScope {
+    collector: *mut ReleaseCollector,
+    previous: *mut ReleaseCollector,
+}
+
+impl Drop for ReleaseBatchScope {
+    fn drop(&mut self) {
+        ACTIVE_RELEASE_COLLECTOR.with(|active| active.set(self.previous));
+        // SAFETY: the collector is stack-local to `with_batched_releases` and
+        // this scope guard is dropped before that local leaves scope.
+        unsafe { (*self.collector).flush() };
+    }
+}
+
 const _: [(); 16] = [(); size_of::<AllocationHeader>()];
 const _: [(); 8] = [(); size_of::<FreeNode>()];
 
@@ -36,12 +109,58 @@ struct Allocator {
     cursor: u32,
     live_bytes: u32,
     free_head: u32,
+    size_class_heads: [u32; SIZE_CLASSES.len()],
+    size_class_counts: [u32; SIZE_CLASSES.len()],
+    has_size_class_cache: bool,
+    #[cfg(feature = "allocator-telemetry")]
+    lock_acquisitions: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    free_list_nodes_visited: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    allocation_size_histogram: [u64; BLOCK_SIZE_BUCKETS],
+    #[cfg(feature = "allocator-telemetry")]
+    release_batches: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    released_extents: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    max_release_batch: u32,
+    #[cfg(feature = "allocator-telemetry")]
+    size_class_hits: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    size_class_misses: u64,
 }
 
 struct CageState {
     capacity: usize,
     memory: NonNull<u8>,
     allocator: Mutex<Allocator>,
+}
+
+/// Holds the global allocator lock for one internal operation. Callers must
+/// finish all user code and destructors before opening a transaction.
+struct AllocatorTransaction<'a> {
+    state: &'a CageState,
+    allocator: MutexGuard<'a, Allocator>,
+}
+
+impl Deref for AllocatorTransaction<'_> {
+    type Target = Allocator;
+
+    fn deref(&self) -> &Self::Target {
+        &self.allocator
+    }
+}
+
+impl DerefMut for AllocatorTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.allocator
+    }
+}
+
+impl AllocatorTransaction<'_> {
+    fn release_many(&mut self, extents: &mut [ReleaseExtent]) -> Result<()> {
+        release_many_locked(self.state, &mut self.allocator, extents, true)
+    }
 }
 
 // SAFETY: `memory` uniquely owns a stable raw allocation. Allocator scalars and
@@ -82,7 +201,7 @@ pub struct CageConfig {
 /// This diagnostic surface is hidden from the normal API documentation and
 /// does not alter allocator state or retained owner layouts.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocatorStats {
     /// Bytes occupied by live allocations, including headers and padding.
     pub live_bytes: u32,
@@ -94,6 +213,48 @@ pub struct AllocatorStats {
     pub free_blocks: u32,
     /// Size of the largest reusable free block.
     pub largest_free_block: u32,
+    /// Number of allocator mutex acquisitions since runtime initialization.
+    pub lock_acquisitions: u64,
+    /// Number of ordered free-list nodes visited by allocation/release paths.
+    pub free_list_nodes_visited: u64,
+    /// Number of release batches applied.
+    pub release_batches: u64,
+    /// Number of extents processed by release batches.
+    pub released_extents: u64,
+    /// Largest release batch applied.
+    pub max_release_batch: u32,
+    /// Number of small size-class allocations served from a cached block.
+    pub size_class_hits: u64,
+    /// Number of eligible small allocations that missed size-class caches.
+    pub size_class_misses: u64,
+    /// Allocation counts by 8-byte block-size bucket; bucket 128 is 1024 B+.
+    pub allocation_size_histogram: [u64; BLOCK_SIZE_BUCKETS],
+    /// Cached free block counts for the measured exact-size classes.
+    pub size_class_free_blocks: [u32; SIZE_CLASSES.len()],
+    /// Cached free bytes for the measured exact-size classes.
+    pub size_class_free_bytes: [u32; SIZE_CLASSES.len()],
+}
+
+impl Default for AllocatorStats {
+    fn default() -> Self {
+        Self {
+            live_bytes: 0,
+            high_water_cursor: 0,
+            free_bytes: 0,
+            free_blocks: 0,
+            largest_free_block: 0,
+            lock_acquisitions: 0,
+            free_list_nodes_visited: 0,
+            release_batches: 0,
+            released_extents: 0,
+            max_release_batch: 0,
+            size_class_hits: 0,
+            size_class_misses: 0,
+            allocation_size_histogram: [0; BLOCK_SIZE_BUCKETS],
+            size_class_free_blocks: [0; SIZE_CLASSES.len()],
+            size_class_free_bytes: [0; SIZE_CLASSES.len()],
+        }
+    }
 }
 
 impl CageConfig {
@@ -129,6 +290,25 @@ impl CompactRuntime {
                 cursor: INITIAL_CURSOR,
                 live_bytes: 0,
                 free_head: 0,
+                size_class_heads: [0; SIZE_CLASSES.len()],
+                size_class_counts: [0; SIZE_CLASSES.len()],
+                has_size_class_cache: false,
+                #[cfg(feature = "allocator-telemetry")]
+                lock_acquisitions: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                free_list_nodes_visited: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                allocation_size_histogram: [0; BLOCK_SIZE_BUCKETS],
+                #[cfg(feature = "allocator-telemetry")]
+                release_batches: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                released_extents: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                max_release_batch: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                size_class_hits: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                size_class_misses: 0,
             }),
         };
         CAGE.set(state)
@@ -166,6 +346,23 @@ impl CompactRuntime {
         let mut stats = AllocatorStats {
             live_bytes: allocator.live_bytes,
             high_water_cursor: allocator.cursor,
+            size_class_free_blocks: allocator.size_class_counts,
+            #[cfg(feature = "allocator-telemetry")]
+            lock_acquisitions: allocator.lock_acquisitions,
+            #[cfg(feature = "allocator-telemetry")]
+            free_list_nodes_visited: allocator.free_list_nodes_visited,
+            #[cfg(feature = "allocator-telemetry")]
+            release_batches: allocator.release_batches,
+            #[cfg(feature = "allocator-telemetry")]
+            released_extents: allocator.released_extents,
+            #[cfg(feature = "allocator-telemetry")]
+            max_release_batch: allocator.max_release_batch,
+            #[cfg(feature = "allocator-telemetry")]
+            size_class_hits: allocator.size_class_hits,
+            #[cfg(feature = "allocator-telemetry")]
+            size_class_misses: allocator.size_class_misses,
+            #[cfg(feature = "allocator-telemetry")]
+            allocation_size_histogram: allocator.allocation_size_histogram,
             ..AllocatorStats::default()
         };
         let mut current = allocator.free_head;
@@ -183,6 +380,36 @@ impl CompactRuntime {
                 .ok_or(Error::InvalidOffset)?;
             stats.largest_free_block = stats.largest_free_block.max(node.len);
             current = node.next;
+        }
+        for class_index in 0..SIZE_CLASSES.len() {
+            let mut class_current = allocator.size_class_heads[class_index];
+            let mut counted = 0_u32;
+            while class_current != 0 {
+                // SAFETY: class heads contain only allocator-owned free blocks.
+                let node = unsafe { read_free_node(state, class_current)? };
+                stats.free_bytes = stats
+                    .free_bytes
+                    .checked_add(node.len)
+                    .ok_or(Error::InvalidOffset)?;
+                stats.free_blocks = stats
+                    .free_blocks
+                    .checked_add(1)
+                    .ok_or(Error::InvalidOffset)?;
+                stats.largest_free_block = stats.largest_free_block.max(node.len);
+                stats.size_class_free_bytes[class_index] = stats.size_class_free_bytes[class_index]
+                    .checked_add(node.len)
+                    .ok_or(Error::InvalidOffset)?;
+                counted = counted.checked_add(1).ok_or(Error::InvalidOffset)?;
+                class_current = node.next;
+            }
+            if counted != allocator.size_class_counts[class_index] {
+                return Err(Error::InvalidOffset);
+            }
+        }
+        if allocator.has_size_class_cache
+            != allocator.size_class_counts.iter().any(|count| *count != 0)
+        {
+            return Err(Error::InvalidOffset);
         }
         Ok(stats)
     }
@@ -202,6 +429,28 @@ impl CompactRuntime {
     /// Reserve one temporary bump region inside the process cage.
     pub fn scratch(capacity: usize) -> Result<crate::ScratchRegion> {
         crate::ScratchRegion::new(capacity)
+    }
+
+    /// Run a teardown or replacement operation and batch cage releases caused
+    /// by its dropped values. The operation runs before any allocator lock is
+    /// acquired; nested calls join the active thread-local batch.
+    #[doc(hidden)]
+    pub fn with_batched_releases<R>(operation: impl FnOnce() -> R) -> R {
+        let previous = ACTIVE_RELEASE_COLLECTOR.with(Cell::get);
+        if !previous.is_null() {
+            return operation();
+        }
+
+        let mut collector = ReleaseCollector::new();
+        let collector_pointer = &mut collector as *mut ReleaseCollector;
+        let previous = ACTIVE_RELEASE_COLLECTOR.with(|active| active.replace(collector_pointer));
+        let scope = ReleaseBatchScope {
+            collector: collector_pointer,
+            previous,
+        };
+        let result = operation();
+        drop(scope);
+        result
     }
 
     /// Check that an owner still names a live allocation in this process cage.
@@ -229,6 +478,30 @@ impl CompactRuntime {
             }
             free = node.next;
         }
+        for class_index in 0..SIZE_CLASSES.len() {
+            let mut free = allocator.size_class_heads[class_index];
+            let mut count = 0_u32;
+            while free != 0 {
+                let node = unsafe { read_free_node(state, free)? };
+                let free_end = free.checked_add(node.len).ok_or(Error::InvalidOffset)?;
+                if start < free_end && free < end {
+                    return Err(Error::InvalidOffset);
+                }
+                count = count.checked_add(1).ok_or(Error::InvalidOffset)?;
+                if count > SIZE_CLASS_CACHE_CAPACITY {
+                    return Err(Error::InvalidOffset);
+                }
+                free = node.next;
+            }
+            if count != allocator.size_class_counts[class_index] {
+                return Err(Error::InvalidOffset);
+            }
+        }
+        if allocator.has_size_class_cache
+            != allocator.size_class_counts.iter().any(|count| *count != 0)
+        {
+            return Err(Error::InvalidOffset);
+        }
         Ok(())
     }
 
@@ -239,38 +512,7 @@ impl CompactRuntime {
     pub fn validate_allocator_state() -> Result<()> {
         let state = state()?;
         let allocator = lock(state)?;
-        if allocator.cursor as usize > state.capacity || allocator.cursor < INITIAL_CURSOR {
-            return Err(Error::InvalidOffset);
-        }
-        let mut free_bytes = 0_u32;
-        let mut previous_end = 0;
-        let mut current = allocator.free_head;
-        while current != 0 {
-            if current < INITIAL_CURSOR || (previous_end != 0 && current <= previous_end) {
-                return Err(Error::InvalidOffset);
-            }
-            let node = unsafe { read_free_node(state, current)? };
-            if node.len < FREE_NODE_BYTES || node.len % 8 != 0 {
-                return Err(Error::InvalidOffset);
-            }
-            let end = current.checked_add(node.len).ok_or(Error::InvalidOffset)?;
-            if end >= allocator.cursor || current == previous_end {
-                return Err(Error::InvalidOffset);
-            }
-            free_bytes = free_bytes
-                .checked_add(node.len)
-                .ok_or(Error::InvalidOffset)?;
-            previous_end = end;
-            current = node.next;
-        }
-        if free_bytes
-            .checked_add(allocator.live_bytes)
-            .ok_or(Error::InvalidOffset)?
-            != allocator.cursor - INITIAL_CURSOR
-        {
-            return Err(Error::InitializationError);
-        }
-        Ok(())
+        validate_allocator(state, &allocator)
     }
 
     /// Resolve an offset to a value.
@@ -489,6 +731,14 @@ impl<T: CompactValue> CageAllocation<T> {
     }
     /// Drop initialized elements until `new_len` remain.
     pub fn truncate(&mut self, new_len: usize) {
+        if core::mem::needs_drop::<T>() {
+            CompactRuntime::with_batched_releases(|| self.truncate_inner(new_len));
+        } else {
+            self.truncate_inner(new_len);
+        }
+    }
+
+    fn truncate_inner(&mut self, new_len: usize) {
         let mut guard = TruncateGuard {
             allocation: self,
             new_len,
@@ -684,6 +934,11 @@ impl<T: CompactValue> CageAllocation<T> {
             .ok_or(Error::OffsetOverflow)?
             .max(1);
         let mut allocator = lock(state)?;
+        if allocator.size_class_counts.iter().any(|count| *count != 0) {
+            // Resize uses the ordered free list to consume adjacent blocks.
+            // Merge cached extents first so no class-owned neighbor is missed.
+            merge_free_ranges_locked(state, &mut allocator)?;
+        }
         let start = self
             .raw_offset()
             .checked_sub(size_of::<AllocationHeader>() as u32)
@@ -839,8 +1094,15 @@ impl Drop for ReleaseGuard {
 
 impl<T: CompactValue> Drop for CageAllocation<T> {
     fn drop(&mut self) {
-        let _release = ReleaseGuard(self.raw_offset());
-        self.truncate(0);
+        if core::mem::needs_drop::<T>() {
+            CompactRuntime::with_batched_releases(|| {
+                let _release = ReleaseGuard(self.raw_offset());
+                self.truncate_inner(0);
+            });
+        } else {
+            let _release = ReleaseGuard(self.raw_offset());
+            self.truncate_inner(0);
+        }
     }
 }
 
@@ -849,8 +1111,18 @@ unsafe impl<T: CompactValue> CompactValue for CageAllocation<T> {}
 fn state() -> Result<&'static CageState> {
     CAGE.get().ok_or(Error::RuntimeNotInitialized)
 }
-fn lock(state: &CageState) -> Result<MutexGuard<'_, Allocator>> {
-    state.allocator.lock().map_err(|_| Error::AllocatorPoisoned)
+fn lock(state: &CageState) -> Result<AllocatorTransaction<'_>> {
+    let allocator = state
+        .allocator
+        .lock()
+        .map_err(|_| Error::AllocatorPoisoned)?;
+    #[cfg(feature = "allocator-telemetry")]
+    let allocator = {
+        let mut allocator = allocator;
+        allocator.lock_acquisitions = allocator.lock_acquisitions.saturating_add(1);
+        allocator
+    };
+    Ok(AllocatorTransaction { state, allocator })
 }
 fn block_layout(
     base: *mut u8,
@@ -983,9 +1255,100 @@ fn allocate_block(
     alignment: usize,
 ) -> Result<(u32, u32, u32)> {
     let required_bytes = u32::try_from(bytes).map_err(|_| Error::OffsetOverflow)?;
+    // With the cage base, starts, and header aligned to eight bytes, requests
+    // up to that alignment have a position-independent block length. Probe
+    // only that exact class; wider alignments still need to check every class.
+    #[cfg(feature = "allocator-telemetry")]
+    let candidate_class = if alignment <= 8 {
+        let block_len = required_bytes
+            .checked_add(size_of::<AllocationHeader>() as u32 + 7)
+            .ok_or(Error::OffsetOverflow)?
+            & !7;
+        size_class_index(block_len)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "allocator-telemetry"))]
+    let candidate_class = if alignment <= 8 && allocator.has_size_class_cache {
+        let block_len = required_bytes
+            .checked_add(size_of::<AllocationHeader>() as u32 + 7)
+            .ok_or(Error::OffsetOverflow)?
+            & !7;
+        size_class_index(block_len)
+    } else {
+        None
+    };
+    let matching_class = allocator
+        .has_size_class_cache
+        .then_some(candidate_class)
+        .flatten();
+    #[cfg(feature = "allocator-telemetry")]
+    let class_eligible = if alignment <= 8 {
+        candidate_class.is_some()
+    } else {
+        size_class_index(
+            block_layout(
+                state.base(),
+                allocator.cursor,
+                required_bytes as usize,
+                alignment,
+            )?
+            .2,
+        )
+        .is_some()
+    };
+    let class_range = match matching_class {
+        Some(index) => index..index + 1,
+        None if alignment > 8 && allocator.has_size_class_cache => 0..SIZE_CLASSES.len(),
+        None => 0..0,
+    };
+    for class_index in class_range {
+        let class_size = SIZE_CLASSES[class_index];
+        let mut current = allocator.size_class_heads[class_index];
+        while current != 0 {
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                allocator.free_list_nodes_visited =
+                    allocator.free_list_nodes_visited.saturating_add(1);
+            }
+            let node = unsafe { read_free_node(state, current)? };
+            if node.len != class_size {
+                return Err(Error::InvalidOffset);
+            }
+            let (data, prefix, required_len) =
+                block_layout(state.base(), current, required_bytes as usize, alignment)?;
+            if required_len == node.len {
+                let live_bytes = allocator
+                    .live_bytes
+                    .checked_add(node.len)
+                    .ok_or(Error::OffsetOverflow)?;
+                allocator.size_class_heads[class_index] = node.next;
+                allocator.size_class_counts[class_index] -= 1;
+                allocator.has_size_class_cache =
+                    allocator.size_class_counts.iter().any(|count| *count != 0);
+                allocator.live_bytes = live_bytes;
+                #[cfg(feature = "allocator-telemetry")]
+                {
+                    allocator.size_class_hits = allocator.size_class_hits.saturating_add(1);
+                }
+                record_allocation_size(allocator, node.len);
+                return Ok((data, prefix, node.len));
+            }
+            current = node.next;
+        }
+    }
+    #[cfg(feature = "allocator-telemetry")]
+    if class_eligible {
+        allocator.size_class_misses = allocator.size_class_misses.saturating_add(1);
+    }
+
     let mut previous = 0;
     let mut current = allocator.free_head;
     while current != 0 {
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.free_list_nodes_visited = allocator.free_list_nodes_visited.saturating_add(1);
+        }
         let node = unsafe { read_free_node(state, current)? };
         let (data, prefix, required_len) =
             block_layout(state.base(), current, required_bytes as usize, alignment)?;
@@ -1026,6 +1389,7 @@ fn allocate_block(
                 unsafe { write_free_node(state, previous, previous_node) };
             }
             allocator.live_bytes = live_bytes;
+            record_allocation_size(allocator, allocated_len);
             return Ok((data, prefix, allocated_len));
         }
         previous = current;
@@ -1045,7 +1409,29 @@ fn allocate_block(
         .ok_or(Error::OffsetOverflow)?;
     allocator.cursor = end;
     allocator.live_bytes = live_bytes;
+    record_allocation_size(allocator, len);
     Ok((data, prefix, len))
+}
+
+#[cfg(feature = "allocator-telemetry")]
+fn record_allocation_size(allocator: &mut Allocator, block_len: u32) {
+    let bucket = ((block_len as usize) / 8).min(BLOCK_SIZE_BUCKETS - 1);
+    allocator.allocation_size_histogram[bucket] =
+        allocator.allocation_size_histogram[bucket].saturating_add(1);
+}
+
+#[cfg(not(feature = "allocator-telemetry"))]
+#[inline]
+fn record_allocation_size(_: &mut Allocator, _: u32) {}
+
+fn size_class_index(block_len: u32) -> Option<usize> {
+    match block_len {
+        32 => Some(0),
+        40 => Some(1),
+        112 => Some(2),
+        528 => Some(3),
+        _ => None,
+    }
 }
 
 unsafe fn read_free_node(state: &CageState, offset: u32) -> Result<FreeNode> {
@@ -1141,130 +1527,746 @@ fn insert_free(state: &CageState, allocator: &mut Allocator, start: u32, len: u3
         return Err(Error::InvalidOffset);
     }
 
-    let mut previous = 0;
+    let mut previous_previous = 0_u32;
+    let mut previous_previous_node = None;
+    let mut previous = 0_u32;
+    let mut previous_node = None;
     let mut next = allocator.free_head;
+    let mut previous_end = 0_u32;
+    let mut steps = 0_u32;
+    let max_steps = allocator.cursor / FREE_NODE_BYTES + 1;
     while next != 0 && next < start {
+        if next < INITIAL_CURSOR || (previous_end != 0 && next <= previous_end) {
+            return Err(Error::InvalidOffset);
+        }
+        let node = unsafe { read_free_node(state, next)? };
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.free_list_nodes_visited = allocator.free_list_nodes_visited.saturating_add(1);
+        }
+        let node_end = next.checked_add(node.len).ok_or(Error::InvalidOffset)?;
+        if node.len < FREE_NODE_BYTES
+            || node.len % 8 != 0
+            || node_end >= allocator.cursor
+            || node_end > start
+            || (node.next != 0 && node_end >= node.next)
+        {
+            return Err(Error::InvalidOffset);
+        }
+        previous_previous = previous;
+        previous_previous_node = previous_node;
         previous = next;
-        next = unsafe { read_free_node(state, next)? }.next;
-    }
-    let previous_node = if previous == 0 {
-        None
-    } else {
-        Some(unsafe { read_free_node(state, previous)? })
-    };
-    let next_node = if next == 0 {
-        None
-    } else {
-        Some(unsafe { read_free_node(state, next)? })
-    };
-    if let Some(node) = previous_node {
-        let previous_end = previous.checked_add(node.len).ok_or(Error::InvalidOffset)?;
-        if previous_end > start {
+        previous_node = Some(node);
+        previous_end = node_end;
+        next = node.next;
+        steps += 1;
+        if steps > max_steps {
             return Err(Error::InvalidOffset);
         }
     }
-    if next_node.is_some() && end > next {
+    let next_node = if next == 0 {
+        None
+    } else {
+        let node = unsafe { read_free_node(state, next)? };
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.free_list_nodes_visited = allocator.free_list_nodes_visited.saturating_add(1);
+        }
+        let node_end = next.checked_add(node.len).ok_or(Error::InvalidOffset)?;
+        if next < INITIAL_CURSOR
+            || (previous_end != 0 && next <= previous_end)
+            || node.len < FREE_NODE_BYTES
+            || node.len % 8 != 0
+            || node_end >= allocator.cursor
+            || end > next
+            || (node.next != 0 && node_end >= node.next)
+        {
+            return Err(Error::InvalidOffset);
+        }
+        Some(node)
+    };
+    if previous_node.is_none() && previous != 0 {
         return Err(Error::InvalidOffset);
     }
 
     let previous_is_adjacent =
-        previous_node.and_then(|node| previous.checked_add(node.len)) == Some(start);
+        previous_node.and_then(|node: FreeNode| previous.checked_add(node.len)) == Some(start);
     let merged_start = if previous_is_adjacent {
         previous
     } else {
         start
     };
-    let mut merged_len = len;
-    let mut merged_next = next;
-    if previous_is_adjacent {
-        let node = previous_node.expect("adjacent previous free block");
-        merged_len = node.len.checked_add(len).ok_or(Error::OffsetOverflow)?;
-        merged_next = node.next;
-    } else if previous == 0 {
-        allocator.free_head = start;
+    let mut merged_len = if previous_is_adjacent {
+        previous_node
+            .expect("adjacent previous free block")
+            .len
+            .checked_add(len)
+            .ok_or(Error::OffsetOverflow)?
     } else {
-        let mut node = previous_node.expect("previous free block");
-        node.next = start;
-        unsafe { write_free_node(state, previous, node) };
-    }
+        len
+    };
+    let mut merged_next = if previous_is_adjacent {
+        previous_node.expect("adjacent previous free block").next
+    } else {
+        next
+    };
     if merged_start.checked_add(merged_len) == Some(next) {
-        let node = next_node.expect("next free block");
+        let node = next_node.expect("adjacent next free block");
         merged_len = merged_len
             .checked_add(node.len)
             .ok_or(Error::OffsetOverflow)?;
         merged_next = node.next;
     }
-    unsafe {
-        write_free_node(
-            state,
-            merged_start,
-            FreeNode {
-                next: merged_next,
-                len: merged_len,
-            },
-        )
-    };
+    let merged_end = merged_start
+        .checked_add(merged_len)
+        .ok_or(Error::OffsetOverflow)?;
+    if merged_end > allocator.cursor || (merged_end == allocator.cursor && merged_next != 0) {
+        return Err(Error::InvalidOffset);
+    }
 
-    loop {
-        let mut prev = 0;
-        let mut last = allocator.free_head;
-        if last == 0 {
-            break;
-        }
-        loop {
-            let node = unsafe { read_free_node(state, last)? };
-            if node.next == 0 {
-                if last.checked_add(node.len) == Some(allocator.cursor) {
-                    if prev == 0 {
-                        allocator.free_head = 0;
-                    } else {
-                        let mut previous_node = unsafe { read_free_node(state, prev)? };
-                        previous_node.next = 0;
-                        unsafe { write_free_node(state, prev, previous_node) };
-                    }
-                    allocator.cursor = last;
-                }
-                break;
+    if merged_end == allocator.cursor {
+        if previous_is_adjacent {
+            if previous_previous == 0 {
+                allocator.free_head = merged_next;
+            } else {
+                let mut node = previous_previous_node.expect("previous free-list predecessor");
+                node.next = merged_next;
+                unsafe { write_free_node(state, previous_previous, node) };
             }
-            prev = last;
-            last = node.next;
+        } else if previous == 0 {
+            allocator.free_head = merged_next;
+        } else {
+            let mut node = previous_node.expect("previous free block");
+            node.next = merged_next;
+            unsafe { write_free_node(state, previous, node) };
         }
-        if allocator.free_head == 0 || last != allocator.cursor {
-            break;
+        allocator.cursor = merged_start;
+    } else if previous_is_adjacent {
+        let mut node = previous_node.expect("adjacent previous free block");
+        node.next = merged_next;
+        node.len = merged_len;
+        unsafe { write_free_node(state, previous, node) };
+    } else {
+        if previous == 0 {
+            allocator.free_head = start;
+        } else {
+            let mut node = previous_node.expect("previous free block");
+            node.next = start;
+            unsafe { write_free_node(state, previous, node) };
         }
+        unsafe {
+            write_free_node(
+                state,
+                start,
+                FreeNode {
+                    next: merged_next,
+                    len: merged_len,
+                },
+            )
+        };
     }
     Ok(())
 }
 
 fn release(offset: u32) {
-    let Ok(state) = state() else {
+    let Some(extent) = release_extent(offset) else {
         return;
     };
-    let mut allocator = match lock(state) {
-        Ok(allocator) => allocator,
-        Err(_) => return,
-    };
-    // SAFETY: the non-copy owner releases this allocator-issued offset once.
-    let Ok(header) = (unsafe { read_header(state, offset) }) else {
-        return;
-    };
-    let Some(start) = offset
-        .checked_sub(size_of::<AllocationHeader>() as u32)
-        .and_then(|header_offset| header_offset.checked_sub(header.prefix))
-    else {
-        return;
-    };
-    let Some(live_bytes) = allocator.live_bytes.checked_sub(header.block_len) else {
-        return;
-    };
-    if insert_free(state, &mut allocator, start, header.block_len).is_ok() {
-        allocator.live_bytes = live_bytes;
+    let collected = ACTIVE_RELEASE_COLLECTOR.with(|active| {
+        let collector = active.get();
+        if collector.is_null() {
+            false
+        } else {
+            // SAFETY: the thread-local pointer is installed only while its
+            // stack-local collector is alive on this same thread.
+            unsafe { (*collector).push(extent) };
+            true
+        }
+    });
+    if !collected {
+        let mut one = [extent];
+        let _ = release_many(&mut one);
     }
+}
+
+fn release_extent(offset: u32) -> Option<ReleaseExtent> {
+    let state = state().ok()?;
+    // SAFETY: the owner releases this allocator-issued offset exactly once.
+    let header = unsafe { read_header(state, offset) }.ok()?;
+    let start = offset
+        .checked_sub(size_of::<AllocationHeader>() as u32)?
+        .checked_sub(header.prefix)?;
+    Some(ReleaseExtent {
+        start,
+        len: header.block_len,
+    })
+}
+
+fn release_many(extents: &mut [ReleaseExtent]) -> Result<()> {
+    if extents.is_empty() {
+        return Ok(());
+    }
+    if extents.len() > RELEASE_BATCH_CAPACITY {
+        return Err(Error::InvalidOffset);
+    }
+    let state = state()?;
+    let mut transaction = lock(state)?;
+    transaction.release_many(extents)
+}
+
+fn next_merge_extent(
+    state: &CageState,
+    general_current: &mut u32,
+    released: &[ReleaseExtent],
+    released_index: &mut usize,
+) -> Result<Option<(ReleaseExtent, bool)>> {
+    if *general_current == 0 {
+        let Some(extent) = released.get(*released_index).copied() else {
+            return Ok(None);
+        };
+        *released_index += 1;
+        return Ok(Some((extent, false)));
+    }
+    let node = unsafe { read_free_node(state, *general_current)? };
+    let general_extent = ReleaseExtent {
+        start: *general_current,
+        len: node.len,
+    };
+    if let Some(extent) = released.get(*released_index).copied() {
+        if extent.start < general_extent.start {
+            *released_index += 1;
+            return Ok(Some((extent, false)));
+        }
+    }
+    *general_current = node.next;
+    Ok(Some((general_extent, true)))
+}
+
+fn release_many_locked(
+    state: &CageState,
+    allocator: &mut Allocator,
+    extents: &mut [ReleaseExtent],
+    cache_small_classes: bool,
+) -> Result<()> {
+    if extents.len() > RELEASE_BATCH_CAPACITY {
+        return Err(Error::InvalidOffset);
+    }
+
+    // Nested owners are often allocated as one tail run and then dropped
+    // together. If no earlier holes exist, validate that run and contract it
+    // directly instead of rebuilding the general free list for each chunk.
+    if !extents.is_empty()
+        && allocator.free_head == 0
+        && allocator.size_class_counts.iter().all(|count| *count == 0)
+    {
+        extents.sort_unstable_by_key(|extent| extent.start);
+        let mut released_bytes = 0_u32;
+        let mut previous_end = 0_u32;
+        let mut is_contiguous = true;
+        for (index, extent) in extents.iter().copied().enumerate() {
+            validate_free_extent(allocator, extent)?;
+            if index != 0 && extent.start != previous_end {
+                is_contiguous = false;
+                break;
+            }
+            previous_end = extent
+                .start
+                .checked_add(extent.len)
+                .ok_or(Error::OffsetOverflow)?;
+            released_bytes = released_bytes
+                .checked_add(extent.len)
+                .ok_or(Error::OffsetOverflow)?;
+        }
+        if is_contiguous
+            && previous_end == allocator.cursor
+            && released_bytes == allocator.cursor.saturating_sub(extents[0].start)
+        {
+            let new_live_bytes = allocator
+                .live_bytes
+                .checked_sub(released_bytes)
+                .ok_or(Error::InvalidOffset)?;
+            if new_live_bytes != extents[0].start.saturating_sub(INITIAL_CURSOR) {
+                return Err(Error::InitializationError);
+            }
+            allocator.live_bytes = new_live_bytes;
+            allocator.cursor = extents[0].start;
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                allocator.release_batches = allocator.release_batches.saturating_add(1);
+                allocator.released_extents = allocator
+                    .released_extents
+                    .saturating_add(extents.len() as u64);
+                allocator.max_release_batch = allocator.max_release_batch.max(extents.len() as u32);
+            }
+            return Ok(());
+        }
+    }
+
+    if extents.len() == 1
+        && cache_small_classes
+        && allocator.size_class_counts.iter().all(|count| *count == 0)
+    {
+        let extent = extents[0];
+        validate_free_extent(allocator, extent)?;
+        let new_live_bytes = allocator
+            .live_bytes
+            .checked_sub(extent.len)
+            .ok_or(Error::InvalidOffset)?;
+        // With no cached ranges, the ordered list is the complete free
+        // structure. Keep its established insertion path for coalescing and
+        // cursor contraction instead of building batch scratch. Size-class
+        // caching is reserved for multi-extent releases so a stream of
+        // individual drops does not force a full class merge on the next drop.
+        insert_free(state, allocator, extent.start, extent.len)?;
+        allocator.live_bytes = new_live_bytes;
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.release_batches = allocator.release_batches.saturating_add(1);
+            allocator.released_extents = allocator.released_extents.saturating_add(1);
+            allocator.max_release_batch = allocator.max_release_batch.max(1);
+        }
+        return Ok(());
+    }
+
+    let mut merged = [ReleaseExtent::default(); MAX_MERGE_EXTENTS];
+    let mut merged_len = 0;
+    let mut released_bytes = 0_u32;
+    for extent in extents.iter().copied() {
+        validate_free_extent(allocator, extent)?;
+        released_bytes = released_bytes
+            .checked_add(extent.len)
+            .ok_or(Error::OffsetOverflow)?;
+        merged[merged_len] = extent;
+        merged_len += 1;
+    }
+
+    let mut class_bytes = 0_u32;
+    #[cfg(feature = "allocator-telemetry")]
+    let mut visited = 0_u64;
+    for (class_index, class_size) in SIZE_CLASSES.iter().copied().enumerate() {
+        let mut current = allocator.size_class_heads[class_index];
+        let mut count = 0_u32;
+        while current != 0 {
+            if merged_len == MAX_MERGE_EXTENTS || count >= SIZE_CLASS_CACHE_CAPACITY {
+                return Err(Error::InvalidOffset);
+            }
+            let node = unsafe { read_free_node(state, current)? };
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                visited += 1;
+            }
+            if node.len != class_size {
+                return Err(Error::InvalidOffset);
+            }
+            let extent = ReleaseExtent {
+                start: current,
+                len: node.len,
+            };
+            validate_free_extent(allocator, extent)?;
+            merged[merged_len] = extent;
+            merged_len += 1;
+            count += 1;
+            class_bytes = class_bytes
+                .checked_add(node.len)
+                .ok_or(Error::OffsetOverflow)?;
+            current = node.next;
+        }
+        if count != allocator.size_class_counts[class_index] {
+            return Err(Error::InvalidOffset);
+        }
+    }
+
+    merged[..merged_len].sort_unstable_by_key(|extent| extent.start);
+    let mut previous_end = 0_u32;
+    let mut release_bytes_sorted = 0_u32;
+    for (index, extent) in merged[..merged_len].iter().copied().enumerate() {
+        validate_free_extent(allocator, extent)?;
+        if index != 0 && extent.start < previous_end {
+            return Err(Error::InvalidOffset);
+        }
+        previous_end = extent
+            .start
+            .checked_add(extent.len)
+            .ok_or(Error::OffsetOverflow)?;
+        release_bytes_sorted = release_bytes_sorted
+            .checked_add(extent.len)
+            .ok_or(Error::OffsetOverflow)?;
+    }
+    if release_bytes_sorted
+        != released_bytes
+            .checked_add(class_bytes)
+            .ok_or(Error::OffsetOverflow)?
+    {
+        return Err(Error::InvalidOffset);
+    }
+
+    let new_live_bytes = allocator
+        .live_bytes
+        .checked_sub(released_bytes)
+        .ok_or(Error::InvalidOffset)?;
+    let expected_prefix = allocator
+        .cursor
+        .checked_sub(INITIAL_CURSOR)
+        .ok_or(Error::InvalidOffset)?;
+    let mut check_general = allocator.free_head;
+    let mut check_released = 0;
+    let mut check_end = 0_u32;
+    let mut general_bytes = 0_u32;
+    let mut steps = 0_u32;
+    let max_steps = allocator.cursor / FREE_NODE_BYTES + 1;
+    while check_general != 0 || check_released < merged_len {
+        let (next, from_general) = next_merge_extent(
+            state,
+            &mut check_general,
+            &merged[..merged_len],
+            &mut check_released,
+        )?
+        .ok_or(Error::InvalidOffset)?;
+        if from_general {
+            general_bytes = general_bytes
+                .checked_add(next.len)
+                .ok_or(Error::OffsetOverflow)?;
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                visited += 1;
+            }
+        }
+        if next.start < check_end {
+            return Err(Error::InvalidOffset);
+        }
+        check_end = next
+            .start
+            .checked_add(next.len)
+            .ok_or(Error::OffsetOverflow)?;
+        if check_end > allocator.cursor {
+            return Err(Error::InvalidOffset);
+        }
+        steps += 1;
+        if steps > max_steps {
+            return Err(Error::InvalidOffset);
+        }
+    }
+    if general_bytes
+        .checked_add(class_bytes)
+        .and_then(|bytes| bytes.checked_add(allocator.live_bytes))
+        .ok_or(Error::OffsetOverflow)?
+        != expected_prefix
+    {
+        return Err(Error::InitializationError);
+    }
+
+    allocator.size_class_heads = [0; SIZE_CLASSES.len()];
+    allocator.size_class_counts = [0; SIZE_CLASSES.len()];
+    allocator.has_size_class_cache = false;
+    let mut general_current = allocator.free_head;
+    let mut released_index = 0;
+    let mut new_general_head = 0_u32;
+    let mut general_tail = 0_u32;
+    let mut last_start = 0_u32;
+    let mut last_end = 0_u32;
+    let mut last_general_previous = 0_u32;
+    let mut last_class = None;
+    while general_current != 0 || released_index < merged_len {
+        let (mut run, _from_general) = next_merge_extent(
+            state,
+            &mut general_current,
+            &merged[..merged_len],
+            &mut released_index,
+        )
+        .expect("free ranges were validated before allocator mutation")
+        .expect("validated merge input must contain the selected extent");
+        #[cfg(feature = "allocator-telemetry")]
+        if _from_general {
+            visited += 1;
+        }
+        let run_start = run.start;
+        let mut run_end = run
+            .start
+            .checked_add(run.len)
+            .expect("validated free extent end fits the cage");
+        loop {
+            let mut general_probe = general_current;
+            let mut released_probe = released_index;
+            let Some((next, _from_general)) = next_merge_extent(
+                state,
+                &mut general_probe,
+                &merged[..merged_len],
+                &mut released_probe,
+            )
+            .expect("free ranges were validated before allocator mutation") else {
+                break;
+            };
+            #[cfg(feature = "allocator-telemetry")]
+            if _from_general {
+                visited += 1;
+            }
+            if next.start != run_end {
+                break;
+            }
+            // Commit the peek only after adjacency has been confirmed.
+            let (_, _from_general) = next_merge_extent(
+                state,
+                &mut general_current,
+                &merged[..merged_len],
+                &mut released_index,
+            )
+            .expect("free ranges were validated before allocator mutation")
+            .expect("adjacent merge input must still contain its peeked extent");
+            #[cfg(feature = "allocator-telemetry")]
+            if _from_general {
+                visited += 1;
+            }
+            run.len = run
+                .len
+                .checked_add(next.len)
+                .expect("validated free range total fits the cage");
+            run_end = run_end
+                .checked_add(next.len)
+                .expect("validated adjacent range end fits the cage");
+        }
+
+        let class_index = cache_small_classes
+            .then(|| size_class_index(run.len))
+            .flatten()
+            .filter(|index| allocator.size_class_counts[*index] < SIZE_CLASS_CACHE_CAPACITY);
+        if let Some(index) = class_index {
+            unsafe {
+                write_free_node(
+                    state,
+                    run_start,
+                    FreeNode {
+                        next: allocator.size_class_heads[index],
+                        len: run.len,
+                    },
+                )
+            };
+            allocator.size_class_heads[index] = run_start;
+            allocator.size_class_counts[index] += 1;
+            allocator.has_size_class_cache = true;
+            last_class = Some(index);
+            last_general_previous = general_tail;
+        } else {
+            unsafe {
+                write_free_node(
+                    state,
+                    run_start,
+                    FreeNode {
+                        next: 0,
+                        len: run.len,
+                    },
+                )
+            };
+            if general_tail == 0 {
+                new_general_head = run_start;
+            } else {
+                let mut tail_node = unsafe { read_free_node(state, general_tail) }
+                    .expect("new general free-list tail remains valid");
+                tail_node.next = run_start;
+                unsafe { write_free_node(state, general_tail, tail_node) };
+            }
+            last_general_previous = general_tail;
+            general_tail = run_start;
+            last_class = None;
+        }
+        last_start = run_start;
+        last_end = run_end;
+    }
+
+    allocator.free_head = new_general_head;
+    allocator.live_bytes = new_live_bytes;
+    if last_end == allocator.cursor {
+        if let Some(class_index) = last_class {
+            assert_eq!(allocator.size_class_heads[class_index], last_start);
+            let node = unsafe { read_free_node(state, last_start) }
+                .expect("last cached free range remains valid");
+            allocator.size_class_heads[class_index] = node.next;
+            allocator.size_class_counts[class_index] -= 1;
+            allocator.has_size_class_cache =
+                allocator.size_class_counts.iter().any(|count| *count != 0);
+        } else if last_general_previous == 0 {
+            allocator.free_head = 0;
+        } else {
+            let mut previous = unsafe { read_free_node(state, last_general_previous) }
+                .expect("last general free-list predecessor remains valid");
+            previous.next = 0;
+            unsafe { write_free_node(state, last_general_previous, previous) };
+        }
+        allocator.cursor = last_start;
+    }
+
+    #[cfg(feature = "allocator-telemetry")]
+    {
+        allocator.free_list_nodes_visited =
+            allocator.free_list_nodes_visited.saturating_add(visited);
+        if !extents.is_empty() {
+            allocator.release_batches = allocator.release_batches.saturating_add(1);
+            allocator.released_extents = allocator
+                .released_extents
+                .saturating_add(extents.len() as u64);
+            allocator.max_release_batch = allocator.max_release_batch.max(extents.len() as u32);
+        }
+    }
+    Ok(())
+}
+
+fn merge_free_ranges_locked(state: &CageState, allocator: &mut Allocator) -> Result<()> {
+    let mut no_releases = [];
+    release_many_locked(state, allocator, &mut no_releases, false)
+}
+
+fn validate_free_extent(allocator: &Allocator, extent: ReleaseExtent) -> Result<()> {
+    if extent.len < FREE_NODE_BYTES
+        || extent.len % 8 != 0
+        || extent.start < INITIAL_CURSOR
+        || extent
+            .start
+            .checked_add(extent.len)
+            .map_or(true, |end| end > allocator.cursor)
+    {
+        return Err(Error::InvalidOffset);
+    }
+    Ok(())
+}
+
+fn validate_allocator(state: &CageState, allocator: &Allocator) -> Result<()> {
+    if allocator.cursor as usize > state.capacity || allocator.cursor < INITIAL_CURSOR {
+        return Err(Error::InvalidOffset);
+    }
+
+    let mut cached = [ReleaseExtent::default(); MAX_SIZE_CLASS_EXTENTS];
+    let mut cached_len = 0;
+    let mut cached_bytes = 0_u32;
+    for (class_index, class_size) in SIZE_CLASSES.iter().copied().enumerate() {
+        let mut current = allocator.size_class_heads[class_index];
+        let mut count = 0_u32;
+        while current != 0 {
+            if count >= SIZE_CLASS_CACHE_CAPACITY || cached_len == cached.len() {
+                return Err(Error::InvalidOffset);
+            }
+            let node = unsafe { read_free_node(state, current)? };
+            if node.len != class_size {
+                return Err(Error::InvalidOffset);
+            }
+            let extent = ReleaseExtent {
+                start: current,
+                len: node.len,
+            };
+            validate_free_extent(allocator, extent)?;
+            if extent
+                .start
+                .checked_add(extent.len)
+                .map_or(true, |end| end >= allocator.cursor)
+            {
+                return Err(Error::InvalidOffset);
+            }
+            cached_bytes = cached_bytes
+                .checked_add(extent.len)
+                .ok_or(Error::OffsetOverflow)?;
+            cached[cached_len] = extent;
+            cached_len += 1;
+            count += 1;
+            current = node.next;
+        }
+        if count != allocator.size_class_counts[class_index] {
+            return Err(Error::InvalidOffset);
+        }
+    }
+    if allocator.has_size_class_cache != (cached_len != 0) {
+        return Err(Error::InvalidOffset);
+    }
+    cached[..cached_len].sort_unstable_by_key(|extent| extent.start);
+
+    let mut general_bytes = 0_u32;
+    let mut general_count = 0_u32;
+    let mut previous_end = 0_u32;
+    let mut current = allocator.free_head;
+    while current != 0 {
+        if current < INITIAL_CURSOR || (previous_end != 0 && current <= previous_end) {
+            return Err(Error::InvalidOffset);
+        }
+        let node = unsafe { read_free_node(state, current)? };
+        let extent = ReleaseExtent {
+            start: current,
+            len: node.len,
+        };
+        validate_free_extent(allocator, extent)?;
+        let end = current.checked_add(node.len).ok_or(Error::InvalidOffset)?;
+        if end >= allocator.cursor || (node.next != 0 && end >= node.next) {
+            return Err(Error::InvalidOffset);
+        }
+        general_bytes = general_bytes
+            .checked_add(node.len)
+            .ok_or(Error::OffsetOverflow)?;
+        general_count = general_count.checked_add(1).ok_or(Error::OffsetOverflow)?;
+        previous_end = end;
+        current = node.next;
+    }
+
+    let mut general_current = allocator.free_head;
+    let mut cached_index = 0;
+    let mut merged_end = 0_u32;
+    let mut total_free_bytes = 0_u32;
+    let mut merged_count = 0_u32;
+    while general_current != 0 || cached_index < cached_len {
+        let (extent, _) = next_merge_extent(
+            state,
+            &mut general_current,
+            &cached[..cached_len],
+            &mut cached_index,
+        )?
+        .ok_or(Error::InvalidOffset)?;
+        validate_free_extent(allocator, extent)?;
+        let end = extent
+            .start
+            .checked_add(extent.len)
+            .ok_or(Error::OffsetOverflow)?;
+        if extent.start <= merged_end && merged_count != 0 {
+            return Err(Error::InvalidOffset);
+        }
+        if end >= allocator.cursor {
+            return Err(Error::InvalidOffset);
+        }
+        merged_end = end;
+        merged_count = merged_count.checked_add(1).ok_or(Error::OffsetOverflow)?;
+        total_free_bytes = total_free_bytes
+            .checked_add(extent.len)
+            .ok_or(Error::OffsetOverflow)?;
+    }
+    if merged_count != general_count.saturating_add(cached_len as u32) {
+        return Err(Error::InvalidOffset);
+    }
+    if total_free_bytes
+        != general_bytes
+            .checked_add(cached_bytes)
+            .ok_or(Error::OffsetOverflow)?
+    {
+        return Err(Error::InitializationError);
+    }
+    if total_free_bytes
+        .checked_add(allocator.live_bytes)
+        .ok_or(Error::OffsetOverflow)?
+        != allocator.cursor - INITIAL_CURSOR
+    {
+        return Err(Error::InitializationError);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_allocate(state: &CageState, allocator: &mut Allocator, bytes: usize) -> ReleaseExtent {
+        let (data, prefix, len) = allocate_block(state, allocator, bytes, 8).unwrap();
+        ReleaseExtent {
+            start: data - size_of::<AllocationHeader>() as u32 - prefix,
+            len,
+        }
+    }
+
+    fn local_release(state: &CageState, allocator: &mut Allocator, extents: &mut [ReleaseExtent]) {
+        release_many_locked(state, allocator, extents, true).unwrap();
+    }
 
     fn local_state(capacity: usize) -> CageState {
         let layout = Layout::from_size_align(capacity, 8).unwrap();
@@ -1277,6 +2279,25 @@ mod tests {
                 cursor: INITIAL_CURSOR,
                 live_bytes: 0,
                 free_head: 0,
+                size_class_heads: [0; SIZE_CLASSES.len()],
+                size_class_counts: [0; SIZE_CLASSES.len()],
+                has_size_class_cache: false,
+                #[cfg(feature = "allocator-telemetry")]
+                lock_acquisitions: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                free_list_nodes_visited: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                allocation_size_histogram: [0; BLOCK_SIZE_BUCKETS],
+                #[cfg(feature = "allocator-telemetry")]
+                release_batches: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                released_extents: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                max_release_batch: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                size_class_hits: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                size_class_misses: 0,
             }),
         }
     }
@@ -1329,5 +2350,187 @@ mod tests {
         assert_eq!(allocator.cursor, starts[0]);
         assert_eq!(allocator.free_head, 0);
         assert_eq!(allocator.live_bytes, 0);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn batch_release_reuses_classes_merges_neighbors_and_contracts_tail() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let a = local_allocate(&state, &mut allocator, 16);
+        let b = local_allocate(&state, &mut allocator, 16);
+        let c = local_allocate(&state, &mut allocator, 16);
+        let d = local_allocate(&state, &mut allocator, 16);
+
+        let mut first_batch = [d, b];
+        local_release(&state, &mut allocator, &mut first_batch);
+        assert_eq!(allocator.size_class_counts[0], 1);
+        assert_eq!(allocator.cursor, d.start);
+        validate_allocator(&state, &allocator).unwrap();
+
+        let reused = local_allocate(&state, &mut allocator, 16);
+        assert_eq!(reused.start, b.start);
+        assert_eq!(allocator.size_class_counts[0], 0);
+        validate_allocator(&state, &allocator).unwrap();
+
+        let mut last_batch = [c, reused, a];
+        local_release(&state, &mut allocator, &mut last_batch);
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+        assert_eq!(allocator.free_head, 0);
+        assert_eq!(allocator.size_class_counts, [0; SIZE_CLASSES.len()]);
+        assert_eq!(allocator.live_bytes, 0);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn contiguous_tail_batch_contracts_without_creating_free_ranges() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let a = local_allocate(&state, &mut allocator, 16);
+        let b = local_allocate(&state, &mut allocator, 16);
+        let c = local_allocate(&state, &mut allocator, 16);
+
+        let mut releases = [c, a, b];
+        local_release(&state, &mut allocator, &mut releases);
+
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+        assert_eq!(allocator.live_bytes, 0);
+        assert_eq!(allocator.free_head, 0);
+        assert!(!allocator.has_size_class_cache);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn class_neighbors_merge_into_general_ranges_on_release() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let a = local_allocate(&state, &mut allocator, 16);
+        let b = local_allocate(&state, &mut allocator, 16);
+        let c = local_allocate(&state, &mut allocator, 16);
+        let d = local_allocate(&state, &mut allocator, 16);
+        let e = local_allocate(&state, &mut allocator, 16);
+
+        let mut release_separated = [d, b];
+        local_release(&state, &mut allocator, &mut release_separated);
+        assert_eq!(allocator.size_class_counts[0], 2);
+
+        let mut release_c = [c];
+        local_release(&state, &mut allocator, &mut release_c);
+        assert_eq!(allocator.size_class_counts[0], 0);
+        assert_eq!(allocator.free_head, b.start);
+        let merged = unsafe { read_free_node(&state, b.start).unwrap() };
+        assert_eq!(merged.len, b.len + c.len + d.len);
+        validate_allocator(&state, &allocator).unwrap();
+
+        let mut release_edges = [e, a];
+        local_release(&state, &mut allocator, &mut release_edges);
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+        assert_eq!(allocator.live_bytes, 0);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn resize_merge_exposes_cached_neighbor_to_ordered_free_list() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let a = local_allocate(&state, &mut allocator, 16);
+        let b = local_allocate(&state, &mut allocator, 16);
+        let c = local_allocate(&state, &mut allocator, 16);
+        let d = local_allocate(&state, &mut allocator, 16);
+        let e = local_allocate(&state, &mut allocator, 16);
+
+        let mut release_neighbor = [d, b];
+        local_release(&state, &mut allocator, &mut release_neighbor);
+        assert_eq!(allocator.size_class_counts[0], 2);
+        merge_free_ranges_locked(&state, &mut allocator).unwrap();
+        assert_eq!(allocator.size_class_counts, [0; SIZE_CLASSES.len()]);
+        assert_eq!(
+            free_node_at(&state, &allocator, b.start).unwrap(),
+            Some((b.len, d.start))
+        );
+
+        consume_free_prefix(&state, &mut allocator, b.start, b.len).unwrap();
+        allocator.live_bytes += b.len;
+        validate_allocator(&state, &allocator).unwrap();
+        let grown_a = ReleaseExtent {
+            start: a.start,
+            len: a.len + b.len,
+        };
+        let mut release_all = [c, grown_a, e];
+        local_release(&state, &mut allocator, &mut release_all);
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn overlapping_batch_is_rejected_before_allocator_mutation() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let a = local_allocate(&state, &mut allocator, 16);
+        let b = local_allocate(&state, &mut allocator, 16);
+        let original_live_bytes = allocator.live_bytes;
+        let mut duplicate_release = [a, a];
+        assert!(release_many_locked(&state, &mut allocator, &mut duplicate_release, true).is_err());
+        assert_eq!(allocator.live_bytes, original_live_bytes);
+        assert_eq!(allocator.free_head, 0);
+        assert_eq!(allocator.size_class_counts, [0; SIZE_CLASSES.len()]);
+        validate_allocator(&state, &allocator).unwrap();
+        let mut release_all = [b, a];
+        local_release(&state, &mut allocator, &mut release_all);
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+    }
+
+    #[test]
+    fn deterministic_allocator_churn_matches_live_extent_model() {
+        let state = local_state(64 * 1024);
+        let mut allocator = lock(&state).unwrap();
+        let mut live = Vec::<ReleaseExtent>::new();
+        let mut random = 0x9e37_79b9_u32;
+        let sizes = [1_usize, 8, 16, 24, 32, 80, 240, 512];
+
+        for _ in 0..1_200 {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if live.is_empty() || (live.len() < RELEASE_BATCH_CAPACITY && random % 100 < 61) {
+                let bytes = sizes[(random as usize >> 8) % sizes.len()];
+                match allocate_block(&state, &mut allocator, bytes, 8) {
+                    Ok((data, prefix, len)) => {
+                        assert_eq!((state.base() as usize + data as usize) % 8, 0);
+                        live.push(ReleaseExtent {
+                            start: data - size_of::<AllocationHeader>() as u32 - prefix,
+                            len,
+                        });
+                    }
+                    Err(Error::AllocationExhausted) => {
+                        let mut release_all = core::mem::take(&mut live);
+                        local_release(&state, &mut allocator, &mut release_all);
+                    }
+                    Err(error) => panic!("unexpected local allocation error: {error:?}"),
+                }
+            } else {
+                let count = 1 + ((random as usize >> 16) % live.len().min(8));
+                let mut batch = Vec::with_capacity(count);
+                for _ in 0..count {
+                    random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let index = random as usize % live.len();
+                    batch.push(live.swap_remove(index));
+                }
+                local_release(&state, &mut allocator, &mut batch);
+            }
+
+            let live_bytes = live.iter().map(|extent| extent.len).sum::<u32>();
+            assert_eq!(allocator.live_bytes, live_bytes);
+            let mut ordered = live.clone();
+            ordered.sort_unstable_by_key(|extent| extent.start);
+            for adjacent in ordered.windows(2) {
+                assert!(adjacent[0].start + adjacent[0].len <= adjacent[1].start);
+            }
+            validate_allocator(&state, &allocator).unwrap();
+        }
+
+        let mut release_all = core::mem::take(&mut live);
+        local_release(&state, &mut allocator, &mut release_all);
+        assert_eq!(allocator.live_bytes, 0);
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+        validate_allocator(&state, &allocator).unwrap();
     }
 }

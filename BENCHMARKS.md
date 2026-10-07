@@ -273,10 +273,11 @@ separate doc-hidden allocator snapshot adds no retained owner or header fields
 and does not change allocation policy.
 
 **V2.4 is frozen after this benchmark and validation pass.** Further memory
-model, pointer model, owner/header, or allocator redesign belongs in V3.
-Correctness fixes, documentation corrections, test improvements, and benchmark
-maintenance remain allowed. The later optimization pass recorded below was
-authorized within that frozen contract and does not change retained layouts.
+model, pointer model, owner/header, or allocator changes that alter the retained
+contract belong in V3. Correctness fixes, documentation corrections, test
+improvements, benchmark maintenance, and bounded global allocator-policy
+optimizations that preserve retained layouts remain allowed. The later passes
+recorded below preserve that contract.
 
 # V2.4 optimized hot-path results
 
@@ -411,3 +412,76 @@ Miri passed `compact_core`, `compact_backend_std` unit and integration tests,
 `PROPTEST_CASES=8` with Miri isolation disabled because `proptest` accesses the
 working directory; all 15 tests passed. Release assembly was inspected for the
 AArch64 NEON classifier, the A4 deque scan, and the B9 frozen view traversal.
+
+## V2.4 allocator and teardown results
+
+The allocator pass was measured against the verified pre-pass revision
+`1743dfead3e4db1ba82fb374d224644072f7e061`. Both worktrees used the same host
+and toolchain listed above. The full `benchmark_compare` release suite ran
+twice at the pinned baseline and twice again after the final allocator changes,
+using features `json,toml` and no telemetry in the timed runs. All native and
+compact checksums matched in all 16 scenarios on every run.
+
+Commands in the baseline and implementation worktrees:
+
+```sh
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/compact-v24-base-1743-run1.tsv
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/compact-v24-base-1743-run2.tsv
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/compact-v24-final-run1.tsv
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/compact-v24-final-run2.tsv
+```
+
+The table shows final implementation medians and p95s from run 1; the ratio is
+compact/native for runs 1 and 2. Memory ratio is retained compact cage plus
+auxiliary bytes divided by native retained live bytes.
+
+| ID | Workload | Native median / p95 (ms) | Allocator V2.4 median / p95 (ms) | Time ratio, run 1 / run 2 | Retained memory ratio |
+|---|---|---:|---:|---:|---:|
+| A1 | vector build/traverse/churn | 0.067 / 0.173 | 0.072 / 0.114 | 1.07x / 1.07x | 1.000x |
+| A2 | box and object allocation | 1.747 / 2.237 | 2.551 / 2.626 | 1.46x / 1.45x | 1.500x |
+| A3 | string and byte lengths | 4.260 / 5.127 | 0.636 / 0.941 | 0.15x / 0.15x | 1.001x |
+| A4 | FIFO deque churn | 0.354 / 0.370 | 2.674 / 2.791 | 7.56x / 7.46x | 1.000x |
+| A5 | hash map and set churn | 1.163 / 2.126 | 5.632 / 5.841 | 4.84x / 4.79x | 1.000x |
+| A6 | path build and query | 1.153 / 1.171 | 1.463 / 1.614 | 1.27x / 1.27x | 1.233x |
+| B1 | 10k record JSON API response | 13.754 / 14.367 | 18.385 / 20.522 | 1.34x / 1.34x | 0.618x |
+| B2 | large TOML service configuration | 0.971 / 0.990 | 1.272 / 1.468 | 1.31x / 1.26x | 0.802x |
+| B3 | 24k request metadata batch | 33.375 / 36.203 | 22.940 / 23.772 | 0.69x / 0.70x | 0.911x |
+| B4 | bounded logging history churn | 6.477 / 6.887 | 8.408 / 8.572 | 1.30x / 1.28x | 0.860x |
+| B5 | mobility dispatch state | 8.812 / 10.005 | 7.268 / 7.543 | 0.82x / 0.81x | 0.710x |
+| B6 | market data order book | 0.038 / 0.045 | 0.593 / 0.719 | 15.47x / 15.81x | 1.000x |
+| B7 | 100k filesystem catalog | 19.989 / 21.692 | 16.691 / 17.030 | 0.84x / 0.83x | 1.050x |
+| B8 | fixed population cache churn | 11.821 / 12.604 | 36.547 / 37.204 | 3.09x / 3.04x | 1.026x |
+| B9 | immutable/frozen catalog | 10.895 / 12.267 | 4.420 / 5.581 | 0.41x / 0.42x | 0.739x |
+| B10 | concurrent worker state | 1.262 / 1.296 | 2.931 / 3.631 | 2.32x / 2.29x | 1.000x |
+
+The pinned-baseline and final medians for the priority teardown and concurrency
+scenarios were:
+
+| Scenario phase | `1743dfe` run 1 / 2 (ms) | Allocator run 1 / 2 (ms) | Old / new |
+|---|---:|---:|---:|
+| B3 drop | 6.990 / 7.014 | 6.356 / 6.753 | 1.10x / 1.04x |
+| B3 end-to-end | 22.780 / 22.655 | 22.940 / 23.353 | 0.99x / 0.97x |
+| B5 drop | 0.197 / 0.196 | 0.125 / 0.125 | 1.57x / 1.57x |
+| B5 end-to-end | 7.332 / 7.283 | 7.268 / 7.206 | 1.01x / 1.01x |
+| B8 drop | 49.732 / 50.123 | 3.133 / 3.141 | 15.88x / 15.96x |
+| B8 end-to-end | 82.439 / 83.110 | 36.547 / 37.007 | 2.26x / 2.25x |
+| B10 end-to-end | 2.980 / 3.188 | 2.931 / 2.853 | 1.02x / 1.12x |
+
+B5 retained memory stayed at 0.710x native and B8 at 1.026x, unchanged from the
+pinned baseline. B3 teardown improved by 4–10%; end-to-end time was 1–3% slower
+than baseline. B10's raw end-to-end medians stayed within the pinned baseline
+range; its concurrent phase has substantial host scheduling variance.
+
+With `allocator-telemetry` enabled, B8's drop phase reduced mutex acquisitions
+from 6,556 to 103 and ordered free-list visits from 3,579,404 to 319,406. The
+new run processed 6,556 extents in 103 batches, with a maximum batch of 64.
+Instrumentation was excluded from timing. The measured exact classes are 32,
+40, 112, and 528 bytes, with 32 cached blocks per class. In the instrumented B8
+process, allocation recorded 8 class hits and 486,599 misses; its teardown gain
+therefore comes primarily from batched release and coalescing rather than
+class reuse. The caches remain global, bounded metadata and are drained before
+merging or resizing.
+
+Exact retained sizes remain unchanged: the allocation owner and vector are
+4 B, the common header is 16 B, and frozen descriptors are 8 B. This pass adds
+no architecture-specific intrinsics or inline assembly.

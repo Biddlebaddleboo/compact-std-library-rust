@@ -493,6 +493,42 @@ fn panic_during_a_value_destructor_still_releases_every_initialized_value() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(values)));
     assert!(result.is_err());
     assert_eq!(DROPS.load(Ordering::SeqCst), 5);
+    CompactRuntime::validate_allocator_state().unwrap();
+}
+
+#[test]
+fn map_drop_batches_nested_releases_and_finishes_after_one_value_panics() {
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct PanicDrop {
+        bytes: CompactBytes,
+        panic: bool,
+    }
+    unsafe impl CompactValue for PanicDrop {}
+    impl Drop for PanicDrop {
+        fn drop(&mut self) {
+            let _ = self.bytes.len();
+            DROPS.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic, "requested map value destructor panic");
+        }
+    }
+
+    init();
+    DROPS.store(0, Ordering::SeqCst);
+    let mut map = CompactHashMap::with_capacity(8).unwrap();
+    for index in 0..5 {
+        map.insert(
+            index,
+            PanicDrop {
+                bytes: CompactBytes::from_slice(&[index as u8; 64]).unwrap(),
+                panic: index == 2,
+            },
+        )
+        .unwrap();
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(map)));
+    assert!(result.is_err());
+    assert_eq!(DROPS.load(Ordering::SeqCst), 5);
+    CompactRuntime::validate_allocator_state().unwrap();
 }
 
 #[test]

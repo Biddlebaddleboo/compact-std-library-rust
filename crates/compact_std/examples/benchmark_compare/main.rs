@@ -140,7 +140,40 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
     } else if variant != "native" {
         return Err(format!("unknown benchmark variant {variant:?}").into());
     }
-    scenarios::run(scenario, variant, repetitions)
+    scenarios::run(scenario, variant, repetitions)?;
+    #[cfg(feature = "allocator-telemetry")]
+    if variant == "compact" {
+        let stats = compact_std::CompactRuntime::allocator_stats()?;
+        println!(
+            "META\tallocator_summary\t{scenario}\t{variant}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            stats.lock_acquisitions,
+            stats.free_list_nodes_visited,
+            stats.release_batches,
+            stats.released_extents,
+            stats.max_release_batch,
+            stats.size_class_hits,
+            stats.size_class_misses,
+        );
+        for (class_size, (blocks, bytes)) in [32_u32, 40, 112, 528].into_iter().zip(
+            stats
+                .size_class_free_blocks
+                .into_iter()
+                .zip(stats.size_class_free_bytes),
+        ) {
+            println!("META\tclass_cache\t{scenario}\t{variant}\t{class_size}\t{blocks}\t{bytes}");
+        }
+        for (bucket, count) in stats.allocation_size_histogram.iter().copied().enumerate() {
+            if count != 0 {
+                let size = if bucket + 1 == stats.allocation_size_histogram.len() {
+                    "1024+".to_owned()
+                } else {
+                    (bucket * 8).to_string()
+                };
+                println!("META\tblock_size_bucket\t{scenario}\t{variant}\t{size}\t{count}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_positive(arguments: &[String], index: usize, option: &str) -> BenchResult<usize> {
@@ -261,7 +294,7 @@ fn write_tsv(path: &str, rows: &[PhaseRow], metadata: &[String]) -> BenchResult<
     let mut file = fs::File::create(path)?;
     writeln!(
         file,
-        "scenario\tvariant\tphase\truns\tmedian_ns\tp95_ns\tmin_ns\tmax_ns\tallocation_calls\tdeallocation_calls\trequested_bytes\tlive_delta_bytes\tpeak_extra_bytes\tcage_live_delta_bytes\tcage_high_water_cursor\tfree_bytes\tfree_blocks\tlargest_free_block"
+        "scenario\tvariant\tphase\truns\tmedian_ns\tp95_ns\tmin_ns\tmax_ns\tallocation_calls\tdeallocation_calls\trequested_bytes\tlive_delta_bytes\tpeak_extra_bytes\tcage_live_delta_bytes\tcage_high_water_cursor\tfree_bytes\tfree_blocks\tlargest_free_block\tallocator_lock_acquisitions\tfree_list_nodes_visited\trelease_batches\treleased_extents\tmax_release_batch\tsize_class_hits\tsize_class_misses"
     )?;
     for row in rows {
         writeln!(

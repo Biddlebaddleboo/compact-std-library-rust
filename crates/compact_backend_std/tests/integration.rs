@@ -97,6 +97,21 @@ fn process_cage_owners_layout_drop_and_threaded_release() {
     assert_eq!(DROPS.load(std::sync::atomic::Ordering::SeqCst), 2);
     CompactRuntime::validate_allocator_state().unwrap();
 
+    thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                CompactRuntime::with_batched_releases(|| {
+                    let mut allocations = Vec::with_capacity(32);
+                    for value in 0..32_u32 {
+                        allocations.push(CompactRuntime::alloc_owned_value(value).unwrap());
+                    }
+                    drop(allocations);
+                });
+            });
+        }
+    });
+    CompactRuntime::validate_allocator_state().unwrap();
+
     let first = CompactRuntime::alloc_owned_slice::<u64>(16).unwrap();
     let first_offset = first.offset().as_u32();
     drop(first);

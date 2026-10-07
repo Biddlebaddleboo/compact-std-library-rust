@@ -21,6 +21,7 @@ default = []
 serde = ["dep:compact_serde"]
 json = ["serde", "compact_serde/json"]
 toml = ["serde", "compact_serde/toml"]
+allocator-telemetry = ["compact_backend_std/allocator-telemetry"]
 
 [dev-dependencies]
 proptest = "=1.6.0"

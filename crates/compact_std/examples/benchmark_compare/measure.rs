@@ -88,6 +88,13 @@ struct PhaseSample {
     free_bytes: u32,
     free_blocks: u32,
     largest_free_block: u32,
+    allocator_lock_acquisitions: u64,
+    free_list_nodes_visited: u64,
+    release_batches: u64,
+    released_extents: u64,
+    max_release_batch: u32,
+    size_class_hits: u64,
+    size_class_misses: u64,
 }
 
 #[derive(Debug)]
@@ -108,6 +115,13 @@ struct PhaseAggregate {
     free_bytes: u32,
     free_blocks: u32,
     largest_free_block: u32,
+    allocator_lock_acquisitions: u64,
+    free_list_nodes_visited: u64,
+    release_batches: u64,
+    released_extents: u64,
+    max_release_batch: u32,
+    size_class_hits: u64,
+    size_class_misses: u64,
 }
 
 pub type Mutation<'a, T> = (
@@ -299,6 +313,35 @@ fn finish_phase(start: PhaseStart, compact: bool) -> BenchResult<PhaseSample> {
             ),
             _ => (0, 0, 0, 0, 0),
         };
+    let (
+        allocator_lock_acquisitions,
+        free_list_nodes_visited,
+        release_batches,
+        released_extents,
+        max_release_batch,
+        size_class_hits,
+        size_class_misses,
+    ) = match (start.cage_before, cage_after) {
+        (Some(before), Some(after)) => (
+            after
+                .lock_acquisitions
+                .saturating_sub(before.lock_acquisitions)
+                .saturating_sub(1),
+            after
+                .free_list_nodes_visited
+                .saturating_sub(before.free_list_nodes_visited),
+            after.release_batches.saturating_sub(before.release_batches),
+            after
+                .released_extents
+                .saturating_sub(before.released_extents),
+            after.max_release_batch,
+            after.size_class_hits.saturating_sub(before.size_class_hits),
+            after
+                .size_class_misses
+                .saturating_sub(before.size_class_misses),
+        ),
+        _ => (0, 0, 0, 0, 0, 0, 0),
+    };
     Ok(PhaseSample {
         elapsed_ns,
         allocation_calls: ALLOC_CALLS.load(Ordering::Relaxed),
@@ -311,6 +354,13 @@ fn finish_phase(start: PhaseStart, compact: bool) -> BenchResult<PhaseSample> {
         free_bytes,
         free_blocks,
         largest_free_block,
+        allocator_lock_acquisitions,
+        free_list_nodes_visited,
+        release_batches,
+        released_extents,
+        max_release_batch,
+        size_class_hits,
+        size_class_misses,
     })
 }
 
@@ -348,6 +398,23 @@ fn aggregate(name: &'static str, samples: Vec<PhaseSample>) -> PhaseAggregate {
                 .iter()
                 .map(|sample| sample.largest_free_block as u64),
         ) as u32,
+        allocator_lock_acquisitions: median_u64(
+            samples
+                .iter()
+                .map(|sample| sample.allocator_lock_acquisitions),
+        ),
+        free_list_nodes_visited: median_u64(
+            samples.iter().map(|sample| sample.free_list_nodes_visited),
+        ),
+        release_batches: median_u64(samples.iter().map(|sample| sample.release_batches)),
+        released_extents: median_u64(samples.iter().map(|sample| sample.released_extents)),
+        max_release_batch: samples
+            .iter()
+            .map(|sample| sample.max_release_batch)
+            .max()
+            .unwrap_or(0),
+        size_class_hits: median_u64(samples.iter().map(|sample| sample.size_class_hits)),
+        size_class_misses: median_u64(samples.iter().map(|sample| sample.size_class_misses)),
     }
 }
 
@@ -384,7 +451,7 @@ fn median_i64(values: impl Iterator<Item = i64>) -> i64 {
 
 fn emit_phase(scenario: &str, variant: &str, summary: PhaseAggregate) {
     println!(
-        "PHASE\t{scenario}\t{variant}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "PHASE\t{scenario}\t{variant}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         summary.name,
         summary.runs,
         summary.median_ns,
@@ -401,6 +468,13 @@ fn emit_phase(scenario: &str, variant: &str, summary: PhaseAggregate) {
         summary.free_bytes,
         summary.free_blocks,
         summary.largest_free_block,
+        summary.allocator_lock_acquisitions,
+        summary.free_list_nodes_visited,
+        summary.release_batches,
+        summary.released_extents,
+        summary.max_release_batch,
+        summary.size_class_hits,
+        summary.size_class_misses,
     );
 }
 

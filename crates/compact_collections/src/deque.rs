@@ -7,6 +7,33 @@ use core::slice;
 
 use crate::{CollectionError, Result};
 
+/// Move one initialized logical ring range into contiguous uninitialized slots.
+///
+/// # Safety
+///
+/// `source` must contain `len` initialized `T` values in the ring range
+/// `head..head + len`, `destination` must have room for `len` values and not
+/// overlap the source, and the caller must clear the source's logical
+/// initialized state after this move.
+unsafe fn move_ring<T>(
+    source: *const MaybeUninit<T>,
+    destination: *mut MaybeUninit<T>,
+    head: usize,
+    len: usize,
+    capacity: usize,
+) {
+    debug_assert!(head < capacity);
+    let first_len = len.min(capacity - head);
+    // SAFETY: the caller guarantees the first physical span is initialized,
+    // destination is uninitialized, and the cage allocations do not overlap.
+    unsafe {
+        destination.copy_from_nonoverlapping(source.add(head), first_len);
+        destination
+            .add(first_len)
+            .copy_from_nonoverlapping(source, len - first_len);
+    }
+}
+
 /// A compact double-ended queue with one owner, head, and length.
 pub struct CompactVecDeque<T: CompactValue> {
     storage: Option<CageAllocation<MaybeUninit<T>>>,
@@ -294,12 +321,11 @@ impl<T: CompactValue> CompactVecDeque<T> {
                 .expect("nonempty deque has storage")
                 .uninit_capacity_mut();
             let old_capacity = old_slots.len();
-            for (index, slot) in slots.iter_mut().take(old_len).enumerate() {
-                let physical = Self::physical_index(head, index, old_capacity);
-                // SAFETY: these logical slots are initialized and each is moved once.
-                let value = unsafe { old_slots[physical].assume_init_read().assume_init_read() };
-                slot.write(MaybeUninit::new(value));
-            }
+            let source = old_slots.as_ptr().cast::<MaybeUninit<T>>();
+            let destination = slots.as_mut_ptr().cast::<MaybeUninit<T>>();
+            // SAFETY: the old ring range is initialized and the replacement
+            // allocation is distinct, empty, and large enough for old_len.
+            unsafe { move_ring(source, destination, head, old_len, old_capacity) };
         }
         self.len = 0;
         self.storage = Some(replacement);
@@ -309,9 +335,18 @@ impl<T: CompactValue> CompactVecDeque<T> {
     }
     /// Drop values after the requested logical length.
     pub fn truncate(&mut self, len: usize) {
-        while self.len() > len {
-            drop(self.pop_back());
+        if !core::mem::needs_drop::<T>() {
+            self.len = self.len.min(len.min(u32::MAX as usize) as u32);
+            if self.len == 0 {
+                self.head = 0;
+            }
+            return;
         }
+        CompactRuntime::with_batched_releases(|| {
+            while self.len() > len {
+                drop(self.pop_back());
+            }
+        });
     }
     /// Drop all values while retaining capacity.
     pub fn clear(&mut self) {
@@ -346,14 +381,15 @@ impl<T: CompactValue> CompactVecDeque<T> {
             .expect("nonempty deque has storage")
             .uninit_capacity_mut();
         let old_capacity = old_slots.len();
-        for (index, slot) in slots.iter_mut().take(len).enumerate() {
-            let physical = Self::physical_index(start, index, old_capacity);
-            // SAFETY: these logical slots are initialized and each is moved once.
-            let value = unsafe { old_slots[physical].assume_init_read().assume_init_read() };
-            slot.write(MaybeUninit::new(value));
-        }
+        let source = old_slots.as_ptr().cast::<MaybeUninit<T>>();
+        let destination = slots.as_mut_ptr().cast::<MaybeUninit<T>>();
+        // SAFETY: the old wrapped range is initialized and the replacement
+        // allocation is distinct, empty, and has exactly enough slots.
+        unsafe { move_ring(source, destination, start, len, old_capacity) };
+        self.len = 0;
         self.storage = Some(replacement);
         self.head = 0;
+        self.len = len as u32;
         let outer = self.storage.as_mut().unwrap().uninit_capacity_mut();
         let ptr = outer.as_mut_ptr().cast::<MaybeUninit<T>>().cast::<T>();
         // SAFETY: values were moved into the first `len` contiguous slots.
@@ -378,19 +414,31 @@ impl<T: CompactValue> Drop for DequeDropGuard<T> {
             while let Some(value) = deque.pop_front() {
                 drop(value);
             }
+            // Take the backing allocation inside the active batch, including
+            // when a value destructor initiated unwinding.
+            drop(deque.storage.take());
         }
     }
 }
 impl<T: CompactValue> Drop for CompactVecDeque<T> {
     fn drop(&mut self) {
-        let mut guard = DequeDropGuard {
-            deque: self,
-            armed: true,
-        };
-        while let Some(value) = self.pop_front() {
-            drop(value);
-        }
-        guard.armed = false;
+        CompactRuntime::with_batched_releases(|| {
+            if !core::mem::needs_drop::<T>() {
+                self.len = 0;
+                self.head = 0;
+                drop(self.storage.take());
+                return;
+            }
+            let mut guard = DequeDropGuard {
+                deque: self,
+                armed: true,
+            };
+            while let Some(value) = self.pop_front() {
+                drop(value);
+            }
+            guard.armed = false;
+            drop(self.storage.take());
+        });
     }
 }
 // SAFETY: the wrapper owns only cage offsets and Rust scalar metadata.

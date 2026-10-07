@@ -2,10 +2,12 @@
 
 ## Freeze status
 
-The architecture is frozen after the native comparison and validation pass
-documented in [BENCHMARKS.md](BENCHMARKS.md). Substantial representation,
-pointer, owner/header, or allocator changes are scoped to V3. Correctness fixes
-and documentation maintenance remain allowed.
+The retained architecture is frozen after the native comparison and
+validation pass documented in [BENCHMARKS.md](BENCHMARKS.md). Changes to the
+pointer model, retained owners/headers, or process-wide cage contract are
+scoped to V3. Bounded global allocator metadata and allocator-policy
+optimizations remain within V2.4 when they preserve those retained layouts and
+ownership rules.
 
 V2.4 keeps a normal 64-bit Rust process and one stable process-wide cage.
 Native references, `usize`, libc, syscalls, and third-party dependencies keep
@@ -20,12 +22,23 @@ reset or public teardown. Runtime state retains one native base pointer, its
 configured capacity, and one mutex protecting allocator scalars. Reading live
 values does not acquire that mutex.
 
-The allocator contains a `u32` high-water cursor, `u32` live-byte count, and a
-`u32` free-list head. Free blocks hold an eight-byte `{ next, len }` node at
-their start. The list is sorted by offset. Allocation is deterministic
-first-fit; a range is split when its remainder can hold a node. Release merges
-neighboring blocks and contracts the high-water tail. There is no native map,
-set, or heap allocation for allocator bookkeeping.
+The allocator contains a `u32` high-water cursor, `u32` live-byte count, an
+ordered general free-list head, and four bounded exact-size class heads for
+32, 40, 112, and 528-byte blocks. Every class can hold at most 32 blocks.
+Free blocks hold an eight-byte `{ next, len }` node at their start. The general
+list is sorted by offset and remains the first-fit fallback. A class owns its
+blocks exclusively; a batch release or resize drains the classes before
+coalescing adjacent ranges, then may cache exact-size results again. The tail
+contracts once after a batch. There is no native map, set, or heap allocation
+for allocator bookkeeping.
+
+`CompactRuntime::with_batched_releases` collects up to 64 temporary extents on
+the stack and releases each chunk under one `AllocatorTransaction`. Nested
+teardown joins the same thread-local collector. Contiguous tail chunks contract
+directly; other chunks are sorted, checked against current free ranges, and
+coalesced before allocator state changes. The optional `allocator-telemetry`
+feature adds counters to global runtime state and benchmark output only; it
+does not change retained owner or header layouts.
 
 The common live header is four `u32` fields and is exactly 16 bytes:
 
@@ -54,8 +67,8 @@ after:     no pointer retained by cage-aware state
 `CageAllocation<T>` stores one nonzero offset and a zero-sized type marker. It
 is non-copyable, so Rust move semantics transfer its unique ownership. Its
 capacity and initialized length live in the allocation header. `Drop` lowers
-the initialized count before each destructor call and then returns the block to
-the intrusive free list.
+the initialized count before each destructor call, then returns the block
+through the active release batch or the allocator's free structures.
 
 Safe owner methods tie returned references to the owner borrow. The public
 unchecked offset resolvers are unsafe and require the caller to prove liveness,

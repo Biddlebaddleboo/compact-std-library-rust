@@ -313,26 +313,40 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     }
     /// Drop every pair while retaining table capacity.
     pub fn clear(&mut self) {
-        let Some(control) = &mut self.control else {
-            return;
-        };
-        let controls = control.as_mut_slice();
-        let entries = self
-            .entries
-            .as_mut()
-            .expect("allocated control has entries")
-            .as_mut_slice();
-        for index in 0..controls.len() {
-            if controls[index] == FULL {
-                controls[index] = EMPTY;
-                self.len -= 1;
-                // SAFETY: the control byte marks one initialized pair.
-                let pair = unsafe { entries[index].assume_init_read() };
-                drop(pair);
+        CompactRuntime::with_batched_releases(|| {
+            let Some(control) = &mut self.control else {
+                return;
+            };
+            let controls = control.as_mut_slice();
+            let entries = self
+                .entries
+                .as_mut()
+                .expect("allocated control has entries")
+                .as_mut_slice();
+            if !core::mem::needs_drop::<(K, V)>() {
+                for control in controls {
+                    if *control == FULL {
+                        *control = EMPTY;
+                    }
+                }
+                self.len = 0;
+                self.tombstones = 0;
+                return;
             }
-        }
-        self.len = 0;
-        self.tombstones = 0;
+            for index in 0..controls.len() {
+                if controls[index] == FULL {
+                    controls[index] = EMPTY;
+                    self.len -= 1;
+                    // SAFETY: the control byte marks one initialized pair and
+                    // is cleared before either destructor can unwind.
+                    let pair = unsafe { entries[index].assume_init_read() };
+                    drop(pair);
+                }
+            }
+            debug_assert_eq!(self.len, 0);
+            self.len = 0;
+            self.tombstones = 0;
+        });
     }
     /// Ensure room for at least `additional` more entries.
     pub fn reserve(&mut self, additional: usize) -> Result<()> {
@@ -357,8 +371,10 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     /// Release unused slots.
     pub fn shrink_to_fit(&mut self) -> Result<()> {
         if self.len == 0 {
-            self.control = None;
-            self.entries = None;
+            CompactRuntime::with_batched_releases(|| {
+                drop(self.entries.take());
+                drop(self.control.take());
+            });
             self.tombstones = 0;
             return Ok(());
         }
@@ -590,8 +606,10 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
                 new_entries_slice[target].write(pair);
             }
         }
-        self.control = Some(new_control);
-        self.entries = Some(new_entries);
+        CompactRuntime::with_batched_releases(|| {
+            drop(self.control.replace(new_control));
+            drop(self.entries.replace(new_entries));
+        });
         self.tombstones = 0;
         Ok(())
     }
@@ -638,18 +656,26 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
                 }
             }
         }
+        map.len = 0;
+        map.tombstones = 0;
+        drop(map.entries.take());
+        drop(map.control.take());
     }
 }
 impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue> Drop
     for CompactHashMap<K, V, S>
 {
     fn drop(&mut self) {
-        let mut guard = MapDropGuard {
-            map: self,
-            armed: true,
-        };
-        self.clear();
-        guard.armed = false;
+        CompactRuntime::with_batched_releases(|| {
+            let mut guard = MapDropGuard {
+                map: self,
+                armed: true,
+            };
+            self.clear();
+            guard.armed = false;
+            drop(self.entries.take());
+            drop(self.control.take());
+        });
     }
 }
 // SAFETY: keys and values obey CompactValue and the hasher is required to be a compact value.

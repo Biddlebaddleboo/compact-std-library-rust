@@ -34,12 +34,27 @@ borrow or inside an allocator critical section. Unique owners govern data
 mutation, and `CageAllocation<T>` inherits thread-safety bounds from `T`
 through `PhantomData`.
 
-Allocator scalars and the intrusive free-list head are protected by one mutex.
-No user code or destructor runs under that lock. Free blocks contain initialized
-`u32` links and lengths, are sorted by offset, do not overlap, and are coalesced
-on release. Live and free extents account for the entire high-water prefix.
-There is no native allocation registry. Safe owners are valid because their
-offsets are private, issued by allocation, and transferred by Rust moves.
+Allocator scalars and free-range links are protected by one mutex. No user
+code or destructor runs under that lock. Free blocks contain initialized
+`u32` links and lengths. General-list ranges are sorted by offset; exact-size
+class ranges are exclusively owned by their class, with no overlap between
+classes or the general list. Each class holds at most 32 ranges. Batch release
+and resize drain the classes before checking and coalescing adjacent ranges.
+The complete incoming batch is validated for bounds, overlap, and accounting
+before allocator state is committed. Live and free extents account for the
+entire high-water prefix. There is no native allocation registry. Safe owners
+are valid because their offsets are private, issued by allocation, and
+transferred by Rust moves.
+
+The release collector is a stack-local array of at most 64 extent descriptors.
+A thread-local cell points to it only for the outermost batched operation on
+that thread; nested teardown reuses the active collector. The scope guard
+restores the thread-local cell before its stack storage leaves scope and flushes
+pending descriptors during both normal return and unwind. Destructors execute
+before each allocator transaction begins. A contiguous tail batch is validated
+and contracted directly; other batches are sorted and fully checked before
+free-list or class-bin links change. If a batch fails validation while cleanup
+is unwinding, each remaining descriptor is attempted individually.
 
 The live header is exactly four `u32` fields: block length, alignment prefix,
 capacity, and initialized count. Its start is derived from the owner offset and
@@ -70,12 +85,16 @@ Relocation allocates the destination first. Once moving starts, raw reads and
 writes do not invoke user code. The source count is cleared before transfer and
 the destination count is published after all values are written. Collections
 that store `MaybeUninit<T>` maintain their own logical initialized-slot state
-and clear that state before moving or dropping an element.
+and clear that state before moving or dropping an element. A deque ring move
+copies at most two disjoint initialized spans into the new allocation, then
+clears the source length before replacing its storage; this is a move under the
+`CompactValue` relocation contract and does not require `T: Copy`.
 
 `CompactVecDeque`, `CompactSmallVec`, and hash collections use drop guards so
 one panicking destructor does not cause a later element to be dropped twice.
-The guards hold temporary raw pointers tied to an exclusive borrow and never
-store pointers in compact state.
+Their child allocations join a thread-local release batch only after each
+destructor returns. The guards hold temporary raw pointers tied to an exclusive
+borrow and never store pointers in compact state.
 
 ## Scratch
 

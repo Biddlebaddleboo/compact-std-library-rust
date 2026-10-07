@@ -1581,6 +1581,13 @@ fn mutate_compact_cache(
     entries: &mut CompactHashMap<u64, CompactCacheEntry>,
     seeds: &[datasets::CacheSeed],
 ) -> BenchResult<()> {
+    CompactRuntime::with_batched_releases(|| mutate_compact_cache_batch(entries, seeds))
+}
+
+fn mutate_compact_cache_batch(
+    entries: &mut CompactHashMap<u64, CompactCacheEntry>,
+    seeds: &[datasets::CacheSeed],
+) -> BenchResult<()> {
     let batch = datasets::CACHE_POPULATION / 8;
     for cycle in 0..datasets::CACHE_CYCLES {
         for index in 0..batch {
