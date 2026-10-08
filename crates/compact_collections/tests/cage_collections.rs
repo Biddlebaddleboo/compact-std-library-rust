@@ -463,10 +463,15 @@ fn randomized_hash_collections_paths_slab_and_interner_work() {
         assert!(set.insert(value).unwrap());
     }
     assert_eq!(map.get(&319), Some(&957));
+    // Exercise the single-resolution mutable and entry-removal paths that the
+    // hash-map optimization rewrites so the Miri integration run covers them.
+    *map.get_mut(&318).expect("value present") += 1;
+    assert_eq!(map.get(&318), Some(&955));
     assert!(set.contains(&319));
-    assert_eq!(map.remove(&319), Some(957));
+    assert_eq!(map.remove_entry(&319), Some((319, 957)));
+    assert_eq!(map.remove(&317), Some(951));
     assert!(set.remove(&319));
-    assert_eq!(map.len(), 499);
+    assert_eq!(map.len(), 498);
 
     let mut path = CompactPathBuf::from("var/log").unwrap();
     path.push("service.log").unwrap();
