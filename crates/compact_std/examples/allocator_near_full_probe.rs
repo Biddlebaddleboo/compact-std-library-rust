@@ -63,9 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let recovered = CompactRuntime::alloc_owned_slice::<u8>(RECOVERY_BYTES)?;
     let recovery_live = expected_block_bytes(RECOVERY_BYTES);
     check_live("recovered_allocation", recovery_live)?;
-    println!(
-        "RECOVERY\tpayload_bytes={RECOVERY_BYTES}\tlive_bytes={recovery_live}"
-    );
+    println!("RECOVERY\tpayload_bytes={RECOVERY_BYTES}\tlive_bytes={recovery_live}");
 
     drop(recovered);
     check_live("final", 0)?;

@@ -363,7 +363,7 @@ fn profile_fnv_map(compact: bool, variant: &str, runs: usize) -> ProfileResult<(
 
 static EQUALITY_CHECKS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Hash)]
+#[derive(Clone, Copy)]
 struct CountedKey(u32);
 
 // SAFETY: this diagnostic key contains only a scalar integer.
@@ -376,6 +376,12 @@ impl PartialEq for CountedKey {
     }
 }
 impl Eq for CountedKey {}
+
+impl Hash for CountedKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct ConstantBuildHasher;
