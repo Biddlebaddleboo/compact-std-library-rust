@@ -886,3 +886,33 @@ cost and would cease to be a like-for-like comparison.
 
 Accepted round-three changes: hash lookup probe, deque batch view, CI lockfile
 repair. The integrated round-three evidence is in `PROFILE_V2_4_ROUND3.md`.
+
+### Round-three integrated ratios (independent orchestration verification)
+
+Paired/interleaved capture on `984f162` (three `measure` plus three `profile`
+suites with `--order alternate`, clean telemetry-free release artifact, nine
+repetitions per phase; medians in ms, ratio = compact/native):
+
+| Scenario | measure native | measure compact | measure ratio | profile native | profile compact | production ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A2 allocation | 1.240 | 1.281 | 1.03x | 1.208 | 1.808 | 1.50x |
+| A4 deque | 0.354 | 1.281 | 3.62x | 0.354 | 1.288 | 3.64x |
+| A5 hash | 1.173 | 3.152 | 2.69x | 1.170 | 3.115 | 2.66x |
+| B6 order book | 0.039 | 0.089 | 2.29x | 0.038 | 0.089 | 2.33x |
+| B8 cache churn | 11.826 | 23.977 | 2.03x | 10.237 | 23.994 | 2.34x |
+| B10 concurrent | 1.259 | 2.795 | 2.22x | 0.424 | 2.795 | 6.59x |
+| B3 request batch (sentinel) | 33.521 | 17.474 | 0.52x | 26.225 | 17.474 | 0.67x |
+| B5 dispatch (sentinel) | 9.004 | 5.177 | 0.58x | 7.031 | 5.177 | 0.74x |
+
+Against the round-two production table, A5 improves 2.78x -> 2.66x, which
+matches the measured ~4% `lookup_scan` gain from the `find_index_in` probe. A4
+is unchanged (3.58x -> 3.64x, within noise) because the shared arm still
+measures per-operation deque operations rather than the opt-in batch view. B3
+and B5 remain compact wins; B10 stays the noisiest scenario on this two-vCPU
+host.
+
+Reproducibility note for development hosts: this workstation had a stale
+root-level `/.cargo/config.toml` carrying the v2.2.0 `[patch.crates-io]` that
+writes the phantom `[[patch.unused]]` blocks back into the tracked lock. It was
+disabled (backed up) so `cargo metadata --locked` and the exact harness workflow
+command resolve against the committed lock, matching CI.
