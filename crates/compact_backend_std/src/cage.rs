@@ -906,6 +906,7 @@ impl CompactRuntime {
     ///
     /// The offset must name a live initialized `T`, and an owner must keep
     /// that allocation alive and immutably borrowed for the returned lifetime.
+    #[inline]
     pub unsafe fn resolve_unchecked<'a, T: CompactValue>(offset: Offset32<T>) -> Result<&'a T> {
         if offset.is_null() {
             return Err(Error::InvalidOffset);
@@ -925,6 +926,7 @@ impl CompactRuntime {
     ///
     /// The range must be wholly inside a live byte allocation kept alive by
     /// an owner for the returned lifetime.
+    #[inline]
     pub unsafe fn resolve_bytes_unchecked<'a>(offset: u32, len: usize) -> Result<&'a [u8]> {
         let state = state()?;
         let header = unsafe { read_header(state, offset) }?;
@@ -1070,39 +1072,47 @@ impl<T: CompactValue> CageAllocation<T> {
     }
 
     /// Return the initialized element count.
+    #[inline]
     pub fn len(&self) -> usize {
         self.header().expect("live cage owner header").initialized as usize
     }
     /// Return the allocated element capacity.
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.header().expect("live cage owner header").capacity as usize
     }
     /// Return initialized length and capacity from one resolved header read.
     #[doc(hidden)]
+    #[inline]
     pub fn len_capacity(&self) -> (usize, usize) {
         let header = self.header().expect("live cage owner header");
         (header.initialized as usize, header.capacity as usize)
     }
     /// Return whether the allocation has no initialized elements.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     /// Return this allocation's typed offset.
+    #[inline]
     pub fn offset(&self) -> Offset32<T> {
         // SAFETY: this owner always contains the allocator-issued live offset.
         unsafe { Offset32::from_raw_unchecked(self.raw_offset()) }
     }
     /// Borrow the initialized prefix.
+    #[inline]
     pub fn as_slice(&self) -> &[T] {
         self.resolved().expect("live cage owner header").as_slice()
     }
     /// Mutably borrow the initialized prefix.
+    #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         self.resolved_mut()
             .expect("live cage owner header")
             .into_mut_slice()
     }
     /// Return an initialized element by index.
+    #[inline]
     pub fn get(&self, index: usize) -> Option<&T> {
         self.resolved()
             .expect("live cage owner header")
@@ -1110,6 +1120,7 @@ impl<T: CompactValue> CageAllocation<T> {
             .get(index)
     }
     /// Mutably borrow an initialized element by index.
+    #[inline]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.resolved_mut()
             .expect("live cage owner header")
@@ -1117,6 +1128,7 @@ impl<T: CompactValue> CageAllocation<T> {
             .get_mut(index)
     }
     /// Initialize the next element slot.
+    #[inline]
     pub fn push(&mut self, value: T) -> Result<()> {
         let mut resolved = self.resolved_mut()?;
         if resolved.header.initialized >= resolved.header.capacity {
@@ -1407,6 +1419,7 @@ impl<T: CompactValue> CageAllocation<T> {
         Ok(true)
     }
     /// Borrow the full capacity as potentially uninitialized slots.
+    #[inline]
     pub fn uninit_capacity(&self) -> &[MaybeUninit<T>] {
         let resolved = self.resolved().expect("live cage owner header");
         // SAFETY: MaybeUninit permits reading every slot state; the owner borrow
@@ -1419,6 +1432,7 @@ impl<T: CompactValue> CageAllocation<T> {
         }
     }
     /// Mutably borrow the full capacity as potentially uninitialized slots.
+    #[inline]
     pub fn uninit_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
         let resolved = self.resolved_mut().expect("live cage owner header");
         let ptr = resolved.ptr;
@@ -1426,9 +1440,11 @@ impl<T: CompactValue> CageAllocation<T> {
         // SAFETY: the unique owner is mutably borrowed and every capacity slot is writable.
         unsafe { slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<T>>(), capacity) }
     }
+    #[inline]
     fn raw_offset(&self) -> u32 {
         self.offset.0.get()
     }
+    #[inline]
     fn header(&self) -> Result<AllocationHeader> {
         // SAFETY: this non-copy owner represents an allocator-issued offset.
         let state = state()?;
@@ -1436,6 +1452,7 @@ impl<T: CompactValue> CageAllocation<T> {
         validate_typed_header::<T>(state, self.raw_offset(), header)?;
         Ok(header)
     }
+    #[inline]
     fn resolved(&self) -> Result<ResolvedAllocation<'_, T>> {
         let state = state()?;
         let offset = self.raw_offset();
@@ -1450,6 +1467,7 @@ impl<T: CompactValue> CageAllocation<T> {
             marker: PhantomData,
         })
     }
+    #[inline]
     fn resolved_mut(&mut self) -> Result<ResolvedAllocationMut<'_, T>> {
         let state = state()?;
         let offset = self.raw_offset();
@@ -1518,6 +1536,7 @@ impl<T: CompactValue> Drop for CageAllocation<T> {
 
 unsafe impl<T: CompactValue> CompactValue for CageAllocation<T> {}
 
+#[inline]
 fn state() -> Result<&'static CageState> {
     CAGE.get().ok_or(Error::RuntimeNotInitialized)
 }
@@ -1693,6 +1712,7 @@ fn block_layout_general(
 ///
 /// `offset` must be within the cage allocation. The caller must ensure the
 /// resulting pointer is used only while the owning cage allocation remains live.
+#[inline]
 unsafe fn ptr_from_offset<T>(state: &CageState, offset: u32) -> *mut T {
     // SAFETY: the caller proves the offset is within the cage allocation.
     unsafe { state.base().add(offset as usize).cast::<T>() }
@@ -1715,6 +1735,7 @@ unsafe fn slice_from_offset<'a>(state: &CageState, offset: u32, len: usize) -> &
 ///
 /// `offset` must be an allocator-issued, live owner offset or validated by the
 /// caller's unsafe contract.
+#[inline]
 unsafe fn header_ptr(state: &CageState, offset: u32) -> *mut AllocationHeader {
     let header_offset = offset
         .checked_sub(size_of::<AllocationHeader>() as u32)
@@ -1723,6 +1744,7 @@ unsafe fn header_ptr(state: &CageState, offset: u32) -> *mut AllocationHeader {
     unsafe { ptr_from_offset(state, header_offset) }
 }
 
+#[inline]
 unsafe fn read_header(state: &CageState, offset: u32) -> Result<AllocationHeader> {
     let header_offset = offset
         .checked_sub(size_of::<AllocationHeader>() as u32)
@@ -1752,6 +1774,7 @@ unsafe fn read_header(state: &CageState, offset: u32) -> Result<AllocationHeader
     Ok(header)
 }
 
+#[inline]
 fn validate_typed_header<T>(
     state: &CageState,
     offset: u32,
