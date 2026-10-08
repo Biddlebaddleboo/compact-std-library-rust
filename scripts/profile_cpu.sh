@@ -20,12 +20,14 @@ SCENARIOS=(A2 A4 A5 B6 B8 B3 B5 B10)
 
 usage() {
     cat <<'EOF'
-Usage: scripts/profile_cpu.sh {metadata|build|baseline|profile|reports}
+Usage: scripts/profile_cpu.sh {metadata|build|baseline|suite|profile|reports}
 
 Commands:
   metadata  Record host and toolchain details (read-only workload-wise).
   build     Build ordinary release and frame-pointer/debug-symbol binaries.
-  baseline  Run two suites with ordinary and frame-pointer release binaries.
+  baseline  Run the eight key scenarios twice with ordinary and frame-pointer
+            release binaries.
+  suite     Run the full 16-scenario ordinary-release suite twice.
   profile   Sample each native/compact child directly with perf.
   reports   Export inclusive/self perf reports from saved samples.
 
@@ -142,6 +144,16 @@ profile() {
     done
 }
 
+suite() {
+    test -x "$PLAIN_BIN" || { echo "missing $PLAIN_BIN; run build first" >&2; return 2; }
+    mkdir -p "$OUT"
+    for run in 1 2; do
+        "$PLAIN_BIN" --output "$OUT/suite-run${run}.tsv" \
+            > "$OUT/suite-run${run}.log" 2>&1
+    done
+    printf 'Wrote full suites to %s/suite-run{1,2}.tsv\n' "$OUT"
+}
+
 reports() {
     mkdir -p "$OUT/reports"
     for data in "$OUT"/perf-data/*.data; do
@@ -166,6 +178,7 @@ case "${1:-}" in
     metadata) metadata ;;
     build) build ;;
     baseline) baseline ;;
+    suite) suite ;;
     profile) profile ;;
     reports) reports ;;
     *) usage >&2; exit 2 ;;
