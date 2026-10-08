@@ -1,0 +1,21 @@
+name: Benchmark harness contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mode-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Measure/profile checksum parity
+        run: >
+          cargo run --locked --release -p compact_std --example benchmark_compare
+          --features json,toml -- --self-check

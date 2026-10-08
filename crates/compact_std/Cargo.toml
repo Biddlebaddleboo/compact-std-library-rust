@@ -38,5 +38,10 @@ path = "examples/benchmark_compare/main.rs"
 required-features = ["json", "toml"]
 
 [[example]]
+name = "benchmark_profile"
+path = "examples/benchmark_profile.rs"
+required-features = ["json", "toml"]
+
+[[example]]
 name = "workloads_bench"
 required-features = ["json", "toml"]

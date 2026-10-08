@@ -1834,14 +1834,20 @@ fn concurrent_workers(variant: &str, repetitions: usize) -> BenchResult<u64> {
         if compact {
             std::thread::scope(|scope| -> BenchResult<Vec<CompactVec<WorkerRecord>>> {
                 let mut handles = Vec::with_capacity(datasets::WORKERS);
-                for records in &seeds {
-                    handles.push(scope.spawn(
-                        move || -> compact_std::Result<CompactVec<WorkerRecord>> {
-                            let mut values = CompactVec::with_capacity(records.len())?;
-                            values.try_extend(records.iter().copied())?;
-                            Ok(values)
-                        },
-                    ));
+                for (worker, records) in seeds.iter().enumerate() {
+                    handles.push(
+                        std::thread::Builder::new()
+                            .name(format!("b10-compact-build-{worker}"))
+                            .spawn_scoped(
+                                scope,
+                                move || -> compact_std::Result<CompactVec<WorkerRecord>> {
+                                    let mut values = CompactVec::with_capacity(records.len())?;
+                                    values.try_extend(records.iter().copied())?;
+                                    Ok(values)
+                                },
+                            )
+                            .expect("spawn compact build worker"),
+                    );
                 }
                 handles
                     .into_iter()
@@ -1857,8 +1863,13 @@ fn concurrent_workers(variant: &str, repetitions: usize) -> BenchResult<u64> {
         } else {
             let workers = std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(datasets::WORKERS);
-                for records in &seeds {
-                    handles.push(scope.spawn(move || records.clone()));
+                for (worker, records) in seeds.iter().enumerate() {
+                    handles.push(
+                        std::thread::Builder::new()
+                            .name(format!("b10-native-build-{worker}"))
+                            .spawn_scoped(scope, move || records.clone())
+                            .expect("spawn native build worker"),
+                    );
                 }
                 handles
                     .into_iter()
@@ -1882,6 +1893,12 @@ fn concurrent_workers(variant: &str, repetitions: usize) -> BenchResult<u64> {
             WorkerState::Compact(workers) => Ok(compact_worker_parallel_read(workers)),
         }),
     );
+    println!(
+        "META\tworker_threads\tB10\t{variant}\tbuild={}\tchurn={}\ttraversal={}",
+        datasets::WORKERS,
+        datasets::WORKERS,
+        datasets::WORKERS
+    );
     measure::run_case(
         "B10",
         variant,
@@ -1897,25 +1914,30 @@ fn native_worker_churn(workers: &mut [Vec<WorkerRecord>]) -> u64 {
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers.len());
         for (worker, records) in workers.iter_mut().enumerate() {
-            handles.push(scope.spawn(move || {
-                let mut checksum = 0_u64;
-                for index in 0..4_000_u32 {
-                    let record = WorkerRecord {
-                        id: worker as u32 * 100_000 + index,
-                        value: u64::from(index) * 31,
-                        group: (index % 256) as u16,
-                        active: index % 5 != 0,
-                    };
-                    let boxed = Box::new(record);
-                    checksum = checksum.wrapping_add(u64::from(boxed.id) + boxed.value);
-                    black_box(boxed);
-                }
-                records
-                    .iter()
-                    .map(|record| u64::from(record.id) + record.value)
-                    .sum::<u64>()
-                    ^ checksum
-            }));
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("b10-native-churn-{worker}"))
+                    .spawn_scoped(scope, move || {
+                        let mut checksum = 0_u64;
+                        for index in 0..4_000_u32 {
+                            let record = WorkerRecord {
+                                id: worker as u32 * 100_000 + index,
+                                value: u64::from(index) * 31,
+                                group: (index % 256) as u16,
+                                active: index % 5 != 0,
+                            };
+                            let boxed = Box::new(record);
+                            checksum = checksum.wrapping_add(u64::from(boxed.id) + boxed.value);
+                            black_box(boxed);
+                        }
+                        records
+                            .iter()
+                            .map(|record| u64::from(record.id) + record.value)
+                            .sum::<u64>()
+                            ^ checksum
+                    })
+                    .expect("spawn native churn worker"),
+            );
         }
         handles
             .into_iter()
@@ -1928,25 +1950,30 @@ fn compact_worker_churn(workers: &mut [CompactVec<WorkerRecord>]) -> BenchResult
     std::thread::scope(|scope| -> compact_std::Result<u64> {
         let mut handles = Vec::with_capacity(workers.len());
         for (worker, records) in workers.iter_mut().enumerate() {
-            handles.push(scope.spawn(move || -> compact_std::Result<u64> {
-                let mut checksum = 0_u64;
-                for index in 0..4_000_u32 {
-                    let record = WorkerRecord {
-                        id: worker as u32 * 100_000 + index,
-                        value: u64::from(index) * 31,
-                        group: (index % 256) as u16,
-                        active: index % 5 != 0,
-                    };
-                    let boxed = CompactBox::new(record)?;
-                    checksum = checksum.wrapping_add(u64::from(boxed.id) + boxed.value);
-                    black_box(boxed);
-                }
-                Ok(records
-                    .iter()
-                    .map(|record| u64::from(record.id) + record.value)
-                    .sum::<u64>()
-                    ^ checksum)
-            }));
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("b10-compact-churn-{worker}"))
+                    .spawn_scoped(scope, move || -> compact_std::Result<u64> {
+                        let mut checksum = 0_u64;
+                        for index in 0..4_000_u32 {
+                            let record = WorkerRecord {
+                                id: worker as u32 * 100_000 + index,
+                                value: u64::from(index) * 31,
+                                group: (index % 256) as u16,
+                                active: index % 5 != 0,
+                            };
+                            let boxed = CompactBox::new(record)?;
+                            checksum = checksum.wrapping_add(u64::from(boxed.id) + boxed.value);
+                            black_box(boxed);
+                        }
+                        Ok(records
+                            .iter()
+                            .map(|record| u64::from(record.id) + record.value)
+                            .sum::<u64>()
+                            ^ checksum)
+                    })
+                    .expect("spawn compact churn worker"),
+            );
         }
         handles.into_iter().try_fold(0_u64, |sum, handle| {
             Ok(sum.wrapping_add(handle.join().expect("compact churn worker")?))
@@ -1958,14 +1985,21 @@ fn compact_worker_churn(workers: &mut [CompactVec<WorkerRecord>]) -> BenchResult
 fn native_worker_parallel_read(workers: &[Vec<WorkerRecord>]) -> u64 {
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers.len());
-        for records in workers {
-            handles.push(scope.spawn(move || {
-                records
-                    .iter()
-                    .filter(|record| record.active)
-                    .map(|record| u64::from(record.id) + record.value + u64::from(record.group))
-                    .sum::<u64>()
-            }));
+        for (worker, records) in workers.iter().enumerate() {
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("b10-native-read-{worker}"))
+                    .spawn_scoped(scope, move || {
+                        records
+                            .iter()
+                            .filter(|record| record.active)
+                            .map(|record| {
+                                u64::from(record.id) + record.value + u64::from(record.group)
+                            })
+                            .sum::<u64>()
+                    })
+                    .expect("spawn native read worker"),
+            );
         }
         handles
             .into_iter()
@@ -1977,14 +2011,21 @@ fn native_worker_parallel_read(workers: &[Vec<WorkerRecord>]) -> u64 {
 fn compact_worker_parallel_read(workers: &[CompactVec<WorkerRecord>]) -> u64 {
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers.len());
-        for records in workers {
-            handles.push(scope.spawn(move || {
-                records
-                    .iter()
-                    .filter(|record| record.active)
-                    .map(|record| u64::from(record.id) + record.value + u64::from(record.group))
-                    .sum::<u64>()
-            }));
+        for (worker, records) in workers.iter().enumerate() {
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("b10-compact-read-{worker}"))
+                    .spawn_scoped(scope, move || {
+                        records
+                            .iter()
+                            .filter(|record| record.active)
+                            .map(|record| {
+                                u64::from(record.id) + record.value + u64::from(record.group)
+                            })
+                            .sum::<u64>()
+                    })
+                    .expect("spawn compact read worker"),
+            );
         }
         handles
             .into_iter()

@@ -2,10 +2,75 @@ use compact_std::{AllocatorStats, CompactRuntime};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::error::Error;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 pub type BenchResult<T> = Result<T, Box<dyn Error>>;
+
+/// Version of the measurement-mode contract carried by every run.
+///
+/// Bump this whenever the meaning of a mode changes so saved artifacts can be
+/// distinguished without guessing.
+pub const MEASUREMENT_MODE_VERSION: u32 = 1;
+
+/// Explicit measurement modes for the shared benchmark harness.
+///
+/// `Measure` keeps full allocator accounting: per-allocation counters on the
+/// native side and per-phase allocator snapshots on the compact side, so phase
+/// timings and memory statistics stay comparable across runs.
+///
+/// `Profile` drops that accounting so a CPU profiler observes the workload
+/// instead of the instrumentation, and must therefore never be compared
+/// numerically against `Measure` output. Only the logical checksum, which is
+/// identical in both modes, is comparable across them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeasurementMode {
+    Measure,
+    Profile,
+}
+
+impl MeasurementMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            MeasurementMode::Measure => "measure",
+            MeasurementMode::Profile => "profile",
+        }
+    }
+
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "measure" => Some(MeasurementMode::Measure),
+            "profile" => Some(MeasurementMode::Profile),
+            _ => None,
+        }
+    }
+}
+
+static MEASUREMENT_MODE: AtomicU8 = AtomicU8::new(0);
+static EMIT_PHASES: AtomicBool = AtomicBool::new(true);
+
+pub fn set_measurement_mode(mode: MeasurementMode) {
+    MEASUREMENT_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+pub fn measurement_mode() -> MeasurementMode {
+    if MEASUREMENT_MODE.load(Ordering::Relaxed) == MeasurementMode::Profile as u8 {
+        MeasurementMode::Profile
+    } else {
+        MeasurementMode::Measure
+    }
+}
+
+/// Controls whether per-phase `PHASE` rows are printed.
+///
+/// Long sampling runs (see the `benchmark_profile` example) disable them so a
+/// child emits one summary line instead of one row per phase per repetition.
+/// Only `benchmark_profile` calls this, so the shared module is expected to
+/// report it as unused from `benchmark_compare`.
+#[allow(dead_code)]
+pub fn set_phase_output(enabled: bool) {
+    EMIT_PHASES.store(enabled, Ordering::Relaxed);
+}
 
 static TRACKING: AtomicBool = AtomicBool::new(false);
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -169,6 +234,9 @@ pub fn run_case<T>(
     mut mutations: Vec<Mutation<'_, T>>,
     mut reads: Vec<Read<'_, T>>,
 ) -> BenchResult<u64> {
+    let mode = measurement_mode();
+    // Reset per-allocation tracking for this child so a reused process cannot
+    // carry counters across scenarios.
     TRACKING.store(false, Ordering::Relaxed);
     let mut warm_state = build()?;
     let mut warm_checksum = 0_u64;
@@ -265,7 +333,7 @@ pub fn run_case<T>(
         } else {
             expected_checksum = Some(checksum);
         }
-        if LIVE_BYTES.load(Ordering::Relaxed) != 0 {
+        if mode == MeasurementMode::Measure && LIVE_BYTES.load(Ordering::Relaxed) != 0 {
             return Err(format!(
                 "{scenario}/{variant} left {} requested native bytes live after drop",
                 LIVE_BYTES.load(Ordering::Relaxed)
@@ -285,6 +353,22 @@ pub fn run_case<T>(
         CompactRuntime::validate_allocator_state()?;
     }
     let checksum = expected_checksum.unwrap_or(0);
+    println!(
+        "META\tmeasurement_mode\t{scenario}\t{variant}\t{}\t{MEASUREMENT_MODE_VERSION}\t{}",
+        mode.name(),
+        if mode == MeasurementMode::Measure {
+            "allocator_accounting=on"
+        } else {
+            "allocator_accounting=off"
+        }
+    );
+    if !EMIT_PHASES.load(Ordering::Relaxed) {
+        println!("META\tchecksum\t{scenario}\t{variant}\t{checksum}");
+        if let Some(rss) = peak_rss_kb() {
+            println!("META\tpeak_rss_kb\t{scenario}\t{variant}\t{rss}");
+        }
+        return Ok(checksum);
+    }
     for (name, phase_samples) in samples {
         emit_phase(scenario, variant, aggregate(name, phase_samples));
     }
@@ -303,6 +387,18 @@ pub fn mix(checksum: u64, value: u64) -> u64 {
 }
 
 fn begin_phase(compact: bool) -> BenchResult<PhaseStart> {
+    if measurement_mode() == MeasurementMode::Profile {
+        // Profiling runs deliberately skip allocator accounting: the
+        // per-allocation counters and the per-phase allocator snapshots are a
+        // large share of the sampled native cost, and the snapshots also
+        // contend on the cage lock, so they would distort exactly the
+        // attribution the profile is meant to establish.
+        return Ok(PhaseStart {
+            started: Instant::now(),
+            baseline_live: 0,
+            cage_before: None,
+        });
+    }
     TRACKING.store(false, Ordering::Relaxed);
     ALLOC_CALLS.store(0, Ordering::Relaxed);
     DEALLOC_CALLS.store(0, Ordering::Relaxed);
@@ -324,6 +420,12 @@ fn begin_phase(compact: bool) -> BenchResult<PhaseStart> {
 
 fn finish_phase(start: PhaseStart, compact: bool) -> BenchResult<PhaseSample> {
     let elapsed_ns = start.started.elapsed().as_nanos();
+    if measurement_mode() == MeasurementMode::Profile {
+        return Ok(PhaseSample {
+            elapsed_ns,
+            ..PhaseSample::default()
+        });
+    }
     TRACKING.store(false, Ordering::Relaxed);
     let current_live = LIVE_BYTES.load(Ordering::Relaxed);
     let peak_live = PEAK_LIVE_BYTES.load(Ordering::Relaxed);

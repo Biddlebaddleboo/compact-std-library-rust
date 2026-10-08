@@ -1,11 +1,48 @@
+//! Authoritative native-vs-compact benchmark harness.
+//!
+//! Each scenario runs in its own child process per variant, accumulates
+//! per-phase samples, cross-checks the logical checksum between variants and
+//! reports timings plus allocator statistics.
+//!
+//! # Measurement modes
+//!
+//! `--mode measure` (default) keeps full allocator accounting: per-allocation
+//! counting on the native side and per-phase allocator snapshots on the compact
+//! side. `--mode profile` drops that accounting so a CPU profiler observes the
+//! workload; its timings and memory columns must not be compared with
+//! measure-mode output. Every child states its mode in
+//! `META measurement_mode`, and `--self-check` asserts that both modes produce
+//! the same logical checksum for every scenario.
+//!
+//! # Relationship to `collection_profile`
+//!
+//! `crates/compact_std/examples/collection_profile.rs` is a diagnostic harness,
+//! not a timing authority. It shares the A4/A5 workload sizes (4,096-entry deque
+//! population, 80,000 deque operations, 16,000 hash entries, 4,000-key churn)
+//! and B6 shape (2,048 levels, 8 rounds x 192 updates), but differs in ways that
+//! make its absolute numbers non-comparable: it black-boxes every individual
+//! operation instead of per-phase results, it pre-reserves deque capacity so
+//! growth is excluded, it runs extra probe-count models and FNV/collision
+//! variants, it installs no counting global allocator, and it has no B8 or B10
+//! coverage. Treat its numbers as attribution evidence, never as
+//! compact/native ratios; only this harness produces the recorded ratios.
+//!
+//! # Variant order and repeatability
+//!
+//! `--order alternate` flips which variant runs first on every other scenario so
+//! host drift cannot systematically favour one side of a pair; the per-scenario
+//! order is recorded in `META scenario_variant_order`. Host, build, feature,
+//! load and toolchain facts are recorded in the suite metadata of every run.
+
 mod datasets;
 mod measure;
 mod models;
 mod scenarios;
 
-use measure::{BenchResult, CountingAllocator};
+use measure::{BenchResult, CountingAllocator, MeasurementMode, MEASUREMENT_MODE_VERSION};
 use std::fs;
 use std::io::Write as _;
+use std::path::Path;
 use std::process::Command;
 
 #[global_allocator]
@@ -33,6 +70,9 @@ fn main() -> BenchResult<()> {
     let mut runs_override = None;
     let mut output_path = None;
     let mut scenario_filters = Vec::new();
+    let mut measurement_mode = MeasurementMode::Measure;
+    let mut order = VariantOrder::Fixed;
+    let mut self_check = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -49,6 +89,25 @@ fn main() -> BenchResult<()> {
                         .clone(),
                 );
             }
+            "--mode" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or("--mode requires measure or profile")?;
+                measurement_mode = MeasurementMode::from_name(value).ok_or_else(|| {
+                    format!("unknown measurement mode {value:?}; expected measure or profile")
+                })?;
+            }
+            "--order" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or("--order requires fixed or alternate")?;
+                order = VariantOrder::from_name(value).ok_or_else(|| {
+                    format!("unknown variant order {value:?}; expected fixed or alternate")
+                })?;
+            }
+            "--self-check" => self_check = true,
             "--scenario" => {
                 index += 1;
                 let scenario = arguments
@@ -69,9 +128,7 @@ fn main() -> BenchResult<()> {
     }
 
     let executable = std::env::current_exe()?;
-    let mut rows = Vec::new();
-    let mut metadata = Vec::new();
-    let mut checksums = std::collections::BTreeMap::<String, u64>::new();
+    measure::set_measurement_mode(measurement_mode);
     let selected_scenarios = scenarios::SCENARIOS
         .iter()
         .filter(|(scenario, _)| {
@@ -79,53 +136,43 @@ fn main() -> BenchResult<()> {
         })
         .copied()
         .collect::<Vec<_>>();
-    for &(scenario, description) in &selected_scenarios {
+
+    if self_check {
+        return run_self_check(&executable, &selected_scenarios);
+    }
+
+    let mut rows = Vec::new();
+    let mut metadata = host_metadata(measurement_mode, order);
+    for (scenario_index, &(scenario, description)) in selected_scenarios.iter().enumerate() {
         eprintln!("benchmark {scenario}: {description}");
         let repetitions = runs_override.unwrap_or_else(|| scenarios::repetitions_for(scenario));
-        for variant in ["native", "compact"] {
-            let output = Command::new(&executable)
-                .arg("--child")
-                .arg(scenario)
-                .arg(variant)
-                .arg(repetitions.to_string())
-                .output()?;
-            if !output.status.success() {
+        let variants = order.variants(scenario_index);
+        let mut pair_checksums = Vec::with_capacity(variants.len());
+        for variant in variants {
+            let (child_rows, child_metadata, checksum) = run_child_process(
+                &executable,
+                scenario,
+                variant,
+                repetitions,
+                measurement_mode,
+            )?;
+            rows.extend(child_rows);
+            metadata.extend(child_metadata);
+            pair_checksums.push((variant, checksum));
+        }
+        let (first_variant, first_checksum) = pair_checksums[0];
+        for (variant, checksum) in &pair_checksums[1..] {
+            if *checksum != first_checksum {
                 return Err(format!(
-                    "child {scenario}/{variant} failed with {}:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                )
-                .into());
-            }
-            let stdout = String::from_utf8(output.stdout)?;
-            let mut child_checksum = None;
-            for line in stdout.lines() {
-                if let Some(row) = parse_phase(line) {
-                    rows.push(row);
-                } else if line.starts_with("META\tchecksum\t") {
-                    let fields: Vec<&str> = line.split('\t').collect();
-                    let checksum = fields
-                        .get(4)
-                        .ok_or_else(|| format!("invalid checksum row: {line}"))?
-                        .parse::<u64>()?;
-                    child_checksum = Some(checksum);
-                    metadata.push(line.to_owned());
-                } else if line.starts_with("META\t") {
-                    metadata.push(line.to_owned());
-                }
-            }
-            let checksum = child_checksum
-                .ok_or_else(|| format!("child {scenario}/{variant} did not report a checksum"))?;
-            if variant == "native" {
-                checksums.insert(scenario.to_owned(), checksum);
-            } else if checksums.get(scenario) != Some(&checksum) {
-                return Err(format!(
-                    "{scenario} native/compact logical results differ: native={:?}, compact={checksum:#x}",
-                    checksums.get(scenario)
+                    "{scenario} native/compact logical results differ: {first_variant}={first_checksum:#x}, {variant}={checksum:#x}"
                 )
                 .into());
             }
         }
+        metadata.push(format!(
+            "META\tscenario_variant_order\t{scenario}\t{}\t{}",
+            pair_checksums[0].0, pair_checksums[1].0
+        ));
     }
 
     print_report(&rows);
@@ -133,6 +180,22 @@ fn main() -> BenchResult<()> {
         "\nLogical result checksums matched for all {} scenarios.",
         selected_scenarios.len()
     );
+    println!(
+        "Measurement mode: {} (contract v{MEASUREMENT_MODE_VERSION}); variant order: {}.",
+        measurement_mode.name(),
+        order.name()
+    );
+    if measurement_mode == MeasurementMode::Profile {
+        println!(
+            "Allocator accounting is disabled in profile mode: do not compare these timings or memory columns with measure-mode output."
+        );
+    }
+    metadata.push(format!(
+        "META\tsuite_summary\tscenarios\t{}\tmeasurement_mode\t{}\tvariant_order\t{}",
+        selected_scenarios.len(),
+        measurement_mode.name(),
+        order.name()
+    ));
     if !metadata.is_empty() {
         println!("\nSupplemental process and allocator diagnostics:");
         for line in &metadata {
@@ -157,6 +220,22 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
     if repetitions == 0 {
         return Err("repetition count must be positive".into());
     }
+    let mut mode = MeasurementMode::Measure;
+    let mut index = 3;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--mode" => {
+                index += 1;
+                let value = arguments.get(index).ok_or("--mode requires a value")?;
+                mode = MeasurementMode::from_name(value).ok_or_else(|| {
+                    format!("unknown measurement mode {value:?}; expected measure or profile")
+                })?;
+            }
+            other => return Err(format!("unknown child argument {other:?}").into()),
+        }
+        index += 1;
+    }
+    measure::set_measurement_mode(mode);
     if variant == "compact" {
         compact_std::CompactRuntime::init(compact_std::CageConfig::new(CAGE_BYTES))?;
     } else if variant != "native" {
@@ -269,6 +348,268 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
         }
     }
     Ok(())
+}
+
+/// Order in which the native and compact children of a scenario are executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VariantOrder {
+    Fixed,
+    Alternate,
+}
+
+impl VariantOrder {
+    fn name(self) -> &'static str {
+        match self {
+            VariantOrder::Fixed => "fixed",
+            VariantOrder::Alternate => "alternate",
+        }
+    }
+
+    fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "fixed" => Some(VariantOrder::Fixed),
+            "alternate" => Some(VariantOrder::Alternate),
+            _ => None,
+        }
+    }
+
+    /// Variant execution order for the scenario at `scenario_index`.
+    ///
+    /// `alternate` flips the order for every other scenario so host drift
+    /// between the two children of a pair cannot systematically favour one
+    /// variant across a whole suite.
+    fn variants(self, scenario_index: usize) -> [&'static str; 2] {
+        match (self, scenario_index % 2) {
+            (VariantOrder::Alternate, 1) => ["compact", "native"],
+            _ => ["native", "compact"],
+        }
+    }
+}
+
+fn run_child_process(
+    executable: &Path,
+    scenario: &str,
+    variant: &str,
+    repetitions: usize,
+    mode: MeasurementMode,
+) -> BenchResult<(Vec<PhaseRow>, Vec<String>, u64)> {
+    let output = Command::new(executable)
+        .arg("--child")
+        .arg(scenario)
+        .arg(variant)
+        .arg(repetitions.to_string())
+        .arg("--mode")
+        .arg(mode.name())
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "child {scenario}/{variant} failed with {}:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut rows = Vec::new();
+    let mut metadata = Vec::new();
+    let mut checksum = None;
+    for line in stdout.lines() {
+        if let Some(row) = parse_phase(line) {
+            rows.push(row);
+        } else if line.starts_with("META\tchecksum\t") {
+            let fields: Vec<&str> = line.split('\t').collect();
+            checksum = Some(
+                fields
+                    .get(4)
+                    .ok_or_else(|| format!("invalid checksum row: {line}"))?
+                    .parse::<u64>()?,
+            );
+            metadata.push(line.to_owned());
+        } else if line.starts_with("META\t") {
+            metadata.push(line.to_owned());
+        }
+    }
+    let checksum =
+        checksum.ok_or_else(|| format!("child {scenario}/{variant} did not report a checksum"))?;
+    Ok((rows, metadata, checksum))
+}
+
+/// Verifies that dropping allocator accounting does not change the logical
+/// workload: every selected scenario must produce the same checksum in
+/// measure and profile mode, and the native and compact variants must agree
+/// inside each mode.
+fn run_self_check(executable: &Path, selected_scenarios: &[(&str, &str)]) -> BenchResult<()> {
+    println!(
+        "Self-check: measure/profile checksum parity, one repetition per child, {} scenario(s).",
+        selected_scenarios.len()
+    );
+    let mut failures = Vec::new();
+    for &(scenario, _) in selected_scenarios {
+        let mut mode_checksums = Vec::new();
+        for mode in [MeasurementMode::Measure, MeasurementMode::Profile] {
+            let mut variant_checksums = Vec::new();
+            for variant in ["native", "compact"] {
+                let (_, _, checksum) = run_child_process(executable, scenario, variant, 1, mode)?;
+                variant_checksums.push((variant, checksum));
+            }
+            if variant_checksums[0].1 != variant_checksums[1].1 {
+                return Err(format!(
+                    "self-check {scenario}: {}/{} checksums differ in {} mode ({:#x} vs {:#x})",
+                    variant_checksums[0].0,
+                    variant_checksums[1].0,
+                    mode.name(),
+                    variant_checksums[0].1,
+                    variant_checksums[1].1
+                )
+                .into());
+            }
+            mode_checksums.push((mode, variant_checksums[0].1));
+        }
+        let (_, measure_checksum) = mode_checksums[0];
+        let (_, profile_checksum) = mode_checksums[1];
+        let parity = measure_checksum == profile_checksum;
+        println!(
+            "SELF-CHECK\t{scenario}\tmeasure={measure_checksum:#018x}\tprofile={profile_checksum:#018x}\t{}",
+            if parity { "ok" } else { "MISMATCH" }
+        );
+        if !parity {
+            failures.push(scenario);
+        }
+    }
+    if failures.is_empty() {
+        println!(
+            "Self-check passed: all {} scenario(s) produced identical checksums with and without allocator accounting.",
+            selected_scenarios.len()
+        );
+        Ok(())
+    } else {
+        Err(format!("self-check mode parity failed for: {}", failures.join(", ")).into())
+    }
+}
+
+/// Recording that makes every saved artifact self-describing: harness contract
+/// version, measurement mode, build profile, features, host and toolchain. The
+/// parent process is not timed, so gathering this costs the workload nothing.
+fn host_metadata(mode: MeasurementMode, order: VariantOrder) -> Vec<String> {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .map(|value| {
+            value
+                .split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .unwrap_or_else(|| "unavailable\tunavailable\tunavailable".to_owned());
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let workers = std::thread::available_parallelism()
+        .map(|value| value.get().to_string())
+        .unwrap_or_else(|_| "unavailable".to_owned());
+    let mut rows = vec![
+        format!(
+            "META\tharness\tbenchmark_compare\t{}\tcontract_v{MEASUREMENT_MODE_VERSION}",
+            env!("CARGO_PKG_VERSION")
+        ),
+        format!(
+            "META\tsuite\tmeasurement_mode\t{}\tcontract_v{MEASUREMENT_MODE_VERSION}\tvariant_order\t{}",
+            mode.name(),
+            order.name()
+        ),
+        format!(
+            "META\tsuite\tbuild\t{profile}\t{}\t{}\t{}-bit\t{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            usize::BITS,
+            std::env::consts::FAMILY
+        ),
+        format!("META\tsuite\tfeatures\t{}", enabled_features()),
+        format!("META\tsuite\tavailable_parallelism\t{workers}"),
+        format!("META\tsuite\tloadavg_1_5_15\t{load}"),
+        format!("META\tsuite\tkernel\t{kernel}"),
+        format!("META\tsuite\thost_cpu\t{}", cpu_model()),
+    ];
+    rows.extend(toolchain_metadata());
+    rows
+}
+
+fn enabled_features() -> String {
+    let mut features = Vec::new();
+    if cfg!(feature = "json") {
+        features.push("json");
+    }
+    if cfg!(feature = "toml") {
+        features.push("toml");
+    }
+    if cfg!(feature = "allocator-telemetry") {
+        features.push("allocator-telemetry");
+    }
+    if cfg!(feature = "benchmark-allocator-a") {
+        features.push("benchmark-allocator-a");
+    }
+    if cfg!(feature = "benchmark-allocator-b") {
+        features.push("benchmark-allocator-b");
+    }
+    if cfg!(feature = "benchmark-allocator-c") {
+        features.push("benchmark-allocator-c");
+    }
+    if features.is_empty() {
+        "none".to_owned()
+    } else {
+        features.join(",")
+    }
+}
+
+fn cpu_model() -> String {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    for line in cpuinfo.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if matches!(
+            key.trim(),
+            "model name" | "Model" | "Hardware" | "cpu model" | "Processor"
+        ) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_owned();
+            }
+        }
+    }
+    std::env::consts::ARCH.to_owned()
+}
+
+fn toolchain_metadata() -> Vec<String> {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+    let Ok(output) = Command::new(rustc).arg("-vV").output() else {
+        return vec!["META\tsuite\ttoolchain\tunavailable\tunavailable\tunavailable".to_owned()];
+    };
+    if !output.status.success() {
+        return vec!["META\tsuite\ttoolchain\tunavailable\tunavailable\tunavailable".to_owned()];
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut version = "unknown".to_owned();
+    let mut host = "unknown".to_owned();
+    let mut llvm = "unknown".to_owned();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("rustc ") {
+            version = rest.to_owned();
+        } else if let Some(rest) = line.strip_prefix("host: ") {
+            host = rest.to_owned();
+        } else if let Some(rest) = line.strip_prefix("LLVM version: ") {
+            llvm = rest.to_owned();
+        }
+    }
+    vec![format!(
+        "META\tsuite\ttoolchain\t{version}\t{host}\tLLVM {llvm}"
+    )]
 }
 
 fn parse_positive(arguments: &[String], index: usize, option: &str) -> BenchResult<usize> {
