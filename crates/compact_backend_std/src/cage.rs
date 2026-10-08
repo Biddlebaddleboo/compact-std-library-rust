@@ -14,6 +14,8 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(feature = "allocator-telemetry")]
+use std::time::Instant;
 
 const INITIAL_CURSOR: u32 = 8;
 const FREE_NODE_BYTES: u32 = size_of::<FreeNode>() as u32;
@@ -81,6 +83,9 @@ struct PendingReuseTelemetry {
     no_active_collector: AtomicU64,
     no_exact_block: AtomicU64,
     alignment_incompatible: AtomicU64,
+    scan_candidates: AtomicU64,
+    scan_depth_histogram: [AtomicU64; RELEASE_BATCH_CAPACITY + 1],
+    candidate_size_histogram: [AtomicU64; BLOCK_SIZE_BUCKETS],
 }
 
 #[cfg(feature = "allocator-telemetry")]
@@ -90,7 +95,54 @@ static PENDING_REUSE_TELEMETRY: PendingReuseTelemetry = PendingReuseTelemetry {
     no_active_collector: AtomicU64::new(0),
     no_exact_block: AtomicU64::new(0),
     alignment_incompatible: AtomicU64::new(0),
+    scan_candidates: AtomicU64::new(0),
+    scan_depth_histogram: [const { AtomicU64::new(0) }; RELEASE_BATCH_CAPACITY + 1],
+    candidate_size_histogram: [const { AtomicU64::new(0) }; BLOCK_SIZE_BUCKETS],
 };
+
+#[cfg(feature = "allocator-telemetry")]
+struct AllocatorPhaseTelemetry {
+    pending_lookup_ns: AtomicU64,
+    layout_ns: AtomicU64,
+    lock_wait_ns: AtomicU64,
+    free_list_search_ns: AtomicU64,
+    bump_allocation_ns: AtomicU64,
+    header_initialization_ns: AtomicU64,
+}
+
+#[cfg(feature = "allocator-telemetry")]
+static ALLOCATOR_PHASE_TELEMETRY: AllocatorPhaseTelemetry = AllocatorPhaseTelemetry {
+    pending_lookup_ns: AtomicU64::new(0),
+    layout_ns: AtomicU64::new(0),
+    lock_wait_ns: AtomicU64::new(0),
+    free_list_search_ns: AtomicU64::new(0),
+    bump_allocation_ns: AtomicU64::new(0),
+    header_initialization_ns: AtomicU64::new(0),
+};
+
+#[cfg(feature = "allocator-telemetry")]
+struct PhaseTimer {
+    started: Instant,
+    total_ns: &'static AtomicU64,
+}
+
+#[cfg(feature = "allocator-telemetry")]
+impl PhaseTimer {
+    fn start(total_ns: &'static AtomicU64) -> Self {
+        Self {
+            started: Instant::now(),
+            total_ns,
+        }
+    }
+}
+
+#[cfg(feature = "allocator-telemetry")]
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.total_ns.fetch_add(elapsed, Ordering::Relaxed);
+    }
+}
 
 #[cfg(feature = "allocator-telemetry")]
 static PENDING_ALLOCATION_SIZE_HISTOGRAM: [AtomicU64; BLOCK_SIZE_BUCKETS] =
@@ -125,8 +177,15 @@ impl ReleaseCollector {
             .and_then(|raw| raw.checked_add(7))
             .and_then(|raw| u32::try_from(raw & !7).ok());
         let mut alignment_incompatible = false;
+        #[cfg(feature = "allocator-telemetry")]
+        let mut scanned = 0;
         for index in (0..self.len).rev() {
             let extent = self.extents[index];
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                scanned += 1;
+                record_pending_candidate_size(extent.len);
+            }
             let Ok((data_offset, prefix, block_len)) =
                 block_layout(base, extent.start, bytes, alignment)
             else {
@@ -141,6 +200,8 @@ impl ReleaseCollector {
                 self.extents.copy_within(index + 1..self.len, index);
                 self.len -= 1;
                 self.extents[self.len] = ReleaseExtent::default();
+                #[cfg(feature = "allocator-telemetry")]
+                record_pending_scan_depth(scanned);
                 return (
                     PendingLookup::Recycled,
                     Some(RecycledExtent {
@@ -154,6 +215,8 @@ impl ReleaseCollector {
                 alignment_incompatible = true;
             }
         }
+        #[cfg(feature = "allocator-telemetry")]
+        record_pending_scan_depth(scanned);
         (
             PendingLookup::NoExactBlock {
                 alignment_incompatible,
@@ -371,6 +434,33 @@ pub struct AllocatorStats {
     pub pending_reuse_no_exact_block: u64,
     /// Pending-reuse misses where alignment padding made an exact-size block too small.
     pub pending_reuse_alignment_incompatible: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Candidate extents examined by pending exact-size lookups.
+    pub pending_reuse_scan_candidates: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Pending lookup depths, indexed from 0 through the collector capacity.
+    pub pending_reuse_scan_depth_histogram: [u64; RELEASE_BATCH_CAPACITY + 1],
+    #[cfg(feature = "allocator-telemetry")]
+    /// Examined pending extent sizes in 8-byte buckets; the last bucket is 1024 B+.
+    pub pending_reuse_candidate_size_histogram: [u64; BLOCK_SIZE_BUCKETS],
+    #[cfg(feature = "allocator-telemetry")]
+    /// Cumulative time spent checking the active release collector, in nanoseconds.
+    pub pending_lookup_phase_ns: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Cumulative time spent computing allocation layouts, in nanoseconds.
+    pub layout_phase_ns: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Cumulative time waiting to acquire the allocator mutex, in nanoseconds.
+    pub lock_wait_phase_ns: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Cumulative time searching global reusable free ranges, in nanoseconds.
+    pub free_list_search_phase_ns: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Cumulative time reserving ranges at the bump cursor, in nanoseconds.
+    pub bump_allocation_phase_ns: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Cumulative time writing fresh allocation headers, in nanoseconds.
+    pub header_initialization_phase_ns: u64,
     /// Successful global-cache allocations by exact block size.
     pub global_class_hits: [u64; SIZE_CLASS_COUNT],
     /// Global-cache lookups not served by each class, by exact block size.
@@ -419,6 +509,24 @@ impl Default for AllocatorStats {
             pending_reuse_no_active_collector: 0,
             pending_reuse_no_exact_block: 0,
             pending_reuse_alignment_incompatible: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_scan_candidates: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_scan_depth_histogram: [0; RELEASE_BATCH_CAPACITY + 1],
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_candidate_size_histogram: [0; BLOCK_SIZE_BUCKETS],
+            #[cfg(feature = "allocator-telemetry")]
+            pending_lookup_phase_ns: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            layout_phase_ns: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            lock_wait_phase_ns: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            free_list_search_phase_ns: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            bump_allocation_phase_ns: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            header_initialization_phase_ns: 0,
             global_class_hits: [0; SIZE_CLASS_COUNT],
             global_class_misses: [0; SIZE_CLASS_COUNT],
             global_class_empty: [0; SIZE_CLASS_COUNT],
@@ -575,6 +683,40 @@ impl CompactRuntime {
             #[cfg(feature = "allocator-telemetry")]
             pending_reuse_alignment_incompatible: PENDING_REUSE_TELEMETRY
                 .alignment_incompatible
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_scan_candidates: PENDING_REUSE_TELEMETRY
+                .scan_candidates
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_scan_depth_histogram: core::array::from_fn(|index| {
+                PENDING_REUSE_TELEMETRY.scan_depth_histogram[index].load(Ordering::Relaxed)
+            }),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_reuse_candidate_size_histogram: core::array::from_fn(|index| {
+                PENDING_REUSE_TELEMETRY.candidate_size_histogram[index].load(Ordering::Relaxed)
+            }),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_lookup_phase_ns: ALLOCATOR_PHASE_TELEMETRY
+                .pending_lookup_ns
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            layout_phase_ns: ALLOCATOR_PHASE_TELEMETRY.layout_ns.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            lock_wait_phase_ns: ALLOCATOR_PHASE_TELEMETRY
+                .lock_wait_ns
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            free_list_search_phase_ns: ALLOCATOR_PHASE_TELEMETRY
+                .free_list_search_ns
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            bump_allocation_phase_ns: ALLOCATOR_PHASE_TELEMETRY
+                .bump_allocation_ns
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            header_initialization_phase_ns: ALLOCATOR_PHASE_TELEMETRY
+                .header_initialization_ns
                 .load(Ordering::Relaxed),
             #[cfg(feature = "allocator-telemetry")]
             global_class_hits: allocator.global_class_hits,
@@ -883,7 +1025,11 @@ impl<T: CompactValue> CageAllocation<T> {
         let state = state()?;
         let needed = bytes.max(1);
         let alignment = align_of::<T>().max(4);
+        #[cfg(feature = "allocator-telemetry")]
+        let pending_lookup_phase = PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.pending_lookup_ns);
         let (lookup, recycled) = take_pending_reuse(state, needed, alignment);
+        #[cfg(feature = "allocator-telemetry")]
+        drop(pending_lookup_phase);
         if let Some(recycled) = recycled {
             debug_assert_eq!(lookup, PendingLookup::Recycled);
             record_pending_lookup(PendingLookup::Recycled, recycled.block_len);
@@ -895,7 +1041,7 @@ impl<T: CompactValue> CageAllocation<T> {
             };
             // SAFETY: the exact pending extent was removed from the
             // thread-local collector after all layout checks succeeded.
-            unsafe { header_ptr(state, recycled.data_offset.get()).write(header) };
+            initialize_allocation_header(state, recycled.data_offset.get(), header);
             return Ok(Self {
                 offset: NonZeroOffset(recycled.data_offset),
                 marker: PhantomData,
@@ -916,7 +1062,7 @@ impl<T: CompactValue> CageAllocation<T> {
             initialized: 0,
         };
         // SAFETY: `allocate_block` reserves this aligned header and data range.
-        unsafe { header_ptr(state, offset.get()).write(header) };
+        initialize_allocation_header(state, offset.get(), header);
         Ok(Self {
             offset: NonZeroOffset(offset),
             marker: PhantomData,
@@ -1376,10 +1522,12 @@ fn state() -> Result<&'static CageState> {
     CAGE.get().ok_or(Error::RuntimeNotInitialized)
 }
 fn lock(state: &CageState) -> Result<AllocatorTransaction<'_>> {
-    let allocator = state
-        .allocator
-        .lock()
-        .map_err(|_| Error::AllocatorPoisoned)?;
+    #[cfg(feature = "allocator-telemetry")]
+    let lock_wait_phase = PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.lock_wait_ns);
+    let lock_result = state.allocator.lock();
+    #[cfg(feature = "allocator-telemetry")]
+    drop(lock_wait_phase);
+    let allocator = lock_result.map_err(|_| Error::AllocatorPoisoned)?;
     #[cfg(feature = "allocator-telemetry")]
     let allocator = {
         let mut allocator = allocator;
@@ -1387,6 +1535,14 @@ fn lock(state: &CageState) -> Result<AllocatorTransaction<'_>> {
         allocator
     };
     Ok(AllocatorTransaction { state, allocator })
+}
+
+fn initialize_allocation_header(state: &CageState, offset: u32, header: AllocationHeader) {
+    #[cfg(feature = "allocator-telemetry")]
+    let _header_initialization_phase =
+        PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.header_initialization_ns);
+    // SAFETY: callers pass the data offset for a newly reserved live extent.
+    unsafe { header_ptr(state, offset).write(header) };
 }
 
 fn take_pending_reuse(
@@ -1450,15 +1606,60 @@ fn record_pending_lookup(lookup: PendingLookup, block_len: u32) {
     let _ = (lookup, block_len);
 }
 
+#[cfg(feature = "allocator-telemetry")]
+fn record_pending_scan_depth(scanned: usize) {
+    let depth = scanned.min(RELEASE_BATCH_CAPACITY);
+    PENDING_REUSE_TELEMETRY
+        .scan_candidates
+        .fetch_add(depth as u64, Ordering::Relaxed);
+    PENDING_REUSE_TELEMETRY.scan_depth_histogram[depth].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "allocator-telemetry")]
+fn record_pending_candidate_size(block_len: u32) {
+    let bucket = ((block_len as usize) / 8).min(BLOCK_SIZE_BUCKETS - 1);
+    PENDING_REUSE_TELEMETRY.candidate_size_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
 fn block_layout(
     base: *mut u8,
     start: u32,
     bytes: usize,
     alignment: usize,
 ) -> Result<(u32, u32, u32)> {
+    #[cfg(feature = "allocator-telemetry")]
+    let _layout_phase = PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.layout_ns);
     if alignment == 0 || !alignment.is_power_of_two() {
         return Err(Error::AlignmentError);
     }
+    if alignment <= 8 {
+        let block_start_address = (base as usize)
+            .checked_add(start as usize)
+            .ok_or(Error::OffsetOverflow)?;
+        if block_start_address % 8 == 0 {
+            let data = start
+                .checked_add(size_of::<AllocationHeader>() as u32)
+                .ok_or(Error::OffsetOverflow)?;
+            let raw = size_of::<AllocationHeader>()
+                .checked_add(bytes)
+                .ok_or(Error::OffsetOverflow)?;
+            let len = checked_align_up(raw, 8)?;
+            return Ok((
+                data,
+                0,
+                u32::try_from(len).map_err(|_| Error::OffsetOverflow)?,
+            ));
+        }
+    }
+    block_layout_general(base, start, bytes, alignment)
+}
+
+fn block_layout_general(
+    base: *mut u8,
+    start: u32,
+    bytes: usize,
+    alignment: usize,
+) -> Result<(u32, u32, u32)> {
     let after_header = (base as usize)
         .checked_add(start as usize)
         .and_then(|n| n.checked_add(size_of::<AllocationHeader>()))
@@ -1581,6 +1782,17 @@ fn allocate_block(
     alignment: usize,
 ) -> Result<(u32, u32, u32)> {
     let required_bytes = u32::try_from(bytes).map_err(|_| Error::OffsetOverflow)?;
+    // A2's object build allocates many blocks before releasing any. Keep this
+    // fast path inside the existing mutex and only use it when neither free
+    // structure has entries. Telemetry builds retain the full accounting path.
+    if !cfg!(feature = "allocator-telemetry")
+        && allocator.free_head == 0
+        && !allocator.has_size_class_cache
+    {
+        return allocate_from_cursor(state, allocator, required_bytes, alignment);
+    }
+    #[cfg(feature = "allocator-telemetry")]
+    let free_list_search_phase = PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.free_list_search_ns);
     // With the cage base, starts, and header aligned to eight bytes, requests
     // up to that alignment have a position-independent block length. Probe
     // only that exact class; wider alignments still need to check every class.
@@ -1758,6 +1970,19 @@ fn allocate_block(
         current = node.next;
     }
 
+    #[cfg(feature = "allocator-telemetry")]
+    drop(free_list_search_phase);
+    allocate_from_cursor(state, allocator, required_bytes, alignment)
+}
+
+fn allocate_from_cursor(
+    state: &CageState,
+    allocator: &mut Allocator,
+    required_bytes: u32,
+    alignment: usize,
+) -> Result<(u32, u32, u32)> {
+    #[cfg(feature = "allocator-telemetry")]
+    let _bump_allocation_phase = PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.bump_allocation_ns);
     let start = allocator.cursor;
     let (data, prefix, len) =
         block_layout(state.base(), start, required_bytes as usize, alignment)?;
@@ -2915,6 +3140,97 @@ mod tests {
         assert_eq!(collector.len, 2);
     }
 
+    #[test]
+    fn pending_collector_preserves_diverse_unmatched_extents() {
+        let state = local_state(1 << 16);
+        let sizes = [8_usize, 16, 24, 32, 80, 512];
+        let extents = {
+            let mut allocator = lock(&state).unwrap();
+            (0..RELEASE_BATCH_CAPACITY)
+                .map(|index| local_allocate(&state, &mut allocator, sizes[index % sizes.len()]))
+                .collect::<Vec<_>>()
+        };
+        let mut collector = ReleaseCollector::new();
+        for extent in &extents {
+            collector.push(*extent);
+        }
+
+        let target_index = (0..extents.len())
+            .rev()
+            .find(|index| sizes[index % sizes.len()] == 24)
+            .unwrap();
+        let target = extents[target_index];
+        let (lookup, recycled) = collector.take_compatible(state.base(), 24, 8);
+        assert_eq!(lookup, PendingLookup::Recycled);
+        let recycled = recycled.unwrap();
+        assert_eq!(recycled.data_offset.get(), target.start + 16);
+        assert_eq!(recycled.block_len, target.len);
+
+        let (lookup, miss) = collector.take_compatible(state.base(), 4096, 8);
+        assert_eq!(
+            lookup,
+            PendingLookup::NoExactBlock {
+                alignment_incompatible: false
+            }
+        );
+        assert!(miss.is_none());
+        let expected_pending = extents
+            .iter()
+            .copied()
+            .filter(|extent| *extent != target)
+            .collect::<Vec<_>>();
+        assert_eq!(&collector.extents[..collector.len], expected_pending);
+
+        let allocator = lock(&state).unwrap();
+        assert_pending_partition(&state, &allocator, &collector, &[target], &expected_pending);
+        drop(allocator);
+        local_flush(&state, &mut collector);
+        let mut allocator = lock(&state).unwrap();
+        let mut recycled_live = [target];
+        local_release(&state, &mut allocator, &mut recycled_live);
+        assert_eq!(allocator.live_bytes, 0);
+        assert_eq!(allocator.cursor, INITIAL_CURSOR);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn small_alignment_layout_matches_general_layout() {
+        let state = local_state(4096);
+        for start in (INITIAL_CURSOR..512).step_by(8) {
+            for bytes in [0_usize, 1, 7, 8, 9, 15, 16, 24, 31, 32, 80, 512] {
+                for alignment in [1_usize, 2, 4, 8, 16, 64] {
+                    assert_eq!(
+                        block_layout(state.base(), start, bytes, alignment).unwrap(),
+                        block_layout_general(state.base(), start, bytes, alignment).unwrap(),
+                        "start={start} bytes={bytes} alignment={alignment}"
+                    );
+                }
+            }
+        }
+        for alignment in [1_usize, 2, 4, 8] {
+            assert_eq!(
+                block_layout(state.base(), INITIAL_CURSOR + 1, 24, alignment).unwrap(),
+                block_layout_general(state.base(), INITIAL_CURSOR + 1, 24, alignment).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_reusable_ranges_allocate_from_the_existing_cursor() {
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+        let start = allocator.cursor;
+        let (data, prefix, block_len) = allocate_block(&state, &mut allocator, 16, 8).unwrap();
+        assert_eq!(prefix, 0);
+        assert_eq!(data, start + size_of::<AllocationHeader>() as u32);
+        assert_eq!(block_len, 32);
+        assert_eq!(allocator.cursor, start + block_len);
+        assert_eq!(allocator.live_bytes, block_len);
+        assert_eq!(allocator.free_head, 0);
+        assert!(!allocator.has_size_class_cache);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
     #[cfg(all(
         feature = "allocator-telemetry",
         any(feature = "benchmark-allocator-a", feature = "benchmark-allocator-c")
@@ -2952,6 +3268,60 @@ mod tests {
             .iter()
             .all(|count| *count > 0));
         validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[cfg(feature = "allocator-telemetry")]
+    #[test]
+    fn pending_scan_telemetry_records_depth_and_candidate_sizes() {
+        let state = local_state(4096);
+        let extents = {
+            let mut allocator = lock(&state).unwrap();
+            [
+                local_allocate(&state, &mut allocator, 8),
+                local_allocate(&state, &mut allocator, 24),
+            ]
+        };
+        let mut collector = ReleaseCollector::new();
+        collector.push(extents[0]);
+        collector.push(extents[1]);
+
+        let depth_before = PENDING_REUSE_TELEMETRY.scan_depth_histogram[2].load(Ordering::Relaxed);
+        let candidates_before = PENDING_REUSE_TELEMETRY
+            .scan_candidates
+            .load(Ordering::Relaxed);
+        let small_bucket = (extents[0].len as usize) / 8;
+        let large_bucket = (extents[1].len as usize) / 8;
+        let small_before =
+            PENDING_REUSE_TELEMETRY.candidate_size_histogram[small_bucket].load(Ordering::Relaxed);
+        let large_before =
+            PENDING_REUSE_TELEMETRY.candidate_size_histogram[large_bucket].load(Ordering::Relaxed);
+
+        let (lookup, recycled) = collector.take_compatible(state.base(), 2048, 8);
+        assert_eq!(
+            lookup,
+            PendingLookup::NoExactBlock {
+                alignment_incompatible: false
+            }
+        );
+        assert!(recycled.is_none());
+        assert!(
+            PENDING_REUSE_TELEMETRY.scan_depth_histogram[2].load(Ordering::Relaxed)
+                >= depth_before + 1
+        );
+        assert!(
+            PENDING_REUSE_TELEMETRY
+                .scan_candidates
+                .load(Ordering::Relaxed)
+                >= candidates_before + 2
+        );
+        assert!(
+            PENDING_REUSE_TELEMETRY.candidate_size_histogram[small_bucket].load(Ordering::Relaxed)
+                >= small_before + 1
+        );
+        assert!(
+            PENDING_REUSE_TELEMETRY.candidate_size_histogram[large_bucket].load(Ordering::Relaxed)
+                >= large_before + 1
+        );
     }
 
     #[test]
