@@ -353,11 +353,9 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     {
         let control = self.control.as_ref()?.as_slice();
         let entries = self.entries.as_ref()?.as_slice();
-        let (index, found) = Self::find_slot_in(control, entries, key, self.hash(key))?;
-        found.then(|| {
-            // SAFETY: FULL control state corresponds to one initialized pair.
-            unsafe { &entries[index].assume_init_ref().1 }
-        })
+        let index = Self::find_index_in(control, entries, key, self.hash(key))?;
+        // SAFETY: FULL control state corresponds to one initialized pair.
+        Some(unsafe { &entries[index].assume_init_ref().1 })
     }
     /// Return key and value by borrowed key.
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
@@ -367,12 +365,10 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     {
         let control = self.control.as_ref()?.as_slice();
         let entries = self.entries.as_ref()?.as_slice();
-        let (index, found) = Self::find_slot_in(control, entries, key, self.hash(key))?;
-        found.then(|| {
-            // SAFETY: FULL control state corresponds to one initialized pair.
-            let pair = unsafe { entries[index].assume_init_ref() };
-            (&pair.0, &pair.1)
-        })
+        let index = Self::find_index_in(control, entries, key, self.hash(key))?;
+        // SAFETY: FULL control state corresponds to one initialized pair.
+        let pair = unsafe { entries[index].assume_init_ref() };
+        Some((&pair.0, &pair.1))
     }
     /// Mutably borrow a value by key.
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
@@ -385,13 +381,9 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         // the probe and the returned value share a single validated view.
         let control = self.control.as_ref()?.as_slice();
         let entries = self.entries.as_mut()?.as_mut_slice();
-        let (index, found) = Self::find_slot_in(control, entries, key, hash)?;
-        if found {
-            // SAFETY: the map is exclusively borrowed and the slot is initialized.
-            Some(unsafe { &mut entries[index].assume_init_mut().1 })
-        } else {
-            None
-        }
+        let index = Self::find_index_in(control, entries, key, hash)?;
+        // SAFETY: the map is exclusively borrowed and the slot is initialized.
+        Some(unsafe { &mut entries[index].assume_init_mut().1 })
     }
     /// Return whether a key is present.
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -412,10 +404,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         // views that located the slot.
         let control = self.control.as_mut()?.as_mut_slice();
         let entries = self.entries.as_mut()?.as_mut_slice();
-        let (index, found) = Self::find_slot_in(control, entries, key, hash)?;
-        if !found {
-            return None;
-        }
+        let index = Self::find_index_in(control, entries, key, hash)?;
         control[index] = TOMBSTONE;
         self.len -= 1;
         self.tombstones += 1;
@@ -641,6 +630,62 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
             consumed += count;
         }
         first_tombstone.map(|index| (index, false))
+    }
+
+    /// Locate the slot holding `key`, or report that it is absent.
+    ///
+    /// Read-only lookups never need an insertion slot, so unlike
+    /// [`Self::find_slot_in`] this variant does not track the earliest
+    /// tombstone. It only needs to skip tombstones while probing and stop at
+    /// the first true `EMPTY` slot, which removes the tombstone bookkeeping
+    /// from the hottest lookup loop without changing which slot is matched.
+    fn find_index_in<Q>(
+        control: &[u8],
+        entries: &[MaybeUninit<(K, V)>],
+        key: &Q,
+        hash: u64,
+    ) -> Option<usize>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let mask = control.len().checked_sub(1)?;
+        let start = hash as usize & mask;
+        let mut consumed = 0;
+        while consumed < control.len() {
+            let count = (control.len() - consumed).min(CONTROL_GROUP_WIDTH);
+            let cursor = start.wrapping_add(consumed) & mask;
+            let classes = classify_control_group(control, cursor, count);
+            let active = lane_mask(count);
+            let empty = classes.empty & active;
+            let full = classes.full & active;
+            if active & !(empty | full | classes.tombstone) != 0 {
+                unreachable!("control state is an internal two-bit invariant");
+            }
+
+            let first_empty = if empty == 0 {
+                count
+            } else {
+                empty.trailing_zeros() as usize
+            };
+            let before_empty = lane_mask(first_empty);
+            let mut full_candidates = full & before_empty;
+            while full_candidates != 0 {
+                let lane = full_candidates.trailing_zeros() as usize;
+                full_candidates &= full_candidates - 1;
+                let index = cursor.wrapping_add(lane) & mask;
+                // SAFETY: FULL slots contain initialized key-value pairs.
+                let pair = unsafe { entries[index].assume_init_ref() };
+                if pair.0.borrow() == key {
+                    return Some(index);
+                }
+            }
+            if first_empty < count {
+                return None;
+            }
+            consumed += count;
+        }
+        None
     }
 
     #[cfg(test)]
