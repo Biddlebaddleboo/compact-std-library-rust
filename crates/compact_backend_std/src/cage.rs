@@ -3103,7 +3103,15 @@ mod tests {
     fn pending_reuse_reports_size_and_alignment_misses() {
         let state = local_state(4096);
         let mut allocator = lock(&state).unwrap();
-        let wrong_size = local_allocate(&state, &mut allocator, 24);
+        // The size-miss extent must be unreusable by the 64-byte-aligned probe
+        // below for *every* cage base address. A 64-byte-aligned block for an
+        // 8-byte request has length `prefix + 24` with `prefix` in
+        // `0..=56 step 8`, so its exact block length is one of `24..=80`. A
+        // 72-byte request leaves an 88-byte extent that can never coincide,
+        // making the probe deterministic instead of a function of the base
+        // address residue mod 64 (as a 24-byte request would be).
+        let wrong_size = local_allocate(&state, &mut allocator, 72);
+        assert_eq!(wrong_size.len, 88);
         let mut alignment_candidate = None;
         for _ in 0..8 {
             let extent = local_allocate(&state, &mut allocator, 8);
@@ -3138,6 +3146,64 @@ mod tests {
             }
         );
         assert_eq!(collector.len, 2);
+    }
+
+    #[test]
+    fn pending_reuse_decision_tracks_cage_base_alignment() {
+        // A released 24-byte allocation leaves a 40-byte extent. Whether it can
+        // back an 8-byte/64-byte-aligned request depends only on the absolute
+        // cage base alignment, so pin both residues with a 64-byte-aligned
+        // scratch allocation. `block_layout` and `take_compatible` perform
+        // integer math on the base only, so these pointers are never
+        // dereferenced.
+        let extent = ReleaseExtent { start: 8, len: 40 };
+        let layout = Layout::from_size_align(128, 64).unwrap();
+        // SAFETY: the test uses a valid, nonzero layout and frees it below.
+        let memory = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        assert_eq!(memory.as_ptr() as usize % 64, 0);
+        let non_fitting_base = memory.as_ptr();
+        // SAFETY: the 24-byte offset stays inside the 128-byte allocation and
+        // the derived pointer is only used for layout arithmetic.
+        let fitting_base = unsafe { memory.as_ptr().add(24) };
+
+        // base = 24 (mod 64) needs a 16-byte prefix, so an 8/64 request lands
+        // on the exact 40-byte block length and can reuse the extent.
+        assert_eq!(
+            block_layout(fitting_base, extent.start, 8, 64).unwrap().2,
+            40
+        );
+        // base = 0 (mod 64) needs a 40-byte prefix, giving a 64-byte block
+        // that cannot reuse the 40-byte extent.
+        assert_eq!(
+            block_layout(non_fitting_base, extent.start, 8, 64)
+                .unwrap()
+                .2,
+            64
+        );
+
+        let mut collector = ReleaseCollector::new();
+        collector.push(extent);
+        let (lookup, recycled) = collector.take_compatible(fitting_base, 8, 64);
+        assert_eq!(lookup, PendingLookup::Recycled);
+        let recycled = recycled.expect("the 40-byte extent fits exactly");
+        assert_eq!(recycled.block_len, 40);
+        assert_eq!(recycled.prefix, 16);
+        assert_eq!(recycled.data_offset.get(), extent.start + 16 + 16);
+        assert_eq!(collector.len, 0);
+
+        collector.push(extent);
+        let (lookup, recycled) = collector.take_compatible(non_fitting_base, 8, 64);
+        assert_eq!(
+            lookup,
+            PendingLookup::NoExactBlock {
+                alignment_incompatible: false
+            }
+        );
+        assert!(recycled.is_none());
+        assert_eq!(collector.len, 1);
+
+        // SAFETY: same layout used for the allocation above.
+        unsafe { dealloc(memory.as_ptr(), layout) };
     }
 
     #[test]
