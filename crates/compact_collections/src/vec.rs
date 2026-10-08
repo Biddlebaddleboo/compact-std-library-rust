@@ -366,9 +366,15 @@ impl<T: CompactValue> CompactVec<T> {
         T: Copy,
     {
         let values = self.as_slice();
-        let mut cloned = Self::with_capacity(values.len())?;
-        cloned.try_extend_copy(values)?;
-        Ok(cloned)
+        if values.is_empty() {
+            return Ok(Self::new());
+        }
+
+        let mut storage = CompactRuntime::alloc_owned_slice::<T>(values.len())?;
+        storage.extend_copy(values)?;
+        Ok(Self {
+            storage: Some(storage),
+        })
     }
 }
 

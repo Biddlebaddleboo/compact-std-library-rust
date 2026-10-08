@@ -193,7 +193,9 @@ impl<T: CompactValue> CompactVecDeque<T> {
             let slots = storage.uninit_capacity_mut();
             if (self.len as usize) < slots.len() {
                 let at = Self::physical_index(self.head as usize, self.len as usize, slots.len());
-                slots[at].write(MaybeUninit::new(value));
+                // SAFETY: `len < capacity` and `physical_index` maps the
+                // logical tail into the allocated ring range.
+                unsafe { slots.get_unchecked_mut(at) }.write(MaybeUninit::new(value));
                 self.len += 1;
                 return Ok(());
             }
@@ -207,7 +209,9 @@ impl<T: CompactValue> CompactVecDeque<T> {
             .expect("reserve allocates storage")
             .uninit_capacity_mut();
         let at = Self::physical_index(head, logical, slots.len());
-        slots[at].write(MaybeUninit::new(value));
+        // SAFETY: reserve guarantees a free slot, and `physical_index` maps
+        // the logical tail into the allocated ring range.
+        unsafe { slots.get_unchecked_mut(at) }.write(MaybeUninit::new(value));
         self.len += 1;
         Ok(())
     }
@@ -224,7 +228,9 @@ impl<T: CompactValue> CompactVecDeque<T> {
                 } else {
                     self.head - 1
                 };
-                slots[head as usize].write(MaybeUninit::new(value));
+                // SAFETY: the empty case selects slot zero; otherwise the
+                // previous head is within the nonzero allocation.
+                unsafe { slots.get_unchecked_mut(head as usize) }.write(MaybeUninit::new(value));
                 self.head = head;
                 self.len += 1;
                 return Ok(());
@@ -244,7 +250,9 @@ impl<T: CompactValue> CompactVecDeque<T> {
         } else {
             self.head - 1
         };
-        slots[self.head as usize].write(MaybeUninit::new(value));
+        // SAFETY: the empty case selects slot zero; otherwise the previous
+        // head is within the nonzero allocation.
+        unsafe { slots.get_unchecked_mut(self.head as usize) }.write(MaybeUninit::new(value));
         self.len += 1;
         Ok(())
     }
@@ -263,7 +271,13 @@ impl<T: CompactValue> CompactVecDeque<T> {
             let capacity = slots.len();
             // SAFETY: the front slot is initialized and removed exactly once.
             (
-                unsafe { slots[at].assume_init_read().assume_init_read() },
+                // SAFETY: a nonempty deque's head is always within capacity.
+                unsafe {
+                    slots
+                        .get_unchecked_mut(at)
+                        .assume_init_read()
+                        .assume_init_read()
+                },
                 capacity,
             )
         };
@@ -289,8 +303,15 @@ impl<T: CompactValue> CompactVecDeque<T> {
                 .expect("nonempty deque has storage")
                 .uninit_capacity_mut();
             let at = Self::physical_index(head, logical, slots.len());
-            // SAFETY: the back slot is initialized and removed exactly once.
-            unsafe { slots[at].assume_init_read().assume_init_read() }
+            // SAFETY: positive length and a valid head map the logical back
+            // into the allocated ring range. The initialized slot is removed
+            // exactly once.
+            unsafe {
+                slots
+                    .get_unchecked_mut(at)
+                    .assume_init_read()
+                    .assume_init_read()
+            }
         };
         self.len -= 1;
         if self.len == 0 {
