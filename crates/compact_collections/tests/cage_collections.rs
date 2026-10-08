@@ -853,7 +853,10 @@ fn compact_map_panicking_equality_leaves_the_map_unchanged() {
 
     let mut map = CompactHashMap::with_hasher(ConstantBuildHasher);
     for key in 0..6_u8 {
-        assert_eq!(map.insert(EqPanicKey(key), u32::from(key) * 3).unwrap(), None);
+        assert_eq!(
+            map.insert(EqPanicKey(key), u32::from(key) * 3).unwrap(),
+            None
+        );
     }
     let len_before = map.len();
     assert_eq!(len_before, 6);
