@@ -1,0 +1,8 @@
+profile:hz:99 /pid == cpid/ {
+    @[ustack(32)] = count();
+}
+
+interval:ms:500 {
+    print(@);
+    clear(@);
+}
