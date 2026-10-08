@@ -8,7 +8,7 @@ use core::ptr;
 use core::slice;
 
 use compact_backend_std::{CageAllocation, CompactRuntime};
-use compact_core::CompactValue;
+use compact_core::{CompactValue, Error as CoreError};
 
 use crate::{CollectionError, Result};
 
@@ -79,11 +79,26 @@ impl<T: CompactValue> CompactVec<T> {
 
     /// Append one value, growing the compact allocation when needed.
     pub fn push(&mut self, value: T) -> Result<()> {
+        // Fast path: append within existing capacity using a single cage-header
+        // resolution. `extend_from_iter` leaves its source iterator untouched
+        // when the vector is full, so the value can be recovered for growth.
+        let pending = if let Some(storage) = &mut self.storage {
+            let mut once = core::iter::once(value);
+            match storage.extend_from_iter(&mut once, 1) {
+                Ok(_) => return Ok(()),
+                Err(CoreError::OutOfBounds) => once
+                    .next()
+                    .expect("capacity miss leaves the pending value available"),
+                Err(other) => return Err(other.into()),
+            }
+        } else {
+            value
+        };
         self.reserve(1)?;
         self.storage
             .as_mut()
             .expect("reserve allocates storage")
-            .push(value)?;
+            .push(pending)?;
         Ok(())
     }
 

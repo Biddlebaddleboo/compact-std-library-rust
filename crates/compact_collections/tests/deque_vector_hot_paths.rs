@@ -1,6 +1,8 @@
 use compact_backend_std::{CageConfig, CompactRuntime};
 use compact_collections::{CompactVec, CompactVecDeque};
+use compact_core::CompactValue;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 static INIT: OnceLock<()> = OnceLock::new();
@@ -101,4 +103,39 @@ fn try_clone_copy_copies_initialized_values_and_keeps_empty_capacity_semantics()
     assert_eq!(cloned.as_slice(), source.as_slice());
     assert_eq!(cloned.capacity(), source.len());
     assert_eq!(source.capacity(), 12);
+}
+
+#[test]
+fn compact_vec_push_grows_past_capacity_and_drops_each_value_exactly_once() {
+    init();
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug)]
+    struct Droppy(u32);
+
+    impl Drop for Droppy {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // SAFETY: `Droppy` is a plain `u32` wrapper moved by value into the cage.
+    unsafe impl CompactValue for Droppy {}
+
+    DROPS.store(0, Ordering::SeqCst);
+    {
+        // Push repeatedly past the initial capacity so the capacity-miss
+        // recovery path and every growth path run.
+        let mut values = CompactVec::with_capacity(2).unwrap();
+        for index in 0..9u32 {
+            values.push(Droppy(index)).unwrap();
+        }
+        assert_eq!(values.len(), 9);
+        assert!(values.capacity() >= 9);
+        let seen: Vec<u32> = values.as_slice().iter().map(|value| value.0).collect();
+        assert_eq!(seen, (0..9).collect::<Vec<_>>());
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(DROPS.load(Ordering::SeqCst), 9);
 }
