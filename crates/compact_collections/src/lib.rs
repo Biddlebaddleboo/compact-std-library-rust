@@ -20,7 +20,7 @@ mod vec;
 pub use bitvec::CompactBitVec;
 pub use boxed::{CompactBox, CompactOption};
 pub use compact_bytes::{CompactBytes, COMPACT_BYTES_INLINE_CAPACITY};
-pub use deque::{CompactRing, CompactVecDeque, CompactVecDequeIter};
+pub use deque::{CompactRing, CompactVecDeque, CompactVecDequeIter, CompactVecDequeView};
 pub use enum_value::CompactEnum;
 pub use error::{CollectionError, Result};
 pub use hash_map::{

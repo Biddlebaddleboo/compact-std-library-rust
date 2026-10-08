@@ -12,8 +12,8 @@ pub use compact_collections::{
     CompactHashMapIter, CompactHashMapIterMut, CompactHashSet, CompactInterner, CompactOption,
     CompactOsStr, CompactOsString, CompactPath, CompactPathBuf, CompactPathDisplay, CompactRing,
     CompactSlab, CompactSmallVec, CompactString, CompactStringWriter, CompactVec, CompactVecDeque,
-    CompactVecDequeIter, InternId, Result, SlabHandle, TryClone, TryExtend, TryFromIterator,
-    TryToCompactString, COMPACT_BYTES_INLINE_CAPACITY,
+    CompactVecDequeIter, CompactVecDequeView, InternId, Result, SlabHandle, TryClone, TryExtend,
+    TryFromIterator, TryToCompactString, COMPACT_BYTES_INLINE_CAPACITY,
 };
 pub use compact_core::{
     bits_required, checked_align_up, read_bits, smallest_word, validate_bit_range, write_bits,

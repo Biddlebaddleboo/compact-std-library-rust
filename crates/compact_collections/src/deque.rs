@@ -449,6 +449,225 @@ impl<T: CompactValue> Default for CompactVecDeque<T> {
         Self::new()
     }
 }
+
+/// A borrow-scoped view over a deque's ring that resolves its cage storage once.
+///
+/// The view supports repeated front/back operations without re-resolving or
+/// re-validating the backing cage allocation on every call. It never retains a
+/// native pointer in deque state: the resolved slots live only for the borrow
+/// scope and the deque keeps its frozen twelve-byte layout.
+///
+/// Growth is not possible while the view is borrowed; callers must [`reserve`]
+/// enough capacity before opening a view. A push that would exceed capacity
+/// returns [`CollectionError::Core(Error::AllocationExhausted)`] and leaves the
+/// deque unchanged and valid.
+///
+/// [`reserve`]: CompactVecDeque::reserve
+pub struct CompactVecDequeView<'a, T: CompactValue> {
+    slots: &'a mut [MaybeUninit<MaybeUninit<T>>],
+    head: u32,
+    len: u32,
+    head_out: &'a mut u32,
+    len_out: &'a mut u32,
+}
+
+impl<T: CompactValue> CompactVecDeque<T> {
+    /// Run `f` with a borrow-scoped view that resolves the backing ring once.
+    ///
+    /// The view is written back to the deque when `f` returns or unwinds, so the
+    /// deque is left valid even if `f` panics. A deque with no reserved storage
+    /// opens an empty view whose pushes fail with
+    /// [`CollectionError::Core(Error::AllocationExhausted)`].
+    pub fn with_view<R>(&mut self, f: impl FnOnce(&mut CompactVecDequeView<'_, T>) -> R) -> R {
+        // Borrow disjoint fields: the resolved slots borrow `storage`, while the
+        // head/length write-back borrows the scalar metadata.
+        let (storage, head, len) = (&mut self.storage, &mut self.head, &mut self.len);
+        let empty: &mut [MaybeUninit<MaybeUninit<T>>] = &mut [];
+        let slots = match storage {
+            Some(allocation) => allocation.uninit_capacity_mut(),
+            None => empty,
+        };
+        let mut view = CompactVecDequeView {
+            slots,
+            head: *head,
+            len: *len,
+            head_out: head,
+            len_out: len,
+        };
+        f(&mut view)
+    }
+}
+
+impl<T: CompactValue> CompactVecDequeView<'_, T> {
+    /// Return the number of stored values.
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+    /// Return allocated slot capacity.
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+    /// Return whether the view holds no values.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Return the front value.
+    pub fn front(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            // SAFETY: the front slot is initialized while the deque is nonempty.
+            Some(unsafe {
+                self.slots[self.head as usize]
+                    .assume_init_ref()
+                    .assume_init_ref()
+            })
+        }
+    }
+    /// Return the back value.
+    pub fn back(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            let physical = CompactVecDeque::<T>::physical_index(
+                self.head as usize,
+                self.len as usize - 1,
+                self.slots.len(),
+            );
+            // SAFETY: the back slot is initialized while the deque is nonempty.
+            Some(unsafe { self.slots[physical].assume_init_ref().assume_init_ref() })
+        }
+    }
+    /// Return a logical element by index.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len as usize {
+            None
+        } else {
+            let physical =
+                CompactVecDeque::<T>::physical_index(self.head as usize, index, self.slots.len());
+            // SAFETY: `index < len` selects a unique initialized slot.
+            Some(unsafe { self.slots[physical].assume_init_ref().assume_init_ref() })
+        }
+    }
+    /// Mutably borrow a logical element by index.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len as usize {
+            None
+        } else {
+            let physical =
+                CompactVecDeque::<T>::physical_index(self.head as usize, index, self.slots.len());
+            // SAFETY: the view is exclusively borrowed and each logical slot is unique.
+            Some(unsafe { self.slots[physical].assume_init_mut().assume_init_mut() })
+        }
+    }
+    /// Append a value at the back, or fail if the view is at capacity.
+    pub fn push_back(&mut self, value: T) -> Result<()> {
+        let capacity = self.slots.len();
+        if self.len as usize >= capacity {
+            return Err(CollectionError::Core(Error::AllocationExhausted));
+        }
+        let at =
+            CompactVecDeque::<T>::physical_index(self.head as usize, self.len as usize, capacity);
+        // SAFETY: `len < capacity` and `physical_index` maps the logical tail
+        // into the allocated ring range.
+        unsafe { self.slots.get_unchecked_mut(at) }.write(MaybeUninit::new(value));
+        self.len += 1;
+        Ok(())
+    }
+    /// Prepend a value at the front, or fail if the view is at capacity.
+    pub fn push_front(&mut self, value: T) -> Result<()> {
+        let capacity = self.slots.len();
+        if self.len as usize >= capacity {
+            return Err(CollectionError::Core(Error::AllocationExhausted));
+        }
+        let head = if self.len == 0 {
+            0
+        } else if self.head == 0 {
+            (capacity - 1) as u32
+        } else {
+            self.head - 1
+        };
+        // SAFETY: the empty case selects slot zero; otherwise the previous head
+        // is within the nonzero allocation.
+        unsafe { self.slots.get_unchecked_mut(head as usize) }.write(MaybeUninit::new(value));
+        self.head = head;
+        self.len += 1;
+        Ok(())
+    }
+    /// Remove and return the front value.
+    pub fn pop_front(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let at = self.head as usize;
+        let capacity = self.slots.len();
+        // SAFETY: the front slot is initialized and removed exactly once.
+        let value = unsafe {
+            self.slots
+                .get_unchecked_mut(at)
+                .assume_init_read()
+                .assume_init_read()
+        };
+        self.head = if self.len == 1 || at + 1 == capacity {
+            0
+        } else {
+            self.head + 1
+        };
+        self.len -= 1;
+        Some(value)
+    }
+    /// Remove and return the back value.
+    pub fn pop_back(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let at = CompactVecDeque::<T>::physical_index(
+            self.head as usize,
+            self.len as usize - 1,
+            self.slots.len(),
+        );
+        // SAFETY: positive length and a valid head map the logical back into the
+        // ring, and the initialized slot is removed exactly once.
+        let value = unsafe {
+            self.slots
+                .get_unchecked_mut(at)
+                .assume_init_read()
+                .assume_init_read()
+        };
+        self.len -= 1;
+        if self.len == 0 {
+            self.head = 0;
+        }
+        Some(value)
+    }
+    /// Iterate over the view in logical order.
+    pub fn iter(&self) -> CompactVecDequeIter<'_, T> {
+        let capacity = self.slots.len();
+        let head = self.head as usize;
+        let len = self.len as usize;
+        let back_index = if len == 0 {
+            head
+        } else {
+            CompactVecDeque::<T>::physical_index(head, len - 1, capacity)
+        };
+        CompactVecDequeIter {
+            slots: self.slots,
+            capacity,
+            front_index: head,
+            back_index,
+            remaining: len,
+        }
+    }
+}
+
+impl<T: CompactValue> Drop for CompactVecDequeView<'_, T> {
+    fn drop(&mut self) {
+        // Write the ring metadata back even when the closure unwinds so the
+        // deque stays valid and sees every completed operation.
+        *self.head_out = self.head;
+        *self.len_out = self.len;
+    }
+}
 struct DequeDropGuard<T: CompactValue> {
     deque: *mut CompactVecDeque<T>,
     armed: bool,
