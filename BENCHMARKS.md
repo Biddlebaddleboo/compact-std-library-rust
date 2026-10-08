@@ -719,3 +719,85 @@ round of quote updates can borrow `CompactVec::as_mut_slice()` once per round
 instead of indexing per update (`IndexMut` re-resolves the header per access);
 this is an available usage pattern, not a library change, so the shared
 benchmark retains its per-index workload.
+
+## V2.4 round-two methodology correction and production-representative ratios
+
+Baseline `1271594` plus the round-two harness commit `490eddd`. Two
+consecutive release suites were captured and all 16 native/compact checksums
+matched in both measurement modes (`benchmark_compare --self-check`).
+
+**Correction to the section above.** Those suites ran with allocator
+accounting ON. "Measure" mode installs a counting global allocator so the suite
+can report allocation statistics. Compact collections allocate inside the cage
+rather than through the global allocator, so the counter's atomic cost lands
+almost entirely on the *native* variant. The compact/native ratios recorded
+above are therefore instrumented and systematically flatter compact; the claim
+that they were "uninstrumented" was wrong. The absolute compact times were
+unaffected (mode-invariant within ~1%), which is why only the native
+denominator moved.
+
+Round two splits the harness: `--mode measure` keeps full accounting for
+allocation statistics, `--mode profile` drops per-allocation counting and
+per-phase allocator snapshots, and the new `benchmark_profile` example runs the
+same scenario code with no counting allocator installed at all. Only the
+accounting-free runs are production-representative for timing.
+
+Paired, interleaved capture (five alternating measure/profile suites with
+`--order alternate`, nine repetitions per phase, same clean release artifact;
+medians in ms):
+
+| Scenario | Measure native | Measure compact | Measure ratio | Profile native | Profile compact | Production ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A2 allocation | 1.733 | 1.801 | 1.04x | 1.177 | 1.795 | **1.53x** |
+| A4 deque | 0.354 | 1.291 | 3.65x | 0.359 | 1.288 | 3.58x |
+| A5 hash | 1.173 | 3.258 | 2.78x | 1.167 | 3.248 | 2.78x |
+| B6 order book | 0.039 | 0.089 | 2.30x | 0.038 | 0.089 | 2.34x |
+| B8 cache churn | 11.705 | 24.101 | 2.06x | 10.184 | 24.057 | 2.36x |
+| B10 concurrent | 1.251 | 2.835 | 2.27x | 0.315 | 2.790 | **8.87x** |
+| B3 request batch (sentinel) | 32.833 | 17.224 | 0.52x | 25.644 | 17.369 | 0.68x |
+| B5 dispatch (sentinel) | 8.792 | 5.152 | 0.59x | 6.926 | 5.166 | 0.75x |
+
+Corrected production picture: A2 is not near-native (1.53x, not 1.04x), B8 is
+worse than recorded (2.36x), and B10 is far worse than recorded. B10 remains
+the noisiest scenario on this two-vCPU host (compact medians span roughly
+0.9-2.8 ms across captures, so the production ratio ranges about 2x to 9x); its
+lock/atomic attribution is confirmed by system-wide sampling, not a single
+number. B3/B5 remain genuine compact wins, though smaller (0.68x / 0.75x).
+A4/A5/B6 are essentially accounting-invariant because those scenarios barely
+touch the global allocator on the native side.
+
+### Harness methodology facts that must travel with any numbers
+
+- Per-process `perf record` samples no CPU for the B10 worker threads even
+  with a long window; only system-wide capture (`-a`) recovers them. The
+  round-one "native B10 has no samples" was this, not an idle process.
+- `target/release/examples/benchmark_compare` is a hardlink that concurrent
+  feature-different builds re-point. A sibling `allocator-telemetry` build
+  inflated compact A2/B8/B3/B10 badly (A2 7.4x). Always benchmark an explicit
+  hashed, telemetry-free artifact; `--self-check` guards checksum equivalence.
+- The legacy allocator uprobes distorted runtime ~25-27x and mis-paired lock
+  and transaction lifetimes; they are retired in favour of low-overhead
+  sampling.
+
+### Round-two optimization outcome (negative results, recorded)
+
+No production change was landed; every candidate was rejected on evidence:
+
+- Deque/vector/map: the remaining A4/B6/B8 cost is the intrinsic per-operation
+  cage-header validation under the frozen 12-byte deque / no-retained-pointer
+  layouts. `read_header` has zero out-of-line symbols (fully inlined) and is no
+  longer a top self symbol. Batching `as_mut_slice()` once per update round is
+  documented as a caller pattern, not a benchmark-only shortcut.
+- Hash: `find_slot_in` probing plus the SIMD classifier is the residual; the
+  classifier touches only ~3-15% of samples and no change reached the target
+  without altering hashing security, which the plan forbids.
+- Allocator: the largest allocator symbol in B8 is `release_many_locked` at
+  ~5.9% (allocator total ~20%, hash map ~50%); removing the allocator entirely
+  would still leave B8 near 1.6x. B10 is ~60% lock/futex/atomic machinery, so
+  no critical-section shortening reaches the target; closing it needs a
+  synchronization/design change the plan forbids. Micro-experiments fell below
+  the ~1.2% harness resolution and were not landed.
+
+The round-two profile evidence, codegen comparison, and memory-reconciliation
+details are in `PROFILE_V2_4_ROUND2.md`; allocator-specific measurements are in
+`PROFILE_ALLOCATOR.md`.

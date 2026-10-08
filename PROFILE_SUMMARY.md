@@ -168,3 +168,27 @@ The full-suite outputs are `/tmp/profile-baseline-run1.tsv` and
 `/tmp/csl-collection-profile/`. Machine-specific raw profiles remain outside
 the repository. The checked-in workstream scripts record the commands and
 reproduction settings.
+
+## Round-two update
+
+A second profiling round (`PROFILE_V2_4_ROUND2.md`) re-measured the tree after
+the round-one optimizations and after the benchmark-methodology change. It
+supersedes the numbers above in two ways:
+
+- The headline ratios recorded here were captured with the harness
+  `CountingAllocator` installed. That counter charges its atomic cost to the
+  native variant only, because compact collections allocate from the cage
+  rather than the global allocator, so the ratios above are instrumented and
+  systematically flatter compact. The production-representative
+  (accounting-free) ratios are A2 1.53x, A4 3.58x, A5 2.78x, B6 2.34x,
+  B8 2.36x, B10 ~2-9x (host-noise band), B3 0.68x, B5 0.75x.
+- Per-process sampling never captured the B10 worker threads; only
+  system-wide capture does. The B10 concurrency path is now attributed with
+  valid low-overhead samples: roughly 60% lock/futex/atomic machinery versus
+  native malloc/cfree in per-thread tcaches.
+
+`read_header` has zero out-of-line symbols on both aarch64 and x86-64, so the
+remaining A4/B6/B8 distance is the intrinsic per-operation cage-header
+validation under the frozen layouts, not a redundant helper call. No
+production change was landed in round two; the candidates and their quantified
+ceilings are recorded in `PROFILE_V2_4_ROUND2.md` and `BENCHMARKS.md`.
