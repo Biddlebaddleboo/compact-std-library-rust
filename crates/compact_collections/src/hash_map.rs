@@ -141,6 +141,32 @@ impl SipHasher24 {
         self.round();
         self.v0 ^= word;
     }
+
+    /// Append an integer's native byte representation to the SipHash stream.
+    /// `value` is arranged as if those bytes had been read as a little-endian
+    /// word, which lets the common integer `Hash` implementations avoid
+    /// materializing a temporary byte slice.
+    #[inline]
+    fn write_integer(&mut self, value: u64, byte_len: usize) {
+        self.length = self.length.wrapping_add(byte_len as u64);
+        let tail_len = self.tail_len as usize;
+        let available = 8 - tail_len;
+        if byte_len < available {
+            self.tail |= value << (tail_len * 8);
+            self.tail_len += byte_len as u8;
+            return;
+        }
+
+        self.tail |= value << (tail_len * 8);
+        self.compress(self.tail);
+        let remaining = byte_len - available;
+        self.tail = if remaining == 0 {
+            0
+        } else {
+            value >> (available * 8)
+        };
+        self.tail_len = remaining as u8;
+    }
 }
 impl Hasher for SipHasher24 {
     fn finish(&self) -> u64 {
@@ -155,15 +181,78 @@ impl Hasher for SipHasher24 {
     }
     fn write(&mut self, bytes: &[u8]) {
         self.length = self.length.wrapping_add(bytes.len() as u64);
-        for byte in bytes {
-            self.tail |= (*byte as u64) << (self.tail_len * 8);
-            self.tail_len += 1;
+
+        let mut remaining = bytes;
+        if self.tail_len != 0 {
+            let fill = (8 - self.tail_len as usize).min(remaining.len());
+            for byte in &remaining[..fill] {
+                self.tail |= (*byte as u64) << (self.tail_len * 8);
+                self.tail_len += 1;
+            }
+            remaining = &remaining[fill..];
             if self.tail_len == 8 {
                 self.compress(self.tail);
                 self.tail = 0;
                 self.tail_len = 0;
             }
         }
+
+        let mut words = remaining.chunks_exact(8);
+        for word in &mut words {
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(word);
+            self.compress(u64::from_le_bytes(bytes));
+        }
+        for byte in words.remainder() {
+            self.tail |= (*byte as u64) << (self.tail_len * 8);
+            self.tail_len += 1;
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.write_integer(u64::from(value.to_le()), 1);
+    }
+    #[inline]
+    fn write_i8(&mut self, value: i8) {
+        self.write_integer(u64::from(value.to_le() as u8), 1);
+    }
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.write_integer(u64::from(value.to_le()), 2);
+    }
+    #[inline]
+    fn write_i16(&mut self, value: i16) {
+        self.write_integer(u64::from(value.to_le() as u16), 2);
+    }
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.write_integer(u64::from(value.to_le()), 4);
+    }
+    #[inline]
+    fn write_i32(&mut self, value: i32) {
+        self.write_integer(u64::from(value.to_le() as u32), 4);
+    }
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.write_integer(value.to_le(), 8);
+    }
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        self.write_integer(value.to_le() as u64, 8);
+    }
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write_integer(value.to_le() as u64, core::mem::size_of::<usize>());
+    }
+    #[inline]
+    fn write_isize(&mut self, value: isize) {
+        self.write_integer(value.to_le() as usize as u64, core::mem::size_of::<isize>());
+    }
+    fn write_u128(&mut self, value: u128) {
+        self.write(&value.to_ne_bytes());
+    }
+    fn write_i128(&mut self, value: i128) {
+        self.write(&value.to_ne_bytes());
     }
 }
 
@@ -871,13 +960,18 @@ unsafe impl<T: CompactValue + Hash + Eq, S: BuildHasher + CompactValue> CompactV
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_control_group, CompactHashMap, CompactValue, EMPTY, FULL, TOMBSTONE};
+    use super::{
+        classify_control_group, CompactHashMap, CompactValue, SipHasher24, EMPTY, FULL, TOMBSTONE,
+    };
     use crate::hash_control::{self, ControlGroupMask, WIDTH};
     use compact_backend_std::{CageConfig, CompactRuntime};
-    use core::hash::{BuildHasher, Hasher};
+    use core::hash::{BuildHasher, Hash, Hasher};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::OnceLock;
 
     static INIT: OnceLock<()> = OnceLock::new();
+    static REHASH_PANIC_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
 
     fn init() {
         INIT.get_or_init(|| {
@@ -914,6 +1008,22 @@ mod tests {
     }
     // SAFETY: this is a zero-sized native hasher builder.
     unsafe impl CompactValue for IdentityBuildHasher {}
+
+    #[derive(Eq, PartialEq)]
+    struct RehashPanicKey(u32);
+
+    impl core::hash::Hash for RehashPanicKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            assert_ne!(
+                self.0,
+                REHASH_PANIC_KEY.load(Ordering::Relaxed),
+                "requested key hash panic during rehash"
+            );
+            self.0.hash(state);
+        }
+    }
+    // SAFETY: the key contains only a u32.
+    unsafe impl CompactValue for RehashPanicKey {}
 
     #[test]
     fn control_group_access_matches_lane_reference_for_every_wrap_and_partial_range() {
@@ -991,5 +1101,167 @@ mod tests {
             map.insert(key, key ^ 0xa5a5).unwrap();
         }
         assert_probe_matches_scalar(&map);
+    }
+
+    #[test]
+    fn siphash24_matches_reference_vectors() {
+        const VECTORS: [u64; 16] = [
+            0x726f_db47_dd0e_0e31,
+            0x74f8_39c5_93dc_67fd,
+            0x0d6c_8009_d9a9_4f5a,
+            0x8567_6696_d7fb_7e2d,
+            0xcf27_94e0_2771_87b7,
+            0x1876_5564_cd99_a68d,
+            0xcbc9_466e_58fe_e3ce,
+            0xab02_00f5_8b01_d137,
+            0x93f5_f579_9a93_2462,
+            0x9e00_82df_0ba9_e4b0,
+            0x7a5d_bbc5_94dd_b9f3,
+            0xf4b3_2f46_226b_ada7,
+            0x751e_8fbc_860e_e5fb,
+            0x14ea_5627_c084_3d90,
+            0xf723_ca90_8e7a_f2ee,
+            0xa129_ca61_49be_45e5,
+        ];
+        let message: Vec<u8> = (0..VECTORS.len() as u8).collect();
+
+        for (length, expected) in VECTORS.into_iter().enumerate() {
+            let mut hasher = SipHasher24::new(0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908);
+            hasher.write(&message[..length]);
+            assert_eq!(hasher.finish(), expected, "message length={length}");
+        }
+    }
+
+    #[test]
+    fn siphash_integer_writes_match_native_byte_streams_at_every_tail_offset() {
+        for prefix_len in 0..8 {
+            let prefix: Vec<u8> = (0..prefix_len).map(|index| (index * 19) as u8).collect();
+            let mut typed = SipHasher24::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+            typed.write(&prefix);
+            typed.write_u8(0xa5);
+            typed.write_i8(-42);
+            typed.write_u16(0x1234);
+            typed.write_i16(-0x1234);
+            typed.write_u32(0x89ab_cdef);
+            typed.write_i32(-0x1234_567);
+            typed.write_u64(0xfedc_ba98_7654_3210);
+            typed.write_i64(-0x1234_5678_9abc_def);
+            typed.write_usize(0x1234_5678);
+            typed.write_isize(-0x1234_567);
+            typed.write_u128(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+            typed.write_i128(-0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+
+            let mut bytes = prefix;
+            bytes.extend_from_slice(&0xa5_u8.to_ne_bytes());
+            bytes.extend_from_slice(&(-42_i8).to_ne_bytes());
+            bytes.extend_from_slice(&0x1234_u16.to_ne_bytes());
+            bytes.extend_from_slice(&(-0x1234_i16).to_ne_bytes());
+            bytes.extend_from_slice(&0x89ab_cdef_u32.to_ne_bytes());
+            bytes.extend_from_slice(&(-0x1234_567_i32).to_ne_bytes());
+            bytes.extend_from_slice(&0xfedc_ba98_7654_3210_u64.to_ne_bytes());
+            bytes.extend_from_slice(&(-0x1234_5678_9abc_def_i64).to_ne_bytes());
+            bytes.extend_from_slice(&0x1234_5678_usize.to_ne_bytes());
+            bytes.extend_from_slice(&(-0x1234_567_isize).to_ne_bytes());
+            bytes.extend_from_slice(&0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_u128.to_ne_bytes());
+            bytes.extend_from_slice(
+                &(-0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_i128).to_ne_bytes(),
+            );
+
+            let mut reference = SipHasher24::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+            reference.write(&bytes);
+            assert_eq!(
+                typed.finish(),
+                reference.finish(),
+                "prefix length={prefix_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_hash_trait_uses_the_same_native_byte_stream() {
+        let mut typed = SipHasher24::new(7, 11);
+        0x89ab_cdef_u32.hash(&mut typed);
+
+        let mut bytes = SipHasher24::new(7, 11);
+        bytes.write(&0x89ab_cdef_u32.to_ne_bytes());
+        assert_eq!(typed.finish(), bytes.finish());
+    }
+
+    #[test]
+    fn siphash_fragmented_writes_match_one_contiguous_write() {
+        let bytes: Vec<u8> = (0..40).map(|index| (index * 37) as u8).collect();
+        for length in 0..=bytes.len() {
+            let mut contiguous = SipHasher24::new(13, 29);
+            contiguous.write(&bytes[..length]);
+
+            for split in 0..=length {
+                let mut fragmented = SipHasher24::new(13, 29);
+                fragmented.write(&bytes[..split]);
+                fragmented.write(&bytes[split..length]);
+                assert_eq!(
+                    fragmented.finish(),
+                    contiguous.finish(),
+                    "length={length}, split={split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deterministic_model_matches_insert_remove_and_lookup_churn() {
+        init();
+        let mut compact = CompactHashMap::with_capacity_and_hasher(1, IdentityBuildHasher).unwrap();
+        let mut native = HashMap::new();
+        let mut state = 0xa341_316c_u32;
+
+        for step in 0..4096_u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let key = state % 257;
+            match state.rotate_left(7) % 4 {
+                0 => {
+                    let value = step.wrapping_mul(31) ^ state;
+                    assert_eq!(
+                        compact.insert(key, value).unwrap(),
+                        native.insert(key, value)
+                    );
+                }
+                1 => assert_eq!(compact.remove(&key), native.remove(&key)),
+                2 => assert_eq!(compact.get(&key), native.get(&key)),
+                _ => {
+                    assert_eq!(compact.contains_key(&key), native.contains_key(&key));
+                    assert_eq!(compact.len(), native.len());
+                }
+            }
+        }
+
+        assert_eq!(compact.len(), native.len());
+        for key in 0..257 {
+            assert_eq!(compact.get(&key), native.get(&key), "key={key}");
+        }
+    }
+
+    #[test]
+    fn rehash_hash_panic_keeps_every_pair_in_the_old_table() {
+        init();
+        REHASH_PANIC_KEY.store(u32::MAX, Ordering::Relaxed);
+        let mut map = CompactHashMap::with_capacity(1).unwrap();
+        map.insert(RehashPanicKey(7), 49_u32).unwrap();
+        let original_capacity = map.capacity();
+
+        REHASH_PANIC_KEY.store(7, Ordering::Relaxed);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = map.reserve(100);
+        }));
+        REHASH_PANIC_KEY.store(u32::MAX, Ordering::Relaxed);
+
+        assert!(result.is_err());
+        assert_eq!(map.capacity(), original_capacity);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&RehashPanicKey(7)), Some(&49));
+        assert!(map.reserve(usize::MAX).is_err());
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&RehashPanicKey(7)), Some(&49));
     }
 }
