@@ -679,3 +679,43 @@ tests, strict Clippy, Apple x86-64 target check, full repository Miri workflow,
 and workspace release build. Release assembly was inspected on AArch64 and
 x86-64. No prefetch instruction, new inline assembly, object field, retained
 pointer, or layout change was introduced.
+
+## V2.4 profile-driven optimization results
+
+Implementation of the profile-driven plan on top of the pinned profiling
+baseline removed redundant cage-header resolution and cross-crate accessor
+calls. Two consecutive uninstrumented release suites were captured with
+`json,toml`; every native/compact and run-to-run checksum matched. End-to-end
+medians and p95 are milliseconds over the default per-scenario repetitions.
+
+| Scenario | Native med / p95 | Compact med / p95 | Ratio (run 1 / run 2) | Checksum |
+| --- | ---: | ---: | ---: | ---: |
+| A2 allocation | 1.755 / 1.883 ms | 1.830 / 2.140 ms | 1.04x / 1.04x | 6387817404620238636 |
+| A4 deque | 0.291 / 0.332 ms | 1.283 / 1.385 ms | 4.40x / 4.42x | 2758306198405373103 |
+| A5 hash | 1.166 / 1.340 ms | 3.248 / 3.314 ms | 2.78x / 2.77x | 17351022467741104803 |
+| B3 request batch (sentinel) | 34.847 / 38.523 ms | 17.597 / 18.189 ms | 0.50x / 0.49x | 7757156252336854840 |
+| B5 dispatch (sentinel) | 8.900 / 9.984 ms | 5.186 / 5.243 ms | 0.58x / 0.57x | 7959229199864024003 |
+| B6 order book | 0.040 / 0.069 ms | 0.089 / 0.159 ms | 2.25x / 2.24x | 14879364451954781671 |
+| B8 cache churn | 12.010 / 12.814 ms | 24.192 / 24.731 ms | 2.01x / 2.02x | 10141254246637991735 |
+| B10 concurrent allocation | 1.295 / 2.075 ms | 2.744 / 3.172 ms | 2.12x / 2.18x | 214883317414038028 |
+
+Relative to the profiled baseline, the compact/native gap narrowed on the
+primary scenarios (A2 ~1.32-1.44x to 1.04x, A5 ~3.93-4.11x to 2.78x, B6
+~3.49-3.65x to 2.25x, B8 ~2.54-2.59x to 2.01x), the B3/B5 sentinels stayed
+comfortably ahead of native, and B10 stayed within its previously documented
+host-noise band. Changes: `CompactHashMap::{insert,get_mut,remove_entry}`
+resolve each table allocation once per operation, `CompactVec::push` appends
+through `CageAllocation::extend_from_iter` to resolve the owner header once,
+and the hot `CageAllocation`/header-resolution accessors are `#[inline]` so
+they can fold across the non-LTO crate boundary. No layout, size, unsafe
+contract, hashing, or accounting change was made; the intrusive allocator Miri
+suite is green.
+
+A4 remains the widest gap. Each `push_back`/`pop_front` already performs exactly
+one essential cage-header resolution, and eliminating it would require caching a
+validated native view across operations, which the frozen 12-byte deque layout
+and no-persistent-pointer contract forbid. For B6, a caller that batches a
+round of quote updates can borrow `CompactVec::as_mut_slice()` once per round
+instead of indexing per update (`IndexMut` re-resolves the header per access);
+this is an available usage pattern, not a library change, so the shared
+benchmark retains its per-index workload.
