@@ -801,3 +801,88 @@ No production change was landed; every candidate was rejected on evidence:
 The round-two profile evidence, codegen comparison, and memory-reconciliation
 details are in `PROFILE_V2_4_ROUND2.md`; allocator-specific measurements are in
 `PROFILE_ALLOCATOR.md`.
+
+## V2.4 round-three results (CI repair, hash lookup, deque batch view)
+
+### Benchmark CI repair: lockfile policy
+
+GitHub Actions run 37725406606 failed at the contract step with
+`error: cannot update the lock file ... because --locked was passed` — it was
+**not** a checksum mismatch. Root cause: the committed `Cargo.lock` carried
+seven trailing `[[patch.unused]]` blocks for the local `compact_*` crates. Those
+entries are written by a developer-host `[patch.crates-io]` configuration (a
+`~/.cargo`/`/.cargo` file, not part of the repository); CI has no such patch, so
+cargo must drop the entries and `--locked` refuses to proceed.
+
+Policy for this repository:
+
+- `Cargo.lock` is tracked and must stay free of `[[patch.unused]]` blocks; those
+  are a local-configuration artifact, not repository state.
+- If a local `[patch.crates-io]` config is active, run cargo once without
+  `--locked` only to resolve, then restore the tracked lock (`git checkout --
+  Cargo.lock`) before committing. Verify with
+  `cargo metadata --locked` in a config-free shell.
+- Regenerate the lock with the intended toolchain and inspect dependency
+  changes; do not silently drop `--locked` from CI.
+
+With the phantom entries removed, `cargo metadata --locked` and the exact
+workflow command (`benchmark_compare --features json,toml -- --self-check`)
+resolve and pass, 16/16 scenarios, with `Cargo.lock` still at format version 3.
+
+### Hash lookup probe (`find_index_in`) — landed
+
+`CompactHashMap::{get,get_key_value,get_mut,remove_entry}` previously shared
+`find_slot_in`, which tracks the earliest tombstone because `insert` needs an
+insertion slot. Read-only lookups never need that slot, so they now use a
+dedicated `find_index_in` probe that skips tombstones and stops at the first
+`EMPTY`. Probe termination, key equality, the SIMD/scalar classifier and the
+matched slot are unchanged; `find_slot_in` still backs `insert`.
+
+| Phase (A5) | baseline | candidate |
+|---|---|---|
+| `lookup_scan` | 0.459–0.465 ms | 0.445–0.456 ms |
+| `mutation` | 0.774–0.790 ms | 0.757–0.763 ms |
+| `end_to_end` | 3.230–3.266 ms | 3.119–3.165 ms |
+
+Two independent A/B captures (interleaved, 5–9 rounds, accounting-free profile
+mode) agree on ~4% off `lookup_scan`; B8/B5 were neutral and the logical checksum
+was identical. Hash-flood defense and the randomized default hash are untouched.
+
+### Deque borrow-scoped batch view (`with_view`) — landed, opt-in
+
+Every `CompactVecDeque::{push_back,pop_front}` resolves and fully re-validates
+the backing cage allocation, which dominates steady-state A4 churn. A new
+borrow-scoped `CompactVecDeque::with_view` resolves the ring once for a whole
+batch of non-growing front/back operations. It stores only a borrow-scoped slot
+slice plus head/len and writes the metadata back on return, early return and
+unwind; the deque keeps its frozen 12-byte layout and retains no native pointer.
+Growth is disallowed while borrowed (reserve first; an over-capacity push returns
+`AllocationExhausted` with the deque left valid).
+
+A4 mutation phase with the batched call pattern: **1.252 ms → 0.119 ms** (native
+per-op is 0.356 ms); `end_to_end` 1.292 ms → 0.157 ms; identical checksum. This
+is an opt-in call-site pattern: the shared A4 arm still measures ordinary
+per-operation `push_back`/`pop_front` against the native `VecDeque` loop, and was
+deliberately **not** rewired to the batch view, because a batched-compact arm
+against a per-op-native arm would report an API advantage rather than a per-op
+cost and would cease to be a like-for-like comparison.
+
+### Allocator (B10/B8) and vector (B6) — analysis, no landed change
+
+- B10 remains dominated by lock/atomic/futex machinery; the safe, local
+  critical-section shortenings available do not reach the target, and the
+  closed-form fix (bounded thread-local chunks / lock-free reclamation) is gated
+  by the plan: it needs a documented reservation/accounting/publication/remote-
+  free/thread-exit/reclamation contract plus central approval before any code.
+  Recommendation recorded: do **not** implement without that contract.
+- B8's allocator share is smaller than its hash share, so hash-side work matters
+  more; no free-list/coalescing/tail change was landed because none showed a
+  repeatable win with an exact-accounting proof.
+- B6/`CompactVec`: batching `as_mut_slice()` once per order-book update round is a
+  caller pattern (consistent with round-two), not a new API or a benchmark-only
+  change. Codegen inspection found `read_header`/`validate_typed_header` fully
+  inlined with no safe redundant range check to remove without weakening typed
+  header/lifetime validation.
+
+Accepted round-three changes: hash lookup probe, deque batch view, CI lockfile
+repair. The integrated round-three evidence is in `PROFILE_V2_4_ROUND3.md`.
