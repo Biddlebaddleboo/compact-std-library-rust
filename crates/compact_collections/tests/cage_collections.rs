@@ -784,3 +784,93 @@ proptest::proptest! {
         }
     }
 }
+
+/// PLAN_COLLECTIONS B6: updating a `CompactVec` through a single
+/// `as_mut_slice()` borrow per round must match per-element `IndexMut`, and the
+/// vector must stay usable for growth and `retain` once that borrow ends. The
+/// batch form resolves one cage header per round instead of one per element.
+#[test]
+fn compact_vec_batch_mutable_slice_matches_per_index_updates() {
+    init();
+
+    let mut batch = CompactVec::with_capacity(8).unwrap();
+    let mut indexed = CompactVec::with_capacity(8).unwrap();
+    for value in 0..5_u64 {
+        batch.push(value).unwrap();
+        indexed.push(value).unwrap();
+    }
+
+    for round in 0..6_u64 {
+        // Batch form: resolve the writable slice once for the whole round.
+        {
+            let levels = batch.as_mut_slice();
+            for (lane, level) in levels.iter_mut().enumerate() {
+                *level = level.wrapping_add(round * 10 + lane as u64);
+            }
+        }
+        // IndexMut form: resolve the writable slice once per element.
+        for lane in 0..indexed.len() {
+            indexed[lane] = indexed[lane].wrapping_add(round * 10 + lane as u64);
+        }
+        assert_eq!(batch.as_slice(), indexed.as_slice());
+
+        // Growth after the batch borrow ends must preserve the updated prefix.
+        if round % 2 == 0 {
+            batch.push(1_000 + round).unwrap();
+            indexed.push(1_000 + round).unwrap();
+        }
+    }
+
+    // Batched updates compose with `retain` exactly like native vectors.
+    batch.retain(|value| value % 3 != 0);
+    indexed.retain(|value| value % 3 != 0);
+    assert_eq!(batch.as_slice(), indexed.as_slice());
+    assert_eq!(batch.len(), indexed.len());
+}
+
+/// A panic inside `PartialEq::eq` reached from the single-resolution probe must
+/// leave the map unchanged and fully usable: `insert`/`get` never mutate the
+/// table before the probe has returned a slot.
+#[test]
+fn compact_map_panicking_equality_leaves_the_map_unchanged() {
+    init();
+
+    struct EqPanicKey(u8);
+    impl Hash for EqPanicKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+    impl PartialEq for EqPanicKey {
+        fn eq(&self, other: &Self) -> bool {
+            assert_ne!(other.0, u8::MAX, "requested key equality panic");
+            self.0 == other.0
+        }
+    }
+    impl Eq for EqPanicKey {}
+    // SAFETY: `EqPanicKey` is a plain `u8` wrapper moved by value into the cage.
+    unsafe impl CompactValue for EqPanicKey {}
+
+    let mut map = CompactHashMap::with_hasher(ConstantBuildHasher);
+    for key in 0..6_u8 {
+        assert_eq!(map.insert(EqPanicKey(key), u32::from(key) * 3).unwrap(), None);
+    }
+    let len_before = map.len();
+    assert_eq!(len_before, 6);
+
+    let insert = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = map.insert(EqPanicKey(u8::MAX), 999);
+    }));
+    assert!(insert.is_err());
+    assert_eq!(map.len(), len_before);
+    for key in 0..6_u8 {
+        assert_eq!(map.get(&EqPanicKey(key)), Some(&(u32::from(key) * 3)));
+    }
+
+    let lookup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = map.get(&EqPanicKey(u8::MAX));
+    }));
+    assert!(lookup.is_err());
+    assert_eq!(map.len(), len_before);
+    assert_eq!(map.get(&EqPanicKey(2)), Some(&6));
+}
