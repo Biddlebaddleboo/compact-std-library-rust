@@ -308,26 +308,41 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     /// Insert a key-value pair, returning the previous value when replacing.
     pub fn insert(&mut self, key: K, value: V) -> Result<Option<V>> {
         self.ensure_insert_capacity()?;
+        // Resolve and validate both table allocations exactly once for this
+        // operation. A single validated borrow-scoped view then drives both the
+        // probe and the mutation, instead of re-reading each cage header for the
+        // control and entry tables on every access.
         let hash = self.hash(&key);
-        if let Some((index, found)) = self.find_slot(&key, hash) {
-            if found {
-                let pair = unsafe {
-                    self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_mut()
-                };
-                return Ok(Some(core::mem::replace(&mut pair.1, value)));
-            }
-            let control = &mut self.control.as_mut().unwrap().as_mut_slice()[index];
-            if *control == TOMBSTONE {
-                self.tombstones -= 1;
-            }
-            self.entries.as_mut().unwrap().as_mut_slice()[index].write((key, value));
-            *control = FULL;
-            self.len += 1;
-            return Ok(None);
+        let Some(control_allocation) = self.control.as_mut() else {
+            return Err(CollectionError::Core(
+                compact_core::Error::AllocationExhausted,
+            ));
+        };
+        let Some(entries_allocation) = self.entries.as_mut() else {
+            return Err(CollectionError::Core(
+                compact_core::Error::AllocationExhausted,
+            ));
+        };
+        let control = control_allocation.as_mut_slice();
+        let entries = entries_allocation.as_mut_slice();
+        let Some((index, found)) = Self::find_slot_in(control, entries, &key, hash) else {
+            return Err(CollectionError::Core(
+                compact_core::Error::AllocationExhausted,
+            ));
+        };
+        if found {
+            // SAFETY: a FULL slot holds one initialized pair and the map is
+            // exclusively borrowed for the duration of the probe view.
+            let pair = unsafe { entries[index].assume_init_mut() };
+            return Ok(Some(core::mem::replace(&mut pair.1, value)));
         }
-        Err(CollectionError::Core(
-            compact_core::Error::AllocationExhausted,
-        ))
+        if control[index] == TOMBSTONE {
+            self.tombstones -= 1;
+        }
+        entries[index].write((key, value));
+        control[index] = FULL;
+        self.len += 1;
+        Ok(None)
     }
 
     /// Return a value by key.
@@ -366,15 +381,17 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         Q: Hash + Eq + ?Sized,
     {
         let hash = self.hash(key);
-        let (index, found) = self.find_slot(key, hash)?;
-        found.then(|| {
+        // Resolve the control table once and the entry table once mutably, so
+        // the probe and the returned value share a single validated view.
+        let control = self.control.as_ref()?.as_slice();
+        let entries = self.entries.as_mut()?.as_mut_slice();
+        let (index, found) = Self::find_slot_in(control, entries, key, hash)?;
+        if found {
             // SAFETY: the map is exclusively borrowed and the slot is initialized.
-            unsafe {
-                &mut self.entries.as_mut().unwrap().as_mut_slice()[index]
-                    .assume_init_mut()
-                    .1
-            }
-        })
+            Some(unsafe { &mut entries[index].assume_init_mut().1 })
+        } else {
+            None
+        }
     }
     /// Return whether a key is present.
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -391,15 +408,19 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
         Q: Hash + Eq + ?Sized,
     {
         let hash = self.hash(key);
-        let (index, found) = self.find_slot(key, hash)?;
+        // Resolve both tables exactly once and mutate through the same verified
+        // views that located the slot.
+        let control = self.control.as_mut()?.as_mut_slice();
+        let entries = self.entries.as_mut()?.as_mut_slice();
+        let (index, found) = Self::find_slot_in(control, entries, key, hash)?;
         if !found {
             return None;
         }
-        self.control.as_mut().unwrap().as_mut_slice()[index] = TOMBSTONE;
+        control[index] = TOMBSTONE;
         self.len -= 1;
         self.tombstones += 1;
         // SAFETY: control state was FULL and the slot is now logically vacant.
-        Some(unsafe { self.entries.as_mut().unwrap().as_mut_slice()[index].assume_init_read() })
+        Some(unsafe { entries[index].assume_init_read() })
     }
     /// Remove a key and return its value.
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
@@ -554,6 +575,7 @@ impl<K: CompactValue + Hash + Eq, V: CompactValue, S: BuildHasher + CompactValue
     fn hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
         self.hash_builder.hash_one(key)
     }
+    #[cfg(test)]
     fn find_slot<Q>(&self, key: &Q, hash: u64) -> Option<(usize, bool)>
     where
         K: Borrow<Q>,
@@ -1238,6 +1260,60 @@ mod tests {
 
         assert_eq!(compact.len(), native.len());
         for key in 0..257 {
+            assert_eq!(compact.get(&key), native.get(&key), "key={key}");
+        }
+    }
+
+    #[test]
+    fn mutable_access_and_entry_removal_match_native_map() {
+        init();
+        let mut compact = CompactHashMap::with_capacity_and_hasher(1, IdentityBuildHasher).unwrap();
+        let mut native = HashMap::new();
+        let mut state = 0x5bd1_e995_u32;
+
+        for step in 0..4096_u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let key = state % 193;
+            match state.rotate_left(9) % 6 {
+                0 => {
+                    let value = step.wrapping_mul(17) ^ state;
+                    assert_eq!(
+                        compact.insert(key, value).unwrap(),
+                        native.insert(key, value)
+                    );
+                }
+                1 => {
+                    let replacement = step ^ 0xdead_beef;
+                    match (compact.get_mut(&key), native.get_mut(&key)) {
+                        (Some(compact_value), Some(native_value)) => {
+                            assert_eq!(*compact_value, *native_value);
+                            *compact_value = replacement;
+                            *native_value = replacement;
+                        }
+                        (None, None) => {}
+                        _ => panic!("get_mut presence mismatch for key {key}"),
+                    }
+                }
+                2 => assert_eq!(compact.remove(&key), native.remove(&key)),
+                3 => assert_eq!(compact.remove_entry(&key), native.remove_entry(&key)),
+                4 => {
+                    compact.retain(|key, value| {
+                        *value = value.wrapping_add(1);
+                        *key % 3 != 0
+                    });
+                    native.retain(|key, value| {
+                        *value = value.wrapping_add(1);
+                        *key % 3 != 0
+                    });
+                }
+                _ => assert_eq!(compact.get(&key), native.get(&key)),
+            }
+        }
+
+        assert_eq!(compact.len(), native.len());
+        for key in 0..193 {
             assert_eq!(compact.get(&key), native.get(&key), "key={key}");
         }
     }
