@@ -3305,8 +3305,7 @@ mod tests {
         );
         assert!(recycled.is_none());
         assert!(
-            PENDING_REUSE_TELEMETRY.scan_depth_histogram[2].load(Ordering::Relaxed)
-                >= depth_before + 1
+            PENDING_REUSE_TELEMETRY.scan_depth_histogram[2].load(Ordering::Relaxed) > depth_before
         );
         assert!(
             PENDING_REUSE_TELEMETRY
@@ -3316,11 +3315,11 @@ mod tests {
         );
         assert!(
             PENDING_REUSE_TELEMETRY.candidate_size_histogram[small_bucket].load(Ordering::Relaxed)
-                >= small_before + 1
+                > small_before
         );
         assert!(
             PENDING_REUSE_TELEMETRY.candidate_size_histogram[large_bucket].load(Ordering::Relaxed)
-                >= large_before + 1
+                > large_before
         );
     }
 

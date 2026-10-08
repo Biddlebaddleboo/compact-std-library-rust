@@ -2,13 +2,17 @@ use compact_std::{
     CompactRuntime, FrozenBuilder, FrozenBytes, FrozenGraph, FrozenString, FrozenVec,
 };
 use core::mem::size_of;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 static INIT: OnceLock<()> = OnceLock::new();
-fn init() {
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn init() -> MutexGuard<'static, ()> {
+    let guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     INIT.get_or_init(|| {
         CompactRuntime::init(compact_std::CageConfig::new(64 * 1024 * 1024)).unwrap()
     });
+    guard
 }
 
 #[compact_std::compact]
@@ -46,7 +50,7 @@ struct Sample {
 
 #[test]
 fn packed_layouts_encode_and_update() {
-    init();
+    let _guard = init();
     let source = LogicalRecord {
         active: true,
         retries: 5,
@@ -102,7 +106,7 @@ fn frozen_descriptors_keep_eight_byte_representations() {
 
 #[test]
 fn frozen_graph_owns_one_immutable_offset_domain() {
-    init();
+    let _guard = init();
     let mut builder = FrozenBuilder::new().unwrap();
     let title = builder.store_str("edge-router").unwrap();
     let ids = builder.store_slice(&[4_u32, 8, 15, 16, 23, 42]).unwrap();
@@ -154,7 +158,7 @@ fn frozen_graph_owns_one_immutable_offset_domain() {
 
 #[test]
 fn ffi_borrow_is_scoped_to_the_compact_owner() {
-    init();
+    let _guard = init();
     let bytes = compact_std::CompactBytes::from_slice(b"native boundary").unwrap();
     let observed = bytes.with_ffi_bytes(|view| {
         assert_eq!(view.as_ptr(), bytes.as_ptr());
@@ -190,7 +194,7 @@ struct DerivedAttributes {
 #[cfg(feature = "json")]
 #[test]
 fn json_and_toml_build_cage_backed_fields_directly() {
-    init();
+    let _guard = init();
     let json = compact_std::json::from_str::<JsonConfig>(
         r#"{"service":"gateway","retries":3,"labels":["api","metrics"]}"#,
     )
@@ -213,7 +217,7 @@ fn json_and_toml_build_cage_backed_fields_directly() {
 #[cfg(feature = "json")]
 #[test]
 fn malformed_json_releases_partially_built_compact_values() {
-    init();
+    let _guard = init();
     let before = CompactRuntime::used_bytes().unwrap();
     let result = compact_std::json::from_str::<JsonConfig>(
         r#"{"service":"partially allocated","retries":"bad","labels":["temporary"]}"#,
@@ -225,7 +229,7 @@ fn malformed_json_releases_partially_built_compact_values() {
 #[cfg(feature = "json")]
 #[test]
 fn serde_derive_applies_rename_defaults_skip_and_unknown_field_rules() {
-    init();
+    let _guard = init();
     let value =
         compact_std::json::from_str::<DerivedAttributes>(r#"{"serverName":"api"}"#).unwrap();
     assert_eq!(value.server_name.as_str(), "api");

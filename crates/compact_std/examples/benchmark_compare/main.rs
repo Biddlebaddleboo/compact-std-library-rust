@@ -202,6 +202,41 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
             cached_exact = stats.exact_size_extents_cached,
             coalesced_exact = stats.exact_size_extents_coalesced_before_cache,
         );
+        let pending_scan_depths = stats
+            .pending_reuse_scan_depth_histogram
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(depth, count)| format!("{depth}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let pending_candidate_sizes = stats
+            .pending_reuse_candidate_size_histogram
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(bucket, count)| {
+                let size = if bucket + 1 == stats.pending_reuse_candidate_size_histogram.len() {
+                    "1024+".to_owned()
+                } else {
+                    (bucket * 8).to_string()
+                };
+                format!("{size}:{count}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "META\tallocator_phase_profile\t{scenario}\t{variant}\t{pending_lookup_ns}\t{layout_ns}\t{lock_wait_ns}\t{free_list_search_ns}\t{bump_allocation_ns}\t{header_initialization_ns}\t{scan_candidates}\t{scan_depths}\t{candidate_sizes}",
+            pending_lookup_ns = stats.pending_lookup_phase_ns,
+            layout_ns = stats.layout_phase_ns,
+            lock_wait_ns = stats.lock_wait_phase_ns,
+            free_list_search_ns = stats.free_list_search_phase_ns,
+            bump_allocation_ns = stats.bump_allocation_phase_ns,
+            header_initialization_ns = stats.header_initialization_phase_ns,
+            scan_candidates = stats.pending_reuse_scan_candidates,
+            scan_depths = pending_scan_depths,
+            candidate_sizes = pending_candidate_sizes,
+        );
         for (class_index, (class_size, (blocks, bytes))) in [32_u32, 40, 112, 528]
             .into_iter()
             .zip(

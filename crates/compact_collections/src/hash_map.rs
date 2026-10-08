@@ -1143,11 +1143,11 @@ mod tests {
             typed.write_u16(0x1234);
             typed.write_i16(-0x1234);
             typed.write_u32(0x89ab_cdef);
-            typed.write_i32(-0x1234_567);
+            typed.write_i32(-0x0123_4567);
             typed.write_u64(0xfedc_ba98_7654_3210);
-            typed.write_i64(-0x1234_5678_9abc_def);
+            typed.write_i64(-0x0123_4567_89ab_cdef);
             typed.write_usize(0x1234_5678);
-            typed.write_isize(-0x1234_567);
+            typed.write_isize(-0x0123_4567);
             typed.write_u128(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
             typed.write_i128(-0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
 
@@ -1157,11 +1157,11 @@ mod tests {
             bytes.extend_from_slice(&0x1234_u16.to_ne_bytes());
             bytes.extend_from_slice(&(-0x1234_i16).to_ne_bytes());
             bytes.extend_from_slice(&0x89ab_cdef_u32.to_ne_bytes());
-            bytes.extend_from_slice(&(-0x1234_567_i32).to_ne_bytes());
+            bytes.extend_from_slice(&(-0x0123_4567_i32).to_ne_bytes());
             bytes.extend_from_slice(&0xfedc_ba98_7654_3210_u64.to_ne_bytes());
-            bytes.extend_from_slice(&(-0x1234_5678_9abc_def_i64).to_ne_bytes());
+            bytes.extend_from_slice(&(-0x0123_4567_89ab_cdef_i64).to_ne_bytes());
             bytes.extend_from_slice(&0x1234_5678_usize.to_ne_bytes());
-            bytes.extend_from_slice(&(-0x1234_567_isize).to_ne_bytes());
+            bytes.extend_from_slice(&(-0x0123_4567_isize).to_ne_bytes());
             bytes.extend_from_slice(&0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_u128.to_ne_bytes());
             bytes.extend_from_slice(
                 &(-0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_i128).to_ne_bytes(),

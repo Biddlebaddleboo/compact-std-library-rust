@@ -573,3 +573,109 @@ release build passed. Release AArch64 assembly showed direct deque slot writes,
 a direct 16-byte contiguous hash control load, and one-slice `Copy` retain
 compaction. The x86-64 SSE2 classifier also loads contiguous groups directly
 (`movdqu`). Neither assembly contained software prefetch instructions.
+
+## V2.4 measured completion follow-up
+
+The pinned implementation base is `4a57dc713f1158347b2c912b6d374ea4dd7213f7`.
+The plan-only `e487cfb` commit used for the before measurements added no
+production code, so its benchmark baseline is code-identical to the pinned
+base. The three isolated workstreams were integrated as `ae65114` (allocator),
+`bc0aafb` (deque/vector), and `d8ec6b9` (hash). The runs used the same
+AArch64 two-core host and Rust 1.95 toolchain described above, with production
+allocator policy B and telemetry disabled. Both complete 16-scenario suites
+matched every native/compact logical checksum.
+
+```sh
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/v24-performance-run1.tsv
+cargo run --release -p compact_std --example benchmark_compare --features json,toml -- --output /tmp/v24-performance-run2.tsv
+cargo run --release -p compact_std --example benchmark_compare --features json,toml,allocator-telemetry -- --scenario A2 --scenario B8 --output /tmp/v24-allocator-profile.tsv
+```
+
+The baseline columns below are the two targeted runs taken immediately before
+these changes. Each cell is median/p95 milliseconds, run 1 / run 2. The final
+compact/native ratio uses the corresponding final run medians.
+
+| ID | Native end-to-end | Baseline compact | Completed compact | Completed/native | Retained memory |
+|---|---:|---:|---:|---:|---:|
+| A2 | 1.745/1.822; 1.781/3.411 | 2.591/2.735; 2.587/3.297 | 2.511/2.555; 2.520/2.802 | 1.44x / 1.41x | 1.500x |
+| A4 | 0.359/0.379; 0.393/1.013 | 2.032/2.049; 2.033/2.438 | 1.994/2.058; 1.986/2.149 | 5.55x / 5.05x | 1.000x |
+| A5 | 1.172/1.336; 1.178/1.315 | 4.986/5.222; 4.997/5.305 | 4.689/5.188; 4.668/7.737 | 4.00x / 3.96x | 1.000x |
+| B6 | 0.040/0.048; 0.040/0.049 | 0.142/0.172; 0.142/0.165 | 0.141/0.187; 0.141/0.148 | 3.51x / 3.52x | 1.000x |
+| B8 | 11.890/12.641; 12.131/13.421 | 32.676/44.395; 33.349/33.982 | 30.358/32.322; 30.392/35.412 | 2.55x / 2.51x | 1.026x |
+| B10 | 1.232/1.335; 1.250/1.385 | 3.048/3.207; 2.884/2.931 | 2.913/3.180; 2.969/3.139 | 2.36x / 2.37x | 1.000x |
+
+The phase medians show where the measured changes occurred. Values are compact
+milliseconds, run 1 / run 2; B6 uses microseconds because its phases are short.
+
+| Phase | Baseline | Completed | Median change |
+|---|---:|---:|---:|
+| A2 build | 1.549 / 1.538 | 1.469 / 1.478 | 4.5% faster |
+| A4 deque mutation | 1.972 / 1.973 | 1.935 / 1.927 | 2.1% faster |
+| A5 hash build | 3.029 / 3.019 | 2.813 / 2.818 | 6.9% faster |
+| A5 hash mutation | 1.234 / 1.240 | 1.174 / 1.169 | 5.3% faster |
+| A5 hash lookup | 0.535 / 0.537 | 0.513 / 0.510 | 4.7% faster |
+| B6 quote updates and snapshot rebuilds | 88.161 / 88.001 µs | 88.040 / 87.921 µs | 0.1% faster |
+| B6 snapshot copy | 2.840 / 2.840 µs | 2.800 / 2.800 µs | 1.4% faster |
+| B8 fixed-population churn | 28.063 / 28.669 | 25.838 / 25.916 | 8.8% faster |
+| B8 drop | 2.425 / 2.446 | 2.422 / 2.413 | 0.7% faster |
+| B10 parallel allocate/drop churn | 2.852 / 2.710 | 2.738 / 2.782 | 0.8% faster |
+
+The A5 median improved in both full runs. Its second full-run p95 was an
+outlier; two additional isolated A5 runs had end-to-end medians of 4.733 ms
+and 4.663 ms, with p95 values of 6.102 ms and 4.759 ms. Hash results and
+checksums remained stable. B10 stayed within baseline timing variation. Cage
+retained bytes were unchanged: A2 900,016 B; A4 32,784 B; A5 720,960 B;
+B6 49,184 B; B8 3,620,248 B; B10 256,032 B. The frozen owner, deque, header,
+and descriptor sizes remain 4 B, 12 B, 16 B, and 8 B respectively.
+
+The allocator plan also names B3 and B5 as real-world regression sentinels.
+They were measured in two additional release runs on the exact pinned
+`4a57dc7` source and compared with the corresponding scenarios in the two full
+completed runs. Values are compact median/p95 milliseconds, run 1 / run 2.
+
+| Scenario | Pinned baseline | Completed | Retained memory |
+|---|---:|---:|---:|
+| B3 request metadata batch | 24.673/25.051; 24.372/24.619 | 23.784/24.408; 24.437/24.955 | 0.911x |
+| B5 mobility dispatch state | 6.855/7.097; 6.824/7.736 | 6.444/8.935; 6.338/6.432 | 0.710x |
+
+B3 was 3.6% faster in run 1 and 0.3% slower in run 2, with unchanged retained
+memory. B5 medians improved by 6–7% in both runs with unchanged retained
+memory. The first completed B5 run had a p95 outlier; its second-run p95 was
+6.432 ms. Checksums matched between native and compact implementations in all
+four targeted runs.
+
+### Allocator profiling
+
+A separate `allocator-telemetry` run gathered phase totals and pending-reuse
+scan data for A2 and B8. These cumulative nanoseconds are diagnostic only:
+timer and atomic instrumentation adds work, phases overlap, and telemetry
+builds retain the full allocator accounting path rather than the default A2
+empty-store fast path. They are excluded from all performance comparisons.
+
+| Instrumented cumulative phase | A2 (ns) | B8 (ns) |
+|---|---:|---:|
+| Pending lookup | 13,699,822 | 182,708,678 |
+| Layout computation | 13,457,886 | 63,012,839 |
+| Allocator mutex wait | 16,434,410 | 7,361,422 |
+| Reusable-store search | 13,409,512 | 11,183,217 |
+| Cursor allocation | 44,370,842 | 8,088,464 |
+| Header initialization | 12,612,623 | 20,424,489 |
+
+Across one B8 telemetry child (warm-up plus nine measured repetitions), pending
+reuse found 524,340 exact matches and missed 124,594 times. Of those misses,
+124,544 had no active collector, 50 had no exact-size candidate, and none
+failed alignment. The 524,390 lookups with an active collector scanned
+1,704,488 candidates, averaging 3.25 candidates each. Scan depths were 0:10,
+1:10, 2:22, 3:393,124, 4:131,084, 5:114, and 6:26. Candidate size buckets were
+40 B:393,262, 112 B:393,282, 528 B:393,264, and 1,024 B or larger:524,680.
+The shallow reverse scan did not justify adding an index. The same child
+recorded 178,375 mutex acquisitions, 3,836,500 free-list nodes visited, and
+53,576 release batches with a maximum size of 64.
+
+### Validation and assembly
+
+Both complete release suites passed, followed by the all-feature workspace
+tests, strict Clippy, Apple x86-64 target check, full repository Miri workflow,
+and workspace release build. Release assembly was inspected on AArch64 and
+x86-64. No prefetch instruction, new inline assembly, object field, retained
+pointer, or layout change was introduced.
