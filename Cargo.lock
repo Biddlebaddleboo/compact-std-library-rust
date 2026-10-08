@@ -544,31 +544,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "compact_backend_std"
-version = "2.2.0"
-
-[[patch.unused]]
-name = "compact_collections"
-version = "2.2.0"
-
-[[patch.unused]]
-name = "compact_core"
-version = "2.2.0"
-
-[[patch.unused]]
-name = "compact_frozen"
-version = "2.2.0"
-
-[[patch.unused]]
-name = "compact_macros"
-version = "2.2.0"
-
-[[patch.unused]]
-name = "compact_serde"
-version = "2.2.0"
-
-[[patch.unused]]
-name = "compact_std"
-version = "2.2.0"
