@@ -1,6 +1,6 @@
 # V2.5 private-owner header validation prototype
 
-**Status:** isolated `cage.rs` prototype on `codex/v25-allocator-targeted`; not built or tested. No allocator chunk/TLS code. Keep this change out of the baseline while hash and collection benchmark windows are running.
+**Status:** accepted for production integration after source review, all-16 A/B measurements, memory accounting, and the Miri workflow. This is a private owner-path fast path only; no allocator chunk/TLS code, owner-layout change, or public API was introduced. The pinned baseline remains `b3ca878`.
 
 ## Hypothesis
 

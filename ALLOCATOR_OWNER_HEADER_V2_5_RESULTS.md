@@ -73,7 +73,7 @@ One all-16 `benchmark_compare --mode measure` run per binary verified checksums 
 - Two-run accounting-free compact RSS medians differed by −132 to +10 KiB (at most +0.31%).
 - Single-run measure-mode compact RSS deltas ranged from −60 to +132 KiB; the largest increase was B6 at +4.57%. Peak high-water bytes did not change, so the RSS movement is process/host noise rather than an allocator footprint change.
 
-Per-scenario memory values are in [measure-memory-deltas.tsv](/tmp/csl-v25-owner-header-candidate/runs/measure-memory-deltas.tsv); raw measure outputs are `measure-baseline.tsv/.log` and `measure-candidate.tsv/.log` under the same `runs` directory. No hardware perf counters were collected by this agent; root is capturing cycles/instructions separately for A2/A4/B6/B10.
+Per-scenario memory values are in [measure-memory-deltas.tsv](/tmp/csl-v25-owner-header-candidate/runs/measure-memory-deltas.tsv); raw measure outputs are `measure-baseline.tsv/.log` and `measure-candidate.tsv/.log` under the same `runs` directory. Root also captured compact-only `perf stat --repeat 3` cycles, instructions, branches, branch misses, and cache misses for A2/A4/B6/B10; raw files are in `/tmp/csl-v25-owner-header-counters/` and are summarized above. The strong cycles/instructions reductions in A2/A4/B6 support the resolved-header hypothesis; B10 counters are effectively unchanged, as expected for allocator-mutex contention.
 
 ## Validation
 
