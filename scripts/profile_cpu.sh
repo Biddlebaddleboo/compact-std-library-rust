@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproducible V2.4 runs. Keep artifacts outside the repository and use the
+# Reproducible V2.5 runs. Keep artifacts outside the repository and use the
 # benchmark_profile binary for timing and sampling; it installs no counting
 # global allocator and does not snapshot allocator state in timed windows.
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-OUT=${PROFILE_OUT:-/tmp/csl-v24-round4}
+OUT=${PROFILE_OUT:-/tmp/csl-v25-cpu-profile}
 BUILD_ROOT=${PROFILE_BUILD_ROOT:-$OUT}
 if [[ -n ${PROFILE_RUN_ID:-} ]]; then
     RUN_ID=$PROFILE_RUN_ID
-elif [[ ${1:-} == reports && -f "$OUT/latest-profile-run" ]]; then
+elif [[ ( ${1:-} == reports || ${1:-} == summary ) && -f "$OUT/latest-profile-run" ]]; then
     IFS= read -r RUN_ID < "$OUT/latest-profile-run"
 else
     RUN_ID="$(date -u +'%Y%m%dT%H%M%SZ')-$$"
@@ -26,19 +26,22 @@ PROFILE_TARGET="$BUILD_ROOT/target-profiled"
 PLAIN_BIN=${PLAIN_BIN:-}
 CHECK_BIN=${CHECK_BIN:-}
 PROFILE_BIN=${PROFILE_BIN:-}
-SCENARIOS=(A2 A4 A5 B6 B8 B3 B5 B10)
+SCENARIOS=(A1 A2 A3 A4 A5 A6 B1 B2 B3 B4 B5 B6 B7 B8 B9 B10)
 
 usage() {
     cat <<'EOF'
-Usage: scripts/profile_cpu.sh {metadata|build|baseline|suite|stats|profile|reports}
+Usage: scripts/profile_cpu.sh {metadata|build|baseline|suite|noisy|stats|profile|counters|summary|reports}
 
 Commands:
   metadata  Record host, toolchain, source, and available artifact hashes.
   build     Build telemetry-off benchmark_profile and checksum binaries.
   baseline  Run checksum parity, measure-mode stats, two full suites, and noisy cases.
   suite     Run SUITE_RUNS full 16-scenario accounting-free suites (default 2).
+  noisy     Repeat selected scenarios in alternating order (default 9 runs).
   stats     Record allocation/accounting snapshots in measure mode; never use its times.
-  profile   Sample selected native/compact windows directly with perf.
+  profile   Sample all A1-A6/B1-B10 native/compact windows directly with perf.
+  counters  Repeat accounting-free runs for available hardware counters.
+  summary   Rebuild the checksum-verified summary from saved suite/noisy runs.
   reports   Export inclusive/self perf reports from saved samples.
 
 Timing uses the hashed benchmark_profile executable. It has no counting
@@ -47,6 +50,8 @@ is used only for the logical-checksum self-check.
 
 Set PROFILE_OUT to store artifacts outside the default /tmp path. Set
 PROFILE_USE_SUDO=1 on hosts that require sudo -n perf.
+Set CSL_B10_WORKERS=1..8 to scale B10; the default is two workers with
+8,000 records per worker.
 EOF
 }
 
@@ -107,11 +112,14 @@ PY
 
 profile_repetitions() {
     case "$1" in
+        A1|A3|A6) printf '%s\n' 15 ;;
         A2|A4) printf '%s\n' 5000 ;;
         A5) printf '%s\n' 3000 ;;
+        B1|B2|B4) printf '%s\n' 9 ;;
         B3) printf '%s\n' 250 ;;
         B5) printf '%s\n' 3000 ;;
         B6) printf '%s\n' 60000 ;;
+        B7|B9) printf '%s\n' 7 ;;
         B8) printf '%s\n' 600 ;;
         B10) printf '%s\n' 1000 ;;
         *) printf 'no profile repetition count for %s\n' "$1" >&2; return 2 ;;
@@ -250,6 +258,7 @@ noisy() {
         done
     done
     echo "Wrote $noisy_runs repeated samples for ${#selected_scenarios[@]} scenarios to $RUN_DIR/noisy"
+    summarize
 }
 
 summarize() {
@@ -361,7 +370,11 @@ profile() {
     mkdir -p "$RUN_DIR/perf-data" "$RUN_DIR/profile-logs"
     local -a perf_cmd=(perf)
     if [[ ${PROFILE_USE_SUDO:-0} == 1 ]]; then
-        perf_cmd=(sudo -n perf)
+        if [[ -n ${CSL_B10_WORKERS:-} ]]; then
+            perf_cmd=(sudo -n --preserve-env=CSL_B10_WORKERS perf)
+        else
+            perf_cmd=(sudo -n perf)
+        fi
     fi
     local frequency=${PERF_FREQUENCY:-499}
     local seconds=${PROFILE_SECONDS:-3}
@@ -407,6 +420,82 @@ profile() {
     printf 'Perf artifacts for run %s are under %s\n' "$RUN_ID" "$RUN_DIR"
 }
 
+counters() {
+    need_binary "$PLAIN_BIN" "plain benchmark_profile"
+    mkdir -p "$RUN_DIR/counters" "$RUN_DIR/counter-probes"
+    : > "$RUN_DIR/counter-status.tsv"
+    local -a perf_cmd=(perf)
+    if [[ ${PROFILE_USE_SUDO:-0} == 1 ]]; then
+        if [[ -n ${CSL_B10_WORKERS:-} ]]; then
+            perf_cmd=(sudo -n --preserve-env=CSL_B10_WORKERS perf)
+        else
+            perf_cmd=(sudo -n perf)
+        fi
+    fi
+    local -a events=(cycles instructions branches branch-misses cache-misses)
+    local -a supported_events=()
+    for event in "${events[@]}"; do
+        local probe="$RUN_DIR/counter-probes/${event}.txt"
+        local probe_error="$RUN_DIR/counter-probes/${event}.stderr"
+        if "${perf_cmd[@]}" stat --no-big-num -x, -e "$event" -o "$probe" \
+            -- true >/dev/null 2>"$probe_error" \
+            && ! grep -Eiq 'not supported|not counted|permission denied|error:' \
+                "$probe" "$probe_error"; then
+            supported_events+=("$event")
+            printf '%s\tavailable\n' "$event" >> "$RUN_DIR/counter-status.tsv"
+        else
+            printf '%s\tunavailable\n' "$event" >> "$RUN_DIR/counter-status.tsv"
+        fi
+    done
+    if (( ${#supported_events[@]} == 0 )); then
+        echo "No requested hardware counters are available; see $RUN_DIR/counter-status.tsv"
+        return 0
+    fi
+    local event_csv
+    event_csv=$(IFS=,; printf '%s' "${supported_events[*]}")
+    local repeats=${COUNTER_REPEAT:-5}
+    [[ "$repeats" =~ ^[1-9][0-9]*$ ]] || {
+        echo "COUNTER_REPEAT must be a positive integer" >&2
+        return 2
+    }
+    local -a selected_scenarios=("${SCENARIOS[@]}")
+    if [[ -n ${PROFILE_SCENARIOS:-} ]]; then
+        IFS=',' read -r -a selected_scenarios <<< "$PROFILE_SCENARIOS"
+    fi
+    for scenario in "${selected_scenarios[@]}"; do
+        local repetitions
+        repetitions=$(profile_repetitions "$scenario")
+        local native_checksum= compact_checksum=
+        for variant in native compact; do
+            local prefix="$RUN_DIR/counters/${scenario}-${variant}"
+            "${perf_cmd[@]}" stat --no-big-num -x, --repeat "$repeats" \
+                -e "$event_csv" -o "${prefix}.perf-stat.csv" -- \
+                "$PLAIN_BIN" --window "$scenario" "$variant" "$repetitions" \
+                --seconds 0 > "${prefix}.workload.log" 2>&1
+            local -a checksums=()
+            mapfile -t checksums < <(
+                awk -F '\t' '$1 == "META" && $2 == "checksum" {print $5}' \
+                    "${prefix}.workload.log" | sort -u
+            )
+            if (( ${#checksums[@]} != 1 )); then
+                echo "expected one stable checksum in ${prefix}.workload.log; found ${#checksums[@]}" >&2
+                return 1
+            fi
+            if [[ $variant == native ]]; then
+                native_checksum=${checksums[0]}
+            else
+                compact_checksum=${checksums[0]}
+            fi
+        done
+        [[ "$native_checksum" == "$compact_checksum" ]] || {
+            echo "$scenario checksum mismatch: native=$native_checksum compact=$compact_checksum" >&2
+            return 1
+        }
+    done
+    printf 'Counter captures for %s scenarios are under %s/counters\n' \
+        "${#selected_scenarios[@]}" "$RUN_DIR"
+}
+
 reports() {
     mkdir -p "$RUN_DIR/reports"
     for data in "$RUN_DIR"/perf-data/*.data; do
@@ -431,8 +520,11 @@ case "${1:-}" in
     build) build ;;
     baseline) baseline ;;
     suite) suite ;;
+    noisy) noisy ;;
     stats) stats ;;
     profile) profile ;;
+    counters) counters ;;
+    summary) summarize ;;
     reports) reports ;;
     *) usage >&2; exit 2 ;;
 esac
