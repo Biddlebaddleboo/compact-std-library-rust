@@ -2,11 +2,11 @@
 
 ## Scope and provenance
 
-This records the V2.4 runtime as the pinned memory baseline for V2.5. `ec68fb7` adds plan documents after `9ff38cd`; the allocator, owners, collections, scenarios, and accounting harness have no source changes since that V2.4 commit. The prior Round 4 accounting capture was built from the dirty `cd4c0d1` worktree whose Round 4 changes were subsequently committed as `9ff38cd`.
+This records the implementation baseline pinned by the targeted V2.5 plan: `8bfe6f7192c5cdd1258d1cffb7fc1b5dddfeab5e`. The current `b3ca878` commit adds plan files only; allocator, owners, collections, scenarios, and accounting source are unchanged from the pinned baseline. The prior Round 4 accounting capture was built from the dirty `cd4c0d1` worktree whose Round 4 changes were subsequently committed as `9ff38cd`.
 
-The fresh V2.5 baseline artifacts are under `/tmp/csl-v25-profile-capture/runs/v25-clean-20261009/`. The accounting capture is `measure-stats.tsv`; host/toolchain and binary hashes are recorded in `host.txt`. It contains all 16 scenarios, with native/compact checksum parity. The source was `ec68fb78f03b964e4c4c4ea8ba2146f1eee0c0e6`; the build used Rust 1.95.0, LLVM 22.1.2, AArch64 Neoverse-N1 (2 vCPUs), Linux kernel 6.17.0-1020-oracle, `--no-default-features --features json,toml`, and a release build with allocator telemetry disabled. Measure mode enabled native allocation counting and compact allocator snapshots. Its elapsed times are accounting-instrumented and are not timing results.
+The pinned baseline artifacts are under `/tmp/csl-v25-targeted-baseline/runs/v25-targeted-baseline/`. The accounting capture is `measure-stats.tsv`; host/toolchain and binary hashes are recorded in `host.txt`. It contains all 16 scenarios with native/compact checksum parity. The source was `b3ca8786448c5fa0b7e503e915414170eaa31e31`; the build used Rust 1.95.0, LLVM 22.1.2, AArch64 Neoverse-N1 (2 vCPUs), Linux kernel 6.17.0-1020-oracle, `--no-default-features --features json,toml`, and release settings with allocator telemetry disabled. Measure mode enabled native allocation counting and compact allocator snapshots. Its elapsed times are accounting-instrumented and are not timing results.
 
-The owners, allocator, collections, and accounting harness in this capture are unchanged from the V2.4 baseline. The source-only plan commit therefore gives a fresh run at the pinned V2.4 runtime without introducing a memory-layout change.
+The owners, allocator, collections, and accounting harness in this capture are unchanged from the pinned `8bfe6f7` baseline. The `b3ca878` plan commit adds no runtime change.
 
 ## Retained owner and descriptor layouts
 
@@ -33,22 +33,22 @@ An allocation's 16-byte header and any alignment prefix live in the cage block, 
 
 | Scenario | Native build-live (B) | Compact build-live (B) | Compact − native (B) | Compact cursor high-water (B) | Peak RSS native / compact (KiB) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| A1 | 400,000 | 400,016 | +16 | 800,024 | 3,292 / 3,484 |
-| A2 | 600,000 | 900,016 | +300,016 | 900,024 | 3,336 / 3,700 |
-| A3 | 13,361,600 | 13,368,816 | +7,216 | 13,368,824 | 22,160 / 22,476 |
-| A4 | 32,768 | 32,784 | +16 | 98,344 | 2,828 / 2,864 |
-| A5 | 720,912 | 720,960 | +48 | 720,968 | 3,468 / 3,604 |
-| A6 | 428,180 | 528,016 | +99,836 | 528,024 | 3,784 / 4,100 |
-| B1 | 4,360,722 | 2,692,880 | −1,667,842 | 3,277,000 | 10,556 / 7,488 |
-| B2 | 56,629 | 45,424 | −11,205 | 46,720 | 3,576 / 3,664 |
-| B3 | 13,071,260 | 11,903,936 | −1,167,324 | 11,903,944 | 42,580 / 34,888 |
-| B4 | 565,270 | 486,112 | −79,158 | 1,076,000 | 12,868 / 12,376 |
-| B5 | 4,846,280 | 3,440,672 | −1,405,608 | 3,440,680 | 13,832 / 11,224 |
-| B6 | 49,169 | 49,184 | +15 | 65,576 | 2,892 / 3,008 |
-| B7 | 14,459,152 | 15,186,952 | +727,800 | 15,186,960 | 41,576 / 38,744 |
-| B8 | 3,528,488 | 3,620,248 | +91,760 | 4,424,784 | 35,772 / 35,268 |
-| B9 | 5,193,776 | 3,840,072 | −1,353,704 | 3,840,080 | 17,224 / 19,172 |
-| B10 | 256,048 | 256,032 | −16 | 256,040 | 3,296 / 3,412 |
+| A1 | 400,000 | 400,016 | +16 | 800,024 | 3,100 / 3,288 |
+| A2 | 600,000 | 900,016 | +300,016 | 900,024 | 3,316 / 3,576 |
+| A3 | 13,361,600 | 13,368,816 | +7,216 | 13,368,824 | 21,908 / 22,336 |
+| A4 | 32,768 | 32,784 | +16 | 98,344 | 2,628 / 2,724 |
+| A5 | 720,912 | 720,960 | +48 | 720,968 | 3,344 / 3,472 |
+| A6 | 428,180 | 528,016 | +99,836 | 528,024 | 3,652 / 3,980 |
+| B1 | 4,360,722 | 2,692,880 | −1,667,842 | 3,277,000 | 10,416 / 7,368 |
+| B2 | 56,629 | 45,424 | −11,205 | 46,720 | 3,576 / 3,652 |
+| B3 | 13,071,260 | 11,903,936 | −1,167,324 | 11,903,944 | 42,468 / 34,760 |
+| B4 | 565,270 | 486,112 | −79,158 | 1,076,000 | 12,676 / 12,244 |
+| B5 | 4,846,280 | 3,440,672 | −1,405,608 | 3,440,680 | 13,704 / 11,088 |
+| B6 | 49,169 | 49,184 | +15 | 65,576 | 2,764 / 2,888 |
+| B7 | 14,459,152 | 15,186,952 | +727,800 | 15,186,960 | 41,464 / 38,620 |
+| B8 | 3,528,488 | 3,620,248 | +91,760 | 4,424,784 | 35,712 / 35,204 |
+| B9 | 5,193,776 | 3,840,072 | −1,353,704 | 3,840,080 | 17,092 / 19,028 |
+| B10 | 256,048 | 256,032 | −16 | 256,040 | 3,216 / 3,348 |
 
 All compact scenarios returned to zero live cage bytes at completion. The per-phase release snapshots showed zero post-drop reusable bytes in these runs; B8 is the exception during its deliberate cache-churn cycles and is summarized below. Scenario repetitions were the harness defaults: 15 for A1–A6, 9 for B1–B4/B6/B8, and 7 for B5/B7/B9/B10. Default B10 uses two build, two churn, and two traversal workers. A separate B10 weak-scaling capture used 1, 2, 4, and 8 workers with 8,000 records per worker; this shared host has only two vCPUs, so the 4/8-worker results show oversubscription rather than physical multicore scaling.
 
@@ -63,7 +63,7 @@ The retained-byte and cursor totals grow with the fixed per-worker data set. The
 
 ## Fragmentation and allocator slack
 
-The B8 per-phase high-water is 4,424,784 B. Its separate 64-row cache-cycle trace reached a 5,211,232 B cursor, 1,590,976 B total free, four free blocks, and a 1,588,240 B largest extent in the prior Round 4 artifact. The fresh V2.5 trace also reached a 5,211,232 B cursor and 1,590,976 B total free, with at most three free blocks and a 1,588,256 B largest extent. The earlier Round 4 narrative treated the per-phase high-water as the cache-cycle maximum; the raw trace is authoritative and that summary is corrected in `PROFILE_V2_4_ROUND4.md`. The higher diagnostic high-water is a distinct cache-churn path and does not replace the per-phase value in the table.
+The B8 per-phase high-water is 4,424,784 B. Its separate 64-row cache-cycle trace in the pinned bundle reached a 5,211,232 B cursor, 1,590,976 B total free, up to four free blocks, and a 1,588,248 B largest extent. The prior Round 4 trace reached the same cursor/free high-water with a 1,588,240 B largest extent. The earlier Round 4 narrative treated the per-phase high-water as the cache-cycle maximum; the raw trace is authoritative and that summary is corrected in `PROFILE_V2_4_ROUND4.md`. The higher diagnostic high-water is a distinct cache-churn path and does not replace the per-phase value in the table.
 
 The production allocator's small size-class cache is bounded: four exact block sizes `[32, 40, 112, 528]`, up to 32 cached extents per class. Their maximum combined cage footprint is 22,784 bytes. The release collector contains 64 eight-byte extents (512 bytes) plus its length field and is stack-local to an active batch; TLS stores only a pointer to that stack object. The current code therefore has no unbounded per-thread allocation cache. This is a source-derived bound, not a measured per-thread RSS delta. B10 on this two-vCPU host does not establish 4/8-worker scaling or thread-exit RSS reclamation.
 
