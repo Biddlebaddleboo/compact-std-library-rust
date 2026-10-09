@@ -6,8 +6,8 @@ use core::mem::{align_of, size_of};
 
 #[test]
 fn configuration_and_owner_layouts_match_the_v2_4_baseline() {
-    assert_eq!(size_of::<CageConfig>(), 8);
-    assert_eq!(align_of::<CageConfig>(), 8);
+    assert_eq!(size_of::<CageConfig>(), size_of::<usize>());
+    assert_eq!(align_of::<CageConfig>(), align_of::<usize>());
 
     assert_eq!(size_of::<CageAllocation<u64>>(), 4);
     assert_eq!(align_of::<CageAllocation<u64>>(), 4);
