@@ -69,7 +69,18 @@ metadata_bytes <= R * M + sum(Q_i * entry_size)
 
 If either budget is exhausted, use the global allocator. Do not let the cap scale with cumulative thread creation. R4’s B10 workload used two worker threads, had a 256,040-byte high-water cursor and 3,444 KiB peak RSS; it did not establish 4/8-worker memory behavior. A hypothetical 32-byte record for each 512-byte chunk would cost 6.25% of B10’s high-water bytes at full occupancy, before queue storage. Thus chunk size and metadata representation are acceptance questions, not settled assumptions.
 
-The clean V2.5 B10 suite median was 3.107 ms compact versus 0.618 ms native (5.03x); the three-run hardware-counter capture measured 7.62x cycles and 4.25x instructions for compact. A compact perf sample attributed 28.07% self samples to `__aarch64_cas4_acq`, 20.23% to `__aarch64_swp4_rel`, and 16.09% to `Mutex::lock_contended`. These samples confirm the lock path remains a major candidate, but the host has only two vCPUs and gives no 4/8-worker scaling evidence.
+The clean default B10 suite median was 3.107 ms compact versus 0.618 ms native (5.03x); its three-repeat hardware-counter capture measured 7.62x cycles and 4.25x instructions for compact. A compact perf sample attributed 28.07% self samples to `__aarch64_cas4_acq`, 20.23% to `__aarch64_swp4_rel`, and 16.09% to `Mutex::lock_contended`.
+
+A separate weak-scaling run kept 8,000 input records per worker and checked native/compact checksums at 1, 2, 4, and 8 workers. The host still had only two vCPUs, so the 4/8-worker rows measure oversubscription and scheduler contention rather than physical multicore scaling.
+
+| Workers | Native median/p95 ms per repetition | Compact median/p95 ms per repetition | Timing ratio | Compact/native cycles | Peak RSS native/compact KiB |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.300 / 0.451 | 0.616 / 0.766 | 2.06x | 2.09x | 2,952 / 3,084 |
+| 2 | 0.558 / 0.728 | 2.736 / 3.416 | 4.90x | 6.91x | 3,332 / 3,348 |
+| 4 | 0.948 / 1.799 | 5.375 / 5.768 | 5.67x | 5.67x | 3,612 / 3,868 |
+| 8 | 1.882 / 2.224 | 11.397 / 11.814 | 6.06x | 6.62x | 5,080 / 4,952 |
+
+Median compact retained cage bytes scaled from 128,016 B at one worker to 1,024,128 B at eight, matching the 8,000-record-per-worker workload. The captures show a material B10 lock cost from two workers onward; they do not validate behavior on a host with four or eight physical cores.
 
 The plan’s memory gates remain: at most 2% retained-byte increase and 5% peak RSS increase against this baseline. Measure reserved slack, chunk records, queue storage, free fragmentation, cursor high-water, RSS after idle/thread exit, and all worker counts in any candidate comparison. No chunk implementation was benchmarked for this note.
 
