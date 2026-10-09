@@ -840,8 +840,8 @@ impl CompactRuntime {
 
     /// Check that an owner still names a live allocation in this process cage.
     pub fn validate_owned<T: CompactValue>(allocation: &CageAllocation<T>) -> Result<()> {
-        let header = allocation.header()?;
         let state = state()?;
+        let header = read_typed_header::<T>(state, allocation.raw_offset())?;
         let allocator = lock(state)?;
         let start = allocation
             .raw_offset()
@@ -912,7 +912,7 @@ impl CompactRuntime {
             return Err(Error::InvalidOffset);
         }
         let state = state()?;
-        let header = unsafe { read_header(state, offset.as_u32()) }?;
+        let header = read_typed_header::<T>(state, offset.as_u32())?;
         if header.initialized == 0 {
             return Err(Error::InitializationError);
         }
@@ -940,6 +940,12 @@ impl CompactRuntime {
 }
 
 /// A unique compact allocation owner represented by one non-null `u32` offset.
+///
+/// The private invariant is that `offset` points to a live allocation created
+/// by this allocator, and its header capacity and block length describe a
+/// correctly aligned payload of exactly `T`. Only allocator construction and
+/// resize paths may create or update this state. `offset()` exports a compact
+/// descriptor, not a way to reconstruct an owner.
 #[repr(transparent)]
 #[must_use = "dropping this owner releases its cage allocation"]
 pub struct CageAllocation<T: CompactValue> {
@@ -1345,9 +1351,7 @@ impl<T: CompactValue> CageAllocation<T> {
         let requested = u32::try_from(capacity).map_err(|_| Error::OffsetOverflow)?;
         let state = state()?;
         let offset = self.raw_offset();
-        // SAFETY: this non-copy owner represents a live allocator-issued offset.
-        let header = unsafe { read_header(state, offset) }?;
-        validate_typed_header::<T>(state, offset, header)?;
+        let header = read_owner_header::<T>(state, self)?;
         if requested < header.initialized {
             return Err(Error::InitializationError);
         }
@@ -1446,19 +1450,14 @@ impl<T: CompactValue> CageAllocation<T> {
     }
     #[inline]
     fn header(&self) -> Result<AllocationHeader> {
-        // SAFETY: this non-copy owner represents an allocator-issued offset.
         let state = state()?;
-        let header = unsafe { read_header(state, self.raw_offset()) }?;
-        validate_typed_header::<T>(state, self.raw_offset(), header)?;
-        Ok(header)
+        read_owner_header::<T>(state, self)
     }
     #[inline]
     fn resolved(&self) -> Result<ResolvedAllocation<'_, T>> {
         let state = state()?;
         let offset = self.raw_offset();
-        // SAFETY: this owner represents an allocator-issued live allocation.
-        let header = unsafe { read_header(state, offset) }?;
-        validate_typed_header::<T>(state, offset, header)?;
+        let header = read_owner_header::<T>(state, self)?;
         // SAFETY: the validated owner offset points to its aligned payload.
         let ptr = unsafe { ptr_from_offset::<T>(state, offset) };
         Ok(ResolvedAllocation {
@@ -1471,9 +1470,7 @@ impl<T: CompactValue> CageAllocation<T> {
     fn resolved_mut(&mut self) -> Result<ResolvedAllocationMut<'_, T>> {
         let state = state()?;
         let offset = self.raw_offset();
-        // SAFETY: this exclusive owner represents an allocator-issued live allocation.
-        let header = unsafe { read_header(state, offset) }?;
-        validate_typed_header::<T>(state, offset, header)?;
+        let header = read_owner_header::<T>(state, self)?;
         // SAFETY: the validated owner offset points to its aligned payload/header.
         let ptr = unsafe { ptr_from_offset::<T>(state, offset) };
         let header_ptr = unsafe { header_ptr(state, offset) };
@@ -1771,6 +1768,38 @@ unsafe fn read_header(state: &CageState, offset: u32) -> Result<AllocationHeader
     {
         return Err(Error::InvalidOffset);
     }
+    Ok(header)
+}
+
+/// Read a header through the private, allocator-issued owner path.
+///
+/// This retains all generic bounds and initialization checks in
+/// [`read_header`]. It omits [`validate_typed_header`] because the owner can
+/// only be minted by [`CageAllocation::allocate`], which reserves enough bytes
+/// for `size_of::<T>() * capacity`, and resized by `try_resize`, which updates
+/// capacity and block length from the same checked formula. Header writes from
+/// those paths preserve the payload-fit invariant. `CageAllocation` is not
+/// cloneable and its fields are private, so safe callers cannot supply a
+/// reconstructed offset here.
+#[inline]
+fn read_owner_header<T: CompactValue>(
+    state: &CageState,
+    owner: &CageAllocation<T>,
+) -> Result<AllocationHeader> {
+    let offset = owner.raw_offset();
+    // SAFETY: this helper is called only with the private offset of a live
+    // allocator-issued owner; its constructors and resize path preserve bounds.
+    unsafe { read_header(state, offset) }
+}
+
+/// Read and fully validate a typed header for an offset that does not carry
+/// the private owner provenance proof.
+#[inline]
+fn read_typed_header<T>(state: &CageState, offset: u32) -> Result<AllocationHeader> {
+    // SAFETY: callers uphold the offset's basic liveness contract or are in an
+    // unsafe offset-resolution API; `read_header` checks cage and header bounds.
+    let header = unsafe { read_header(state, offset) }?;
+    validate_typed_header::<T>(state, offset, header)?;
     Ok(header)
 }
 
@@ -2927,6 +2956,47 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[repr(align(64))]
+    struct OverAlignedValue {
+        _bytes: [u8; 24],
+    }
+
+    // SAFETY: the test-only value contains plain bytes and has no address-sensitive state.
+    unsafe impl CompactValue for OverAlignedValue {}
+
+    fn assert_allocator_issued_header<T: CompactValue>(
+        state: &CageState,
+        allocator: &mut Allocator,
+        capacity: usize,
+    ) -> (u32, AllocationHeader) {
+        let capacity_u32 = u32::try_from(capacity).unwrap();
+        let payload_bytes = size_of::<T>().checked_mul(capacity).unwrap().max(1);
+        let (offset, prefix, block_len) =
+            allocate_block(state, allocator, payload_bytes, align_of::<T>().max(4)).unwrap();
+        let header = AllocationHeader {
+            block_len,
+            prefix,
+            capacity: capacity_u32,
+            initialized: 0,
+        };
+        initialize_allocation_header(state, offset, header);
+        // SAFETY: the test owner uses the valid offset and matching header
+        // emitted by `allocate_block` and `initialize_allocation_header` above.
+        let owner = core::mem::ManuallyDrop::new(CageAllocation::<T> {
+            offset: NonZeroOffset(core::num::NonZeroU32::new(offset).unwrap()),
+            marker: PhantomData,
+        });
+        let owner_header = read_owner_header::<T>(state, &*owner).unwrap();
+        let typed_header = read_typed_header::<T>(state, offset).unwrap();
+        for observed in [owner_header, typed_header] {
+            assert_eq!(observed.block_len, header.block_len);
+            assert_eq!(observed.prefix, header.prefix);
+            assert_eq!(observed.capacity, header.capacity);
+            assert_eq!(observed.initialized, header.initialized);
+        }
+        (offset, header)
+    }
+
     fn local_allocate(state: &CageState, allocator: &mut Allocator, bytes: usize) -> ReleaseExtent {
         let (data, prefix, len) = allocate_block(state, allocator, bytes, 8).unwrap();
         ReleaseExtent {
@@ -2969,6 +3039,71 @@ mod tests {
             }
         }
         extents
+    }
+
+    #[test]
+    fn allocator_issued_headers_satisfy_typed_payload_bounds() {
+        let state = local_state(16 * 1024);
+        let mut allocator = lock(&state).unwrap();
+
+        for capacity in [0, 1, 4, 16] {
+            assert_allocator_issued_header::<u8>(&state, &mut allocator, capacity);
+            assert_allocator_issued_header::<u64>(&state, &mut allocator, capacity);
+            assert_allocator_issued_header::<OverAlignedValue>(&state, &mut allocator, capacity);
+        }
+    }
+
+    #[test]
+    fn resize_capacity_formula_preserves_typed_payload_bounds() {
+        let state = local_state(16 * 1024);
+        let mut allocator = lock(&state).unwrap();
+        let (offset, original) =
+            assert_allocator_issued_header::<OverAlignedValue>(&state, &mut allocator, 4);
+        drop(allocator);
+
+        // `try_resize` retains the prefix, recomputes block length from the
+        // requested capacity, and only commits growth after reserving the
+        // adjacent bytes. Exercise both shrink and grow candidate headers.
+        for capacity in [0, 1, 2, 8, 32] {
+            let payload_bytes = size_of::<OverAlignedValue>()
+                .checked_mul(capacity)
+                .unwrap()
+                .max(1);
+            let block_len = u32::try_from(
+                checked_align_up(
+                    (original.prefix as usize) + size_of::<AllocationHeader>() + payload_bytes,
+                    8,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let resized = AllocationHeader {
+                block_len,
+                prefix: original.prefix,
+                capacity: capacity as u32,
+                initialized: 0,
+            };
+            assert!(validate_typed_header::<OverAlignedValue>(&state, offset, resized).is_ok());
+        }
+    }
+
+    #[test]
+    fn typed_raw_offset_reader_rejects_payload_beyond_block() {
+        let state = local_state(128);
+        let offset = 32;
+        let malformed_for_u64 = AllocationHeader {
+            block_len: size_of::<AllocationHeader>() as u32,
+            prefix: 0,
+            capacity: 2,
+            initialized: 0,
+        };
+        // SAFETY: the local test cage has a writable, aligned header slot at
+        // `offset - size_of::<AllocationHeader>()`.
+        unsafe { header_ptr(&state, offset).write(malformed_for_u64) };
+
+        // The header is structurally valid, but this external raw offset has
+        // no owner provenance proof and must retain the typed payload check.
+        assert!(read_typed_header::<u64>(&state, offset).is_err());
     }
 
     fn assert_pending_partition(
