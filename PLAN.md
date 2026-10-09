@@ -1,37 +1,40 @@
-# PLAN.md — V2.4 Round 4 Profiling and Optimization
-
+# PLAN.md — V2.5 Framework-Wide Architectural Optimization
 Repository: Biddlebaddleboo/compact-std-library-rust
 Branch: main
-Verified baseline: 59540b84cd97c0eb5bfda3f4db3ce45c5a604d76
-CI at baseline: Miri and benchmark harness passing.
+Verified initial baseline: 9ff38cdfc6daffc75eb39fcc8047d12cd9d180f8
 
 ## Objective
-Profile and resolve remaining evidence-supported V2.4 bottlenecks without sacrificing memory footprint, safety, or compatibility. Priorities: B10 allocator concurrency; A5 hash probing; B8 combined map/allocator overhead; A4/B6 batch access; A2 overhead. Do not repeat rejected experiments without a new hypothesis.
+V2.5 is an evidence-driven architectural optimization release. Existing architectural contracts are optimization targets, **not** defaults to preserve. Optimize CPU efficiency, latency, throughput, concurrency and memory across the whole framework, including workloads already faster than native Rust. Accept contract changes whenever repeatable, worthwhile gains justify complexity and modest memory costs; safety remains mandatory.
 
 ## Verified facts
-Round 3 introduced CompactHashMap::find_index_in for lookup, and CompactVecDeque::with_view for opt-in borrow-scoped no-growth batch operations; regular deque operations remain unchanged. Hash control metadata has no partial-hash fingerprints. B10 has substantial lock/futex/atomic self samples, with large variability on two-vCPU host. Thread-local allocation chunks have not been implemented. A2 is ~1.5x native in accounting-free capture. B3/B5 remain faster than native in measured cases.
+V2.4 has cage-relative 4-byte ownership and vectors, 12-byte deque, 16-byte allocation header, 8-byte frozen descriptor. `CompactVecDeque::with_view` and `CompactVec::as_mut_slice` amortize validation during borrows. Hash lookup has a specialized probe; Round 4 seven-bit fingerprint prototype delivered negligible integrated gain and was rejected. Global allocator mutex remains a B10 hotspot. `crates/compact_backend_std/src/allocator_model.rs` is test-only/sequential, not an implementation or proof of concurrent safety. Round 4 added profiling harness and collection differential tests; A2/A4/A5/B8/B10 remain slower in ordinary APIs, B3/B5 faster. Round 4 left the five PLAN*.md files on main pending architecture handoff.
 
-## Frozen invariants
-Four-byte cage-relative owners/vectors; 12-byte deque; 16-byte AllocationHeader; eight-byte frozen descriptors; one process-wide cage; no persistent native pointers; correct ownership/aliasing/initialization/drop/FFI; accurate live-byte accounting, concurrent/remote free semantics; randomized hash-flood-resistant default hashing. No software prefetch, new inline assembly, V3 compiler-target changes or unapproved lock-free reclamation.
+## Architectural policy
+Open to redesign: allocation synchronization/reservations, global/TLS ownership, cage offset resolution, headers and validation, borrow-scoped storage, collection metadata/backing stores, hash probing/control bytes, reclamation/recycling/fragmentation, internal interfaces and lifetimes. Do not redesign without a measured hypothesis or retain a costly contract solely for compatibility. Keep safe Rust guarantees, collision-resistant randomized default hashing, correct initialization/destruction, remote-free safety and accurate accounting. Do not mislabel distinct algorithms as like-for-like benchmarks.
 
-## Workstreams and file ownership
-- PLAN_ALLOCATOR_CONCURRENCY.md owns crates/compact_backend_std/src/cage.rs and dedicated allocator tests. Must design allocator state transitions, duplicate-allocation prevention, cross-thread frees and reclamation *before* implementing any thread-local chunk scheme.
-- PLAN_HASH_PROBING.md owns crates/compact_collections/src/hash_map.rs, hash_control.rs, and dedicated hash tests.
-- PLAN_COLLECTION_ACCESS.md owns crates/compact_collections/src/deque.rs, vec.rs and dedicated collection tests.
-- PLAN_PERFORMANCE_VALIDATION.md owns standalone scripts (scripts/profile_cpu.sh, scripts/sample_collections.sh, scripts/profiling/allocator_profile.sh), PROFILE_V2_4_ROUND4.md and profiling evidence; common benchmark_compare/main.rs, benchmark_profile.rs, scenarios and BENCHMARKS.md are orchestrator-owned.
+## Memory budget (relative to pinned V2.4 on identical workloads)
+Retained bytes default ≤+2%, peak RSS default ≤+5%, owner sizes preferably unchanged, metadata preferably unchanged; bounded lazy and reclaimable TLS reservations, idle return close to baseline, no significant fragmentation regression. Measure absolute and relative deltas and separate virtual cage reservation, committed pages, allocator retained bytes, metadata and RSS. Tiny/noisy baselines require absolute-byte context. Exceptions require explicit approval with benefit and exact cost; no unbounded growth.
 
-Hash and collection experiments are parallel-safe in isolated worktrees; allocator measurements may run concurrently but invasive allocator redesign requires central review of the complete state/accounting contract. Overlapping test/harness edits are integrated centrally; assign each shared symbol one owner.
+## Scope ownership
+- PLAN_PROFILING.md: standalone profiling tools, baseline capture and opportunity matrix; read-only production code.
+- PLAN_ALLOCATOR.md: `crates/compact_backend_std/src/cage.rs`, allocator model/tests, synchronization, release, accounting, allocator-side access primitives.
+- PLAN_OWNERSHIP.md: define shared handle-resolution/validation/borrow contract and proof obligations; owns design document, not production cage.rs, which allocator integrates.
+- PLAN_COLLECTIONS.md: `crates/compact_collections/src/{vec.rs,deque.rs,hash_map.rs,hash_control.rs}` and associated tests. Other collection files only if profiling warrants.
+- PLAN_MEMORY.md: memory/layout/compatibility inventory, budget tests and report; production layout edits by owning workstreams.
+- PLAN_VALIDATION.md: integration verification and final report.
+Orchestrator owns shared `benchmark_compare` scenarios, `benchmark_profile.rs`, global docs/version changes, ownership interfaces and merge conflicts. Avoid simultaneous edits to shared symbols.
 
-## Integration sequence
-1. Verify latest main and reconcile any material architecture changes.
-2. Record clean accounting-free native/compact baseline on exact commit; run checksums and both CI workflows.
-3. Profile A2/A4/A5/B6/B8/B10, retain B3/B5 sentinels. Include multiple worker counts/hardware where available.
-4. Experiment independently with hash probing/fingerprints and collection batching. Report before/after micro and real scenario timings.
-5. Prepare allocator state-transition model, tests and centrally reviewed design. Only then experiment with bounded thread-local reservation or caching, keeping simpler mutex changes as controls.
-6. Integrate hash, collection and allocator work in that order; reprofile shifted costs and validate regressions.
-7. Repeat full 16-scenario release suite twice plus noisy-case runs. Separate accounting-enabled measure mode from accounting-free timing, pin telemetry-free hashed artifact and record medians, p95, sample attribution, retained bytes, high-water and RSS.
-8. Run cargo fmt --all -- --check; cargo check --workspace --all-features; cargo test --workspace --all-features; cargo clippy --workspace --all-targets --all-features -- -D warnings; available Apple cross-target check; full Miri workflow; harness CI parity.
-9. Independently verify final diff and safety/performance evidence, resolve plan contradictions centrally; delete all PLAN*.md before final implementation commit.
+## Dependencies, parallel safety and integration
+1. Verify latest main, reconcile changed code/history/CI; read PLAN.md first.
+2. Profile all 16 scenarios (including already fast) and memory on a reproducible, accounting-free V2.4 baseline; separate instrumented allocation statistics; rank hotspots by absolute time, cross-framework impact, improvement confidence, complexity and memory cost.
+3. In parallel isolated worktrees, allocator develops **state contract/model**, ownership defines safe resolved-view API, collections profile localized bottlenecks, memory establishes baseline. No unsafe TLS production implementation before central safety gate.
+4. Orchestrator approves allocator/ownership interfaces, memory exceptions and architecture decisions. Contract consumers implement only after interface approval and upstream integration. Isolate competing prototypes and measure each against baseline before combining.
+5. Integrate allocator, agreed ownership primitives, collection consumers, then benchmarks/docs. Reprofile shifted bottlenecks, regressions and memory.
+6. Run cargo fmt --all -- --check; cargo check --workspace --all-features --locked; cargo test --workspace --all-features --locked; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings; full Miri/harness workflows; available cross-target checks; stress/differential tests and repeated 16-scenario release comparisons.
+7. Independent final diff and test review. Record accepted/rejected experiments, absolute latency, medians/p95, RSS, retention, fragmentation, complexity and migrations. Remove **all** PLAN*.md before final implementation commit.
 
-## Acceptance and handoff
-Only keep stable performance improvements without significant B3/B5 or other scenario regressions; maintain frozen layouts, matching checksums, collision security and complete allocator correctness. Document rejected hypotheses and profiler limitations. Every executor reports exact changed files/symbols, commit SHA, tests, measurements, deviations and unresolved assumptions. PLAN.md is a temporary handoff artifact, not a permanent source file.
+## Non-goals
+Wholesale rewrite absent evidence; unchecked public APIs; hash-flood regression; benchmark-only shortcuts; unbounded TLS caches; assuming lower instruction count equals runtime improvement; V3 compiler ABI projects.
+
+## Execution handoff
+Bounded executors report exact touched files/symbols, commit SHA, tests, performance/memory comparisons, deviations and unresolved assumptions. Scope expansion only for moved symbols, compilation, safety, compatibility or demonstrated dependencies. Central orchestrator resolves contradictions; no executor redesigns interfaces silently.
