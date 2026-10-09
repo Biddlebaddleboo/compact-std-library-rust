@@ -43,9 +43,10 @@
 //! handle may move between threads without changing its bytes; a remote drop
 //! records the receiving collector as the `PendingRelease` owner. The chunk
 //! design adds `Free -> Reserved`, `Reserved -> Live` (same thread),
-//! `Reserved -> Reclaimable`, and `Reclaimable -> Free`. A `Reserved` owner
-//! transfer is a separate whole-chunk operation after pending frees are
-//! drained; the byte-only predicate below cannot validate that precondition.
+//! `Reserved -> Reclaimable`, and `Reclaimable -> Free`. Chunk ownership is
+//! nontransferable between mutator threads. The only handoff is
+//! `Active -> Retiring` to the reaper after the home thread closes its local
+//! allocation path; the byte-only predicate cannot validate this phase gate.
 //! Notably illegal:
 //! `Free -> PendingRelease`, cross-thread `PendingRelease -> Live`,
 //! cross-thread `Reserved -> Live`, `Reclaimable -> Live`, and
@@ -67,8 +68,9 @@
 //! The small transition helpers below are supplemented by
 //! [`hypothetical_chunk_model`], a deterministic sequential reference
 //! protocol. That model accounts for ranges and chunk identities and tests
-//! failure paths. It is hypothetical: remote publication is atomic at a model
-//! method boundary, the reaper is an abstract owner, and the model does not
+//! failure paths, including a remote lookup pin interleaved with retirement.
+//! It is hypothetical: remote publication is atomic at a model method boundary,
+//! the reaper is an abstract owner, and the model does not
 //! establish actual memory ordering, thread-local destructor behavior, or
 //! production allocator safety. The production tests in `cage.rs` independently
 //! exercise only the current mutex allocator; they do not call
@@ -77,8 +79,9 @@
 //! # Open questions the chunk design must answer (do not implement without these)
 //!
 //! [`CHUNK_DESIGN_GAPS`] lists implementation questions the hypothetical
-//! protocol cannot settle. They still need concrete answers and central review
-//! before any unsafe chunk code lands.
+//! protocol cannot settle. The pin model does not prove that Rust mutex,
+//! registry, `Arc`, or TLS behavior implements that protocol. They still need
+//! concrete answers and central review before any unsafe chunk code lands.
 
 /// The single state of one managed cage byte in the high-water prefix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,12 +189,14 @@ pub(crate) const LIVE_STATES: [ByteState; 2] = [
 
 /// Implementation questions that the sequential hypothetical model cannot
 /// settle. Each needs a concrete answer before any unsafe chunk implementation.
-pub(crate) const CHUNK_DESIGN_GAPS: [&str; 6] = [
-    "actual remote-queue publication ordering and the synchronization primitive that makes it safe",
+pub(crate) const CHUNK_DESIGN_GAPS: [&str; 8] = [
+    "production offset-to-record routing and proof that unique-owner Drop is the only release source",
+    "real registry pin publication/removal ordering and the synchronization primitive that makes it safe",
     "thread-local destructor and reaper integration with in-flight operations on real threads",
-    "nested collectors, destructor reentrancy, and errors while flushing actual release batches",
-    "panic, allocation failure, and abort behavior while real chunk metadata is being reclaimed",
-    "mapping reserved/reclaimable accounting into public stats without changing frozen layouts",
+    "bounded no-allocation remote pending storage, overflow, nested collectors, and flush errors",
+    "panic, poisoned locks, allocation failure, and retry/quarantine behavior during reclamation",
+    "coherent live/free/reserved accounting and stats snapshots without changing frozen layouts",
+    "chunk size, metadata, queue bounds, fragmentation, thread churn, and memory-budget evidence",
     "concurrent stress, Miri/model-checker evidence, and central review for a concrete unsafe implementation",
 ];
 
@@ -339,7 +344,7 @@ mod tests {
 
     #[test]
     fn every_chunk_design_gap_is_documented() {
-        assert_eq!(CHUNK_DESIGN_GAPS.len(), 6);
+        assert_eq!(CHUNK_DESIGN_GAPS.len(), 8);
         assert!(CHUNK_DESIGN_GAPS.iter().all(|gap| !gap.is_empty()));
     }
 }
@@ -423,6 +428,15 @@ mod hypothetical_chunk_model {
         phase: ChunkPhase,
     }
 
+    /// Stable side-metadata pin acquired by offset lookup before a remote
+    /// release waits for the chunk-state mutex.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RemoteReleasePin {
+        chunk: ChunkId,
+        allocation: AllocationId,
+        dropper: ThreadKey,
+    }
+
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct Accounting {
         live_bytes: u32,
@@ -495,6 +509,7 @@ mod hypothetical_chunk_model {
         WrongAllocationHolder,
         WrongQueueOwner,
         ChunkNotActive,
+        ChunkTransferForbidden,
         ChunkBusy,
         WrongPhase,
         AlreadyReclaimed,
@@ -512,6 +527,9 @@ mod hypothetical_chunk_model {
         extents: Vec<Extent>,
         chunks: BTreeMap<ChunkId, Chunk>,
         exited_threads: BTreeSet<ThreadKey>,
+        /// Outstanding registry lookup pins. A pinned allocation remains
+        /// Live until the operation commits or explicitly cancels.
+        remote_release_pins: BTreeSet<AllocationId>,
         accounting: Accounting,
     }
 
@@ -525,6 +543,7 @@ mod hypothetical_chunk_model {
                 extents: Vec::new(),
                 chunks: BTreeMap::new(),
                 exited_threads: BTreeSet::new(),
+                remote_release_pins: BTreeSet::new(),
                 accounting: Accounting::default(),
             }
         }
@@ -715,19 +734,108 @@ mod hypothetical_chunk_model {
             let chunk_id = extent.chunk.ok_or(ModelError::InvariantViolation)?;
             let chunk = self.chunk(chunk_id)?;
             let local = chunk.phase == ChunkPhase::Active && chunk.owner == dropper;
-            let route = if local {
-                PendingRoute::LocalCollector
+            if local {
+                self.extents[index].state = ExtentState::PendingRelease {
+                    owner: chunk.owner,
+                    allocation,
+                    route: PendingRoute::LocalCollector,
+                };
             } else {
-                PendingRoute::RemoteQueue
-            };
-            self.extents[index].state = ExtentState::PendingRelease {
-                owner: chunk.owner,
-                allocation,
-                route,
-            };
+                let pin = self.begin_remote_release(allocation, dropper)?;
+                self.commit_remote_release(pin)?;
+            }
             // Live and pending bytes share the public live accounting bucket.
             self.assert_valid();
             Ok(())
+        }
+
+        /// Pin an offset-to-chunk lookup before it waits for the chunk mutex.
+        /// This is a separate model step so owner retirement can interleave
+        /// between lookup and release publication.
+        fn begin_remote_release(
+            &mut self,
+            allocation: AllocationId,
+            dropper: ThreadKey,
+        ) -> Result<RemoteReleasePin, ModelError> {
+            self.ensure_thread_active(dropper)?;
+            let index = self
+                .extent_for_allocation(allocation)
+                .ok_or(ModelError::UnknownOrStaleAllocation)?;
+            let extent = self.extents[index];
+            match extent.state {
+                ExtentState::Live { holder, .. } if holder == dropper => {}
+                ExtentState::Live { .. } => return Err(ModelError::WrongAllocationHolder),
+                _ => return Err(ModelError::UnknownOrStaleAllocation),
+            }
+            let chunk_id = extent.chunk.ok_or(ModelError::InvariantViolation)?;
+            let chunk = self.chunk(chunk_id)?;
+            if !matches!(chunk.phase, ChunkPhase::Active | ChunkPhase::Retiring) {
+                return Err(ModelError::ChunkNotActive);
+            }
+            if chunk.owner == dropper {
+                return Err(ModelError::WrongChunkOwner);
+            }
+            if !self.remote_release_pins.insert(allocation) {
+                return Err(ModelError::ChunkBusy);
+            }
+            let pin = RemoteReleasePin {
+                chunk: chunk_id,
+                allocation,
+                dropper,
+            };
+            self.assert_valid();
+            Ok(pin)
+        }
+
+        /// Commit a pinned remote drop while holding the chunk-state lock.
+        /// This remains valid after the home changes `Active -> Retiring`.
+        fn commit_remote_release(
+            &mut self,
+            pin: RemoteReleasePin,
+        ) -> Result<(), ModelError> {
+            self.ensure_thread_active(pin.dropper)?;
+            if !self.remote_release_pins.contains(&pin.allocation) {
+                return Err(ModelError::UnknownOrStaleAllocation);
+            }
+            let index = self
+                .extent_for_allocation(pin.allocation)
+                .ok_or(ModelError::UnknownOrStaleAllocation)?;
+            let extent = self.extents[index];
+            match extent.state {
+                ExtentState::Live { holder, .. } if holder == pin.dropper => {}
+                ExtentState::Live { .. } => return Err(ModelError::WrongAllocationHolder),
+                _ => return Err(ModelError::UnknownOrStaleAllocation),
+            }
+            if extent.chunk != Some(pin.chunk) {
+                return Err(ModelError::UnknownChunk);
+            }
+            let chunk = self.chunk(pin.chunk)?;
+            if !matches!(chunk.phase, ChunkPhase::Active | ChunkPhase::Retiring) {
+                return Err(ModelError::ChunkNotActive);
+            }
+            self.extents[index].state = ExtentState::PendingRelease {
+                owner: chunk.owner,
+                allocation: pin.allocation,
+                route: PendingRoute::RemoteQueue,
+            };
+            self.remote_release_pins.remove(&pin.allocation);
+            self.assert_valid();
+            Ok(())
+        }
+
+        /// Cancel a lookup pin if publication aborts before its linearization
+        /// point. The live owner remains authoritative and may retry or cause
+        /// the real implementation to quarantine the chunk on lock failure.
+        fn cancel_remote_release(
+            &mut self,
+            pin: RemoteReleasePin,
+        ) -> Result<(), ModelError> {
+            if self.remote_release_pins.remove(&pin.allocation) {
+                self.assert_valid();
+                Ok(())
+            } else {
+                Err(ModelError::UnknownOrStaleAllocation)
+            }
         }
 
         /// Exact pending reuse is local to the collector that owns the entry.
@@ -856,32 +964,8 @@ mod hypothetical_chunk_model {
             from: ThreadKey,
             to: ThreadKey,
         ) -> Result<(), ModelError> {
-            self.ensure_thread_active(from)?;
-            if to == REAPER {
-                return Err(ModelError::WrongChunkOwner);
-            }
-            self.ensure_thread_active(to)?;
-            let chunk = self.chunk(chunk_id)?;
-            if chunk.phase != ChunkPhase::Active {
-                return Err(ModelError::ChunkNotActive);
-            }
-            if chunk.owner != from {
-                return Err(ModelError::WrongChunkOwner);
-            }
-            if self.has_pending(chunk_id) {
-                return Err(ModelError::ChunkBusy);
-            }
-            self.chunks.get_mut(&chunk_id).unwrap().owner = to;
-            for extent in &mut self.extents {
-                if extent.chunk == Some(chunk_id)
-                    && matches!(extent.state, ExtentState::Reserved { .. })
-                {
-                    extent.state = ExtentState::Reserved { owner: to };
-                }
-            }
-            self.coalesce_reserved(chunk_id);
-            self.assert_valid();
-            Ok(())
+            let _ = (chunk_id, from, to);
+            Err(ModelError::ChunkTransferForbidden)
         }
 
         /// A thread exit drops handles it still holds, flushes its collectors,
@@ -948,7 +1032,7 @@ mod hypothetical_chunk_model {
             if chunk.phase == ChunkPhase::Reclaimed {
                 return Err(ModelError::AlreadyReclaimed);
             }
-            if self.has_live_or_pending(chunk_id) {
+            if self.has_live_or_pending(chunk_id) || self.has_remote_pin(chunk_id) {
                 return Err(ModelError::ChunkBusy);
             }
             if !matches!(
@@ -967,7 +1051,7 @@ mod hypothetical_chunk_model {
             if chunk.phase != ChunkPhase::Reclaiming {
                 return Err(ModelError::WrongPhase);
             }
-            if self.has_live_or_pending(chunk_id) {
+            if self.has_live_or_pending(chunk_id) || self.has_remote_pin(chunk_id) {
                 return Err(ModelError::ChunkBusy);
             }
             let indices = self
@@ -1005,7 +1089,7 @@ mod hypothetical_chunk_model {
             if chunk.phase != ChunkPhase::Reclaiming {
                 return Err(ModelError::WrongPhase);
             }
-            if self.has_live_or_pending(chunk_id) {
+            if self.has_live_or_pending(chunk_id) || self.has_remote_pin(chunk_id) {
                 return Err(ModelError::ChunkBusy);
             }
             let indices = self
@@ -1062,10 +1146,11 @@ mod hypothetical_chunk_model {
             })
         }
 
-        fn has_pending(&self, chunk_id: ChunkId) -> bool {
-            self.extents.iter().any(|extent| {
-                extent.chunk == Some(chunk_id)
-                    && matches!(extent.state, ExtentState::PendingRelease { .. })
+        fn has_remote_pin(&self, chunk_id: ChunkId) -> bool {
+            self.remote_release_pins.iter().any(|allocation| {
+                self.extent_for_allocation(*allocation)
+                    .and_then(|index| self.extents.get(index))
+                    .is_some_and(|extent| extent.chunk == Some(chunk_id))
             })
         }
 
@@ -1286,6 +1371,17 @@ mod hypothetical_chunk_model {
                 return Err(ModelError::InvariantViolation);
             }
 
+            for allocation in &self.remote_release_pins {
+                let Some(index) = self.extent_for_allocation(*allocation) else {
+                    return Err(ModelError::InvariantViolation);
+                };
+                if !matches!(self.extents[index].state, ExtentState::Live { .. })
+                    || self.extents[index].chunk.is_none()
+                {
+                    return Err(ModelError::InvariantViolation);
+                }
+            }
+
             let mut active_ranges = Vec::new();
             for (id, chunk) in &self.chunks {
                 if chunk.id != *id || chunk.len == 0 {
@@ -1489,35 +1585,55 @@ mod hypothetical_chunk_model {
         }
 
         #[test]
-        fn chunk_transfer_requires_draining_remote_publications() {
+        fn active_chunk_owner_transfer_is_forbidden() {
             let mut model = HypotheticalAllocator::new(32);
             let chunk = model.reserve_chunk(thread(1), 16).unwrap();
-            let remotely_freed = model.allocate_from_chunk(chunk, thread(1), 4).unwrap();
-            let still_live = model.allocate_from_chunk(chunk, thread(1), 4).unwrap();
-            model
-                .transfer_live_handle(remotely_freed, thread(1), thread(2))
-                .unwrap();
-            model.release_allocation(remotely_freed, thread(2)).unwrap();
+            let before = model.accounting();
             assert_eq!(
                 model.transfer_chunk(chunk, thread(1), thread(2)),
-                Err(ModelError::ChunkBusy)
+                Err(ModelError::ChunkTransferForbidden)
             );
-            model.flush_remote(chunk, thread(1)).unwrap();
-            assert_eq!(model.accounting().live_bytes, 4);
-            model.transfer_chunk(chunk, thread(1), thread(2)).unwrap();
-            assert_eq!(model.accounting().live_bytes, 4);
-            let transferred = model.allocate_from_chunk(chunk, thread(2), 4).unwrap();
-            assert_ne!(remotely_freed, transferred);
-            assert_ne!(still_live, transferred);
-            assert_eq!(model.chunks[&chunk].owner, thread(2));
+            assert_eq!(model.accounting(), before);
+            assert_eq!(model.chunks[&chunk].owner, thread(1));
+            let _allocation = model.allocate_from_chunk(chunk, thread(1), 4).unwrap();
+            model.assert_valid();
+        }
 
-            // A live allocation remains valid across chunk-owner transfer. Its
-            // later drop is routed to the new owner and counted until flushed.
-            model.release_allocation(still_live, thread(1)).unwrap();
+        #[test]
+        fn pinned_remote_release_survives_owner_retirement_and_blocks_reclaim() {
+            let mut model = HypotheticalAllocator::new(32);
+            let chunk = model.reserve_chunk(thread(1), 16).unwrap();
+            let allocation = model.allocate_from_chunk(chunk, thread(1), 8).unwrap();
+            model
+                .transfer_live_handle(allocation, thread(1), thread(2))
+                .unwrap();
+
+            let canceled = model.begin_remote_release(allocation, thread(2)).unwrap();
+            assert_eq!(
+                model.begin_remote_release(allocation, thread(2)),
+                Err(ModelError::ChunkBusy),
+                "the same live allocation cannot acquire two release pins"
+            );
+            model.cancel_remote_release(canceled).unwrap();
+
+            // The stable record pin is acquired before waiting on the chunk
+            // mutex. Owner exit closes local allocation and hands only the
+            // reaper role the existing record; it cannot reclaim pinned bytes.
+            let pin = model.begin_remote_release(allocation, thread(2)).unwrap();
+            model.thread_exit(thread(1)).unwrap();
+            assert_eq!(model.chunks[&chunk].phase, ChunkPhase::Retiring);
+            assert_eq!(model.chunks[&chunk].owner, REAPER);
+            assert_eq!(model.teardown_chunk(chunk), Err(ModelError::ChunkBusy));
             assert_eq!(model.accounting().live_bytes, 8);
-            model.flush_remote(chunk, thread(2)).unwrap();
-            assert_eq!(model.accounting().live_bytes, 4);
-            assert_eq!(model.accounting().reserved_bytes, 12);
+
+            model.commit_remote_release(pin).unwrap();
+            assert_eq!(model.remote_release_pins.len(), 0);
+            assert_eq!(model.accounting().live_bytes, 8);
+            assert_eq!(model.teardown_chunk(chunk), Err(ModelError::ChunkBusy));
+            assert_eq!(model.flush_remote(chunk, REAPER), Ok(1));
+            model.teardown_chunk(chunk).unwrap();
+            assert_eq!(model.chunks[&chunk].phase, ChunkPhase::Reclaimed);
+            assert_eq!(model.accounting(), Accounting::default());
             model.assert_valid();
         }
 
