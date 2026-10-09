@@ -28,12 +28,15 @@ The owner path currently performs both `read_header` and `validate_typed_header`
 
 The safety argument is that only the checked allocation constructor establishes `T`'s capacity/block relationship, only checked `try_resize` changes it, and the other header writers alter only initialized length. The type is unique and non-cloneable. A raw offset has no such proof and keeps typed validation.
 
-## Added tests (not run)
+## Added and validated tests
 
 - `allocator_issued_headers_satisfy_typed_payload_bounds`: cover zero, small, and larger capacities for `u8`, `u64`, and a 64-byte-aligned payload; compare owner and full typed reads.
 - `resize_capacity_formula_preserves_typed_payload_bounds`: check the exact resize length formula for shrinking and growing candidates of an over-aligned payload.
 - `typed_raw_offset_reader_rejects_payload_beyond_block`: show a structurally valid synthetic header is rejected by the typed external-offset reader. The malformed header is not reachable from any allocator-issued owner.
+- The backend integration test exercises a real 64-byte-aligned owner through fresh allocation, growth, shrink to zero, growth again, pending exact reuse, and post-reuse access.
 
 ## Decision and limits
 
-The source audit closes the invariant proof for owners produced and maintained by the current private API. The prototype still needs central review, formatting/build/test validation, and repeated benchmark comparisons before landing. In particular, do not use `read_owner_header` for externally reconstructed offsets. The new tests are unexecuted because root has reserved the host for hash and collection benchmark windows.
+The source audit and validation support the payload-fit invariant for owners produced and maintained by the current private API. `read_owner_header` must remain restricted to those owners; externally reconstructed offsets continue through typed validation. Central review found no soundness defect, full Miri and focused/full-suite A/B validation passed, and the fast path is accepted for production. The independent metrics and exact validation commands are in `ALLOCATOR_OWNER_HEADER_V2_5_RESULTS.md`.
+
+This acceptance does not close the separate unsafe chunk/TLS allocator gate. The owner-affine chunk design remains blocked on registry pin/reclaim ordering, bounded remote-release storage, TLS/reaper recovery, coherent stats, and a measured metadata/slack cap.

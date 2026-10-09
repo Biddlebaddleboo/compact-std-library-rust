@@ -1,6 +1,6 @@
 # V2.5 owner-header validation experiment
 
-**Status: accepted for production integration.** Central review approved the isolated owner-header fast path after source audit, full Miri, focused and full-suite timing, memory accounting, and compact-only perf counters. The implementation remains on `codex/v25-allocator-targeted` until its commit is integrated. No chunk/TLS code, public layout change, or API change was made.
+**Status: accepted and integrated on `main` at `bdeccd9`.** Central review approved the owner-header fast path after source audit, full Miri, focused/full-suite timing, memory accounting, and compact-only perf counters. The real over-aligned owner resize/reuse integration guard is at `c941e9e`. No chunk/TLS code, public layout change, or API change was made.
 
 ## Candidate and artifacts
 
@@ -62,6 +62,25 @@ Root captured compact-only `perf stat --repeat 3` against the pinned baseline an
 | B10 | Cache misses | 61,537,693 | 63,212,753 | +2.72% |
 
 A2 had a 3.47% cache-miss increase; B10 had 5.56% more branch misses and 2.72% more cache misses. The sampled A2/A4/B6 hot paths improved in wall time and cycles, and no retained-byte/high-water changes occurred.
+
+### B10 timing limits
+
+B10 is especially sensitive to scheduler noise on this two-vCPU VM. In the
+two-suite full profile, compact's median moved −23.94%. A separate nine-pair
+zero-second run moved +10.56% (2.715 to 3.001 ms/rep), with p95 3.059 to
+3.992 ms. Nine paired 0.5-second windows moved −10.18% (3.074 to 2.761
+ms/rep), with p95 3.156 to 3.072 ms. The 0.5-second compact counter capture
+was nearly flat: cycles −0.09%, instructions −2.08%, branches −0.32%, branch
+misses +2.32%, cache misses +2.69%; native counters varied by 16–20% between
+the two release binaries. Raw captures are under
+`/tmp/csl-v25-owner-header-counters/b10-stable-window/` and
+`/tmp/csl-v25-owner-header-candidate/runs/b10-owner-header-9pairs/`.
+
+Treat the B10 latency delta as inconclusive, not as a candidate win or a
+confirmed regression. Acceptance rests on the repeatable A2/A4/B6 gains,
+improving B3/B5 sentinels, unchanged retained/high-water bytes, and no
+material full-suite p95 regression; the small p95 shifts are within the
+two-run noise. Continue B10 monitoring on a multicore host when available.
 
 ## Memory and accounting
 

@@ -73,4 +73,10 @@ The old harness records requested cage capacity (128 MiB in `benchmark_compare`)
 
 The capture still cannot establish virtual reservation, page commitment, or current idle RSS relative to V2.4. For an integrated runtime change, add separate non-timing snapshots for current RSS after the workload has dropped owners and the process has quiesced, virtual mappings, and worker-thread exit. Keep timing binaries free of allocator telemetry. Record absolute-byte deltas alongside ratios; for scenarios with very small baseline RSS, compare byte deltas and repeatability rather than interpreting a rounded percentage as a meaningful alarm.
 
-No runtime layout or allocator policy change is made by this workstream. The only code change is the test fixture for owner and descriptor layouts. No V2.5 memory-budget exception is requested.
+The accepted owner-header fast path changes only validation on private,
+allocator-issued owners. Owner sizes, allocation headers, collection layouts,
+public APIs, serialized descriptors, and allocator accounting are unchanged.
+The all-16 candidate accounting capture found identical compact live bytes,
+peak requested/cage bytes, and zero retained bytes after each scenario; the
+small RSS differences are process-level noise. No V2.5 memory-budget exception
+is requested.

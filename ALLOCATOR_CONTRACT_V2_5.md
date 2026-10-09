@@ -1,6 +1,6 @@
 # V2.5 allocator concurrency contract
 
-**Status:** design gate only, reviewed against `ec68fb78` and the clean all-16 baseline in `/tmp/csl-v25-profile-capture/runs/v25-clean-20261009/`. No production allocator change is authorized by this note.
+**Status:** chunk/TLS design gate only, reviewed against the pinned `b3ca878` baseline. The separate private owner-header validation fast path is accepted and integrated at `bdeccd9`; it does not implement chunk reservation, remote routing, or a new allocator policy. No chunk/TLS production change is authorized by this note.
 
 ## Recommendation
 
@@ -13,7 +13,7 @@ The next architecture to evaluate is **A with B’s local reuse and remote-relea
 | **C. Shorter/sharded critical sections** | Keep as a measured control. R4 rejected request-layout precomputation and header initialization outside the global lock: both improved some B10 timings but regressed A2 or other acceptance cases. Revisit partitioning only after the V2.5 baseline identifies remaining lock contention. |
 | **D. Alternative synchronization/reclamation** | Defer. Lock-free machinery is not a goal and needs a separate proof and approval after a mutex-based design demonstrates a need. |
 
-The proposed first chunk version is owner-affine: a chunk is not handed to another mutator thread. A handle may move between threads, but its chunk home stays fixed. A terminating owner hands its chunk to a reaper only after closing the owner path. The V2.4 model’s active chunk-transfer operation is useful as a scenario, but this proposed contract forbids that transfer; the model needs a rejecting case before it can validate this policy.
+The proposed first chunk version is owner-affine: a chunk is not handed to another mutator thread. A live allocation handle may move between threads, but its chunk home stays fixed. A terminating owner hands its chunk to a reaper only after closing the owner path. The Phase 1 model now rejects active chunk-owner transfer and tests a pinned remote release across retirement; it remains sequential and is not a concurrency proof.
 
 ## Ownership and states
 
@@ -69,9 +69,11 @@ metadata_bytes <= R * M + sum(Q_i * entry_size)
 
 If either budget is exhausted, use the global allocator. Do not let the cap scale with cumulative thread creation. R4’s B10 workload used two worker threads, had a 256,040-byte high-water cursor and 3,444 KiB peak RSS; it did not establish 4/8-worker memory behavior. A hypothetical 32-byte record for each 512-byte chunk would cost 6.25% of B10’s high-water bytes at full occupancy, before queue storage. Thus chunk size and metadata representation are acceptance questions, not settled assumptions.
 
-The clean default B10 suite median was 3.107 ms compact versus 0.618 ms native (5.03x); its three-repeat hardware-counter capture measured 7.62x cycles and 4.25x instructions for compact. A compact perf sample attributed 28.07% self samples to `__aarch64_cas4_acq`, 20.23% to `__aarch64_swp4_rel`, and 16.09% to `Mutex::lock_contended`.
+The pinned `b3ca878` B10 suite median was 3.277 ms compact versus 0.422 ms native (7.77x); its three-repeat hardware-counter capture measured 7.54x cycles and 4.17x instructions for compact. A compact perf sample attributed 27.91% self samples to the AArch64 acquire-CAS instruction; the full symbol report is in `PROFILE_V2_5_BASELINE.md`.
 
-A separate weak-scaling run kept 8,000 input records per worker and checked native/compact checksums at 1, 2, 4, and 8 workers. The host still had only two vCPUs, so the 4/8-worker rows measure oversubscription and scheduler contention rather than physical multicore scaling.
+After the accepted owner-header fast path, the two-suite B10 compact median moved 23.94% and p95 10.33%, while a separate nine-pair zero-second run moved 10.56% slower and nine 0.5-second windows moved 10.18% faster. The 0.5-second compact counter capture was nearly flat (cycles −0.09%, instructions −2.08%). Treat B10 timing as unresolved two-vCPU scheduler noise; the global-mutex synchronization hotspot remains a chunk-design hypothesis, not proof of an accepted allocator redesign.
+
+A pre-owner-header weak-scaling run kept 8,000 input records per worker and checked native/compact checksums at 1, 2, 4, and 8 workers. The host still had only two vCPUs, so the 4/8-worker rows measure oversubscription and scheduler contention rather than physical multicore scaling. Re-run the matrix after a candidate owner/allocator change before using it as a direct comparison.
 
 | Workers | Native median/p95 ms per repetition | Compact median/p95 ms per repetition | Timing ratio | Compact/native cycles | Peak RSS native/compact KiB |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -86,7 +88,7 @@ The plan’s memory gates remain: at most 2% retained-byte increase and 5% peak 
 
 ## Model audit and proof required
 
-`allocator_model.rs` is test-only and explicitly sequential. It has chunk/allocation identities, byte conservation, local/remote pending transitions, transfer, exit/reaper, interrupted teardown recovery, exhaustion, stale-ID rejection, and coalescing cases. It assumes each model method is atomic; it does not prove real mutex/atomic ordering, concurrent interleavings, TLS destructor order, error behavior of `ReleaseCollector::flush_with`, public-stat snapshot semantics, header lifetime, or memory cost. It models a zero-based raw-byte arena, not production headers/alignment or the current `Allocator` fields.
+`allocator_model.rs` is test-only and explicitly sequential. It has chunk/allocation identities, byte conservation, local/remote pending transitions, forbidden active chunk-owner transfer, a remote-release pin across owner retirement, interrupted teardown recovery, exhaustion, stale-ID rejection, and coalescing cases. It assumes each model method is atomic; it does not prove real mutex/atomic ordering, concurrent interleavings, TLS destructor order, error behavior of `ReleaseCollector::flush_with`, public-stat snapshot semantics, header lifetime, or memory cost. It models a zero-based raw-byte arena, not production headers/alignment or the current `Allocator` fields.
 
 Before an unsafe chunk implementation, extend the model and test the selected contract with deterministic barriers: remote publication racing owner exit and reclaim; stale/duplicate release versus address reuse; nested collectors and destructor reentrancy; panic at every reclaim commit step; queue capacity/overflow; allocation failure and exhaustion; high-alignment and fragmented coalescing; and a live suballocation surviving owner exit. Check exact global and per-chunk accounting after every step. Then use a concurrency model checker (such as Loom for the queue/registry protocol), Miri, supported sanitizers, and stress tests. Prove no chunk enters `Reclaimable` or global free while any live or pending allocation, queue entry, or in-flight operation refers to it. Preserve checksum parity and run A2/A4/A5/B8/B10 plus B3/B5 at 1/2/4/8 workers where available only after the baseline.
 

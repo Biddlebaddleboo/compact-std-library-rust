@@ -1,6 +1,6 @@
 # V2.5 allocator phase 1: owner-affine chunk safety model
 
-**Status:** phase 1 proposal for central review. No production `cage.rs` changes. The test-only model now rejects mutator-to-mutator chunk transfer and exposes the remote lookup/commit interleaving with owner retirement. This does not close the unsafe implementation gate.
+**Status:** phase 1 proposal for central review. At this phase no production `cage.rs` changes were made; a later independent owner-header validation fast path is recorded in `ALLOCATOR_OWNER_HEADER_V2_5_RESULTS.md`. The test-only model rejects mutator-to-mutator chunk transfer and exposes the remote lookup/commit interleaving with owner retirement. This does not close the unsafe chunk-implementation gate.
 
 ## Candidate state and interface
 
