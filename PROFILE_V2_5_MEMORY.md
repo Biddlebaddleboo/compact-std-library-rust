@@ -50,7 +50,16 @@ An allocation's 16-byte header and any alignment prefix live in the cage block, 
 | B9 | 5,193,776 | 3,840,072 | −1,353,704 | 3,840,080 | 17,224 / 19,172 |
 | B10 | 256,048 | 256,032 | −16 | 256,040 | 3,296 / 3,412 |
 
-All compact scenarios returned to zero live cage bytes at completion. The per-phase release snapshots showed zero post-drop reusable bytes in these runs; B8 is the exception during its deliberate cache-churn cycles and is summarized below. Scenario repetitions were the harness defaults: 15 for A1–A6, 9 for B1–B4/B6/B8, and 7 for B5/B7/B9/B10. B10 used two build, two churn, and two traversal workers; the host had only two vCPUs.
+All compact scenarios returned to zero live cage bytes at completion. The per-phase release snapshots showed zero post-drop reusable bytes in these runs; B8 is the exception during its deliberate cache-churn cycles and is summarized below. Scenario repetitions were the harness defaults: 15 for A1–A6, 9 for B1–B4/B6/B8, and 7 for B5/B7/B9/B10. Default B10 uses two build, two churn, and two traversal workers. A separate B10 weak-scaling capture used 1, 2, 4, and 8 workers with 8,000 records per worker; this shared host has only two vCPUs, so the 4/8-worker results show oversubscription rather than physical multicore scaling.
+
+| B10 workers | Native build-live (B) | Compact build-live (B) | Compact cursor high-water (B) | Peak RSS native / compact (KiB) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 128,048 | 128,016 | 128,024 | 2,952 / 3,084 |
+| 2 | 256,048 | 256,032 | 256,040 | 3,332 / 3,348 |
+| 4 | 512,096 | 512,064 | 512,072 | 3,612 / 3,868 |
+| 8 | 1,024,192 | 1,024,128 | 1,024,136 | 5,080 / 4,952 |
+
+The retained-byte and cursor totals grow with the fixed per-worker data set. These runs do not measure current RSS after thread exit or prove reclamation on a multicore host.
 
 ## Fragmentation and allocator slack
 
