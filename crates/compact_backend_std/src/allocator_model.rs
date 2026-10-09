@@ -789,10 +789,7 @@ mod hypothetical_chunk_model {
 
         /// Commit a pinned remote drop while holding the chunk-state lock.
         /// This remains valid after the home changes `Active -> Retiring`.
-        fn commit_remote_release(
-            &mut self,
-            pin: RemoteReleasePin,
-        ) -> Result<(), ModelError> {
+        fn commit_remote_release(&mut self, pin: RemoteReleasePin) -> Result<(), ModelError> {
             self.ensure_thread_active(pin.dropper)?;
             if !self.remote_release_pins.contains(&pin.allocation) {
                 return Err(ModelError::UnknownOrStaleAllocation);
@@ -826,10 +823,7 @@ mod hypothetical_chunk_model {
         /// Cancel a lookup pin if publication aborts before its linearization
         /// point. The live owner remains authoritative and may retry or cause
         /// the real implementation to quarantine the chunk on lock failure.
-        fn cancel_remote_release(
-            &mut self,
-            pin: RemoteReleasePin,
-        ) -> Result<(), ModelError> {
+        fn cancel_remote_release(&mut self, pin: RemoteReleasePin) -> Result<(), ModelError> {
             if self.remote_release_pins.remove(&pin.allocation) {
                 self.assert_valid();
                 Ok(())

@@ -51,7 +51,29 @@ fn process_cage_owners_layout_drop_and_threaded_release() {
     aligned.push(Aligned([7; 64])).unwrap();
     assert_eq!(aligned.as_slice().as_ptr() as usize % 64, 0);
     assert_eq!(aligned.as_slice()[0].0[0], 7);
-    drop(aligned);
+    let aligned_offset = aligned.offset().as_u32();
+    assert!(aligned.try_resize(4).unwrap());
+    assert_eq!(aligned.capacity(), 4);
+    aligned.truncate(0);
+    assert!(aligned.try_resize(0).unwrap());
+    assert_eq!(aligned.capacity(), 0);
+    assert!(aligned.try_resize(4).unwrap());
+    assert_eq!(aligned.offset().as_u32(), aligned_offset);
+
+    let mut reused_aligned = CompactRuntime::with_batched_releases(|| {
+        drop(aligned);
+        CompactRuntime::alloc_owned_slice::<Aligned>(4).unwrap()
+    });
+    if BENCHMARK_POLICY_A {
+        assert_ne!(reused_aligned.offset().as_u32(), aligned_offset);
+    } else {
+        assert_eq!(reused_aligned.offset().as_u32(), aligned_offset);
+    }
+    assert_eq!(reused_aligned.len(), 0);
+    reused_aligned.push(Aligned([9; 64])).unwrap();
+    assert_eq!(reused_aligned.as_slice().as_ptr() as usize % 64, 0);
+    assert_eq!(reused_aligned.as_slice()[0].0[0], 9);
+    drop(reused_aligned);
 
     let mut zero_sized = CompactRuntime::alloc_owned_slice::<()>(3).unwrap();
     zero_sized.push(()).unwrap();
