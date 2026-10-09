@@ -1846,7 +1846,7 @@ fn concurrent_workers(variant: &str, repetitions: usize) -> BenchResult<u64> {
     let build = || -> BenchResult<WorkerState> {
         if compact {
             std::thread::scope(|scope| -> BenchResult<Vec<CompactVec<WorkerRecord>>> {
-                let mut handles = Vec::with_capacity(datasets::WORKERS);
+                let mut handles = Vec::with_capacity(worker_count);
                 for (worker, records) in seeds.iter().enumerate() {
                     handles.push(
                         std::thread::Builder::new()
@@ -1875,7 +1875,7 @@ fn concurrent_workers(variant: &str, repetitions: usize) -> BenchResult<u64> {
             .map(WorkerState::Compact)
         } else {
             let workers = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(datasets::WORKERS);
+                let mut handles = Vec::with_capacity(worker_count);
                 for (worker, records) in seeds.iter().enumerate() {
                     handles.push(
                         std::thread::Builder::new()
