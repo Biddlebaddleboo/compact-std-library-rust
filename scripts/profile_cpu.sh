@@ -233,6 +233,7 @@ suite() {
         fi
         run_profile_suite "$RUN_DIR/suite/run${run}" "$order"
     done
+    printf '%s\n' "$RUN_ID" > "$OUT/latest-profile-run"
     echo "Wrote $suite_runs accounting-free full suites to $RUN_DIR/suite"
     summarize
 }
@@ -257,6 +258,7 @@ noisy() {
             run_profile_suite "$RUN_DIR/noisy/run${run}-${scenario}" "$order" "$scenario"
         done
     done
+    printf '%s\n' "$RUN_ID" > "$OUT/latest-profile-run"
     echo "Wrote $noisy_runs repeated samples for ${#selected_scenarios[@]} scenarios to $RUN_DIR/noisy"
     summarize
 }
