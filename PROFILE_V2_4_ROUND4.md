@@ -81,7 +81,7 @@ Its diagnostic repetitions were 15 for A2, 9 for B8, and 7 for B10.
 | B8 | 178,375 | 3,829,227 | 53,576 / 124,594 | 524,340 / 124,594 |
 | B10 | 128,092 | 18,891 | 64,016 / 64,016 | 0 / 64,016 |
 
-Telemetry lock-phase timers include instrumentation and are not production lock-latency measurements. B8 cache-cycle snapshots reached a 4,424,784-byte high-water cursor; the largest observed free total was 804,528 bytes in one extent, with at most two free extents. This capture did not show a large fragmented-free-space tail.
+Telemetry lock-phase timers include instrumentation and are not production lock-latency measurements. Correction from the raw `measure-stats.tsv`: the B8 per-phase high-water cursor was 4,424,784 bytes, but its separate cache-cycle snapshots reached 5,211,232 bytes, 1,590,976 total free bytes, four free extents, and a largest extent of 1,588,240 bytes. The earlier summary quoted an incomplete portion of the cache-cycle trace. Keep the per-phase and diagnostic high-water paths distinct; B8 can produce a substantial free-space tail during churn.
 
 CPU profiling used `cpu-clock:u` at 499 Hz. Every perf capture with samples reported zero lost samples. The largest compact exclusive symbols were:
 
