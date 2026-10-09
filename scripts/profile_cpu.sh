@@ -52,6 +52,7 @@ Set PROFILE_OUT to store artifacts outside the default /tmp path. Set
 PROFILE_USE_SUDO=1 on hosts that require sudo -n perf.
 Set CSL_B10_WORKERS=1..8 to scale B10; the default is two workers with
 8,000 records per worker.
+Set COUNTER_REPEAT to choose hardware-counter repetitions (default three).
 EOF
 }
 
@@ -455,7 +456,7 @@ counters() {
     fi
     local event_csv
     event_csv=$(IFS=,; printf '%s' "${supported_events[*]}")
-    local repeats=${COUNTER_REPEAT:-5}
+    local repeats=${COUNTER_REPEAT:-3}
     [[ "$repeats" =~ ^[1-9][0-9]*$ ]] || {
         echo "COUNTER_REPEAT must be a positive integer" >&2
         return 2
