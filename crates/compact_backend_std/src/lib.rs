@@ -5,6 +5,8 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("compact_backend_std requires a 64-bit process ABI");
 
+#[cfg(test)]
+mod allocator_model;
 mod cage;
 mod scratch;
 

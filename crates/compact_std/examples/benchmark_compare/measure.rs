@@ -225,6 +225,17 @@ pub type Mutation<'a, T> = (
 );
 pub type Read<'a, T> = (&'static str, Box<dyn FnMut(&T) -> BenchResult<u64> + 'a>);
 
+pub fn validate_compact_state(scenario: &str, variant: &str) -> BenchResult<()> {
+    let live_bytes = CompactRuntime::used_bytes()?;
+    if live_bytes != 0 {
+        return Err(
+            format!("{scenario}/{variant} left {live_bytes} cage bytes live after drop").into(),
+        );
+    }
+    CompactRuntime::validate_allocator_state()?;
+    Ok(())
+}
+
 pub fn run_case<T>(
     scenario: &str,
     variant: &str,
@@ -342,15 +353,8 @@ pub fn run_case<T>(
         }
     }
 
-    if compact {
-        if CompactRuntime::used_bytes()? != 0 {
-            return Err(format!(
-                "{scenario}/{variant} left {} cage bytes live after drop",
-                CompactRuntime::used_bytes()?
-            )
-            .into());
-        }
-        CompactRuntime::validate_allocator_state()?;
+    if compact && mode == MeasurementMode::Measure {
+        validate_compact_state(scenario, variant)?;
     }
     let checksum = expected_checksum.unwrap_or(0);
     println!(

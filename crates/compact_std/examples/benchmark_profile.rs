@@ -9,6 +9,10 @@
 //! * no counting global allocator is installed (the process uses `System`),
 //! * no per-phase allocator snapshot is taken, so the cage lock is untouched
 //!   while the workload runs,
+//! * compact allocator state is checked after each window, outside the
+//!   recorded workload time, and
+//! * a whole-process profiler can still observe that single post-window check;
+//!   it is excluded from the elapsed_ns value, and
 //! * each `--window` invocation repeats one scenario/variant for a wall-clock
 //!   target so a sampler gets enough samples, including the named B10 worker
 //!   threads, and
@@ -16,6 +20,7 @@
 //!   reports, which is how mode equivalence is proven.
 //!
 //! Usage (driver): profile every scenario for three seconds per variant.
+//! Variant order can be fixed, alternate by scenario, or alternate-reversed.
 //! ```text
 //! cargo run --release -p compact_std --example benchmark_profile \
 //!     --features json,toml -- --seconds 3 --output /tmp/v24-profile.tsv
@@ -63,6 +68,7 @@ fn run_driver(arguments: &[String]) -> BenchResult<()> {
     let mut output_path = None;
     let mut scenario_filters = Vec::new();
     let mut variant_filters = Vec::new();
+    let mut variant_order = VariantOrder::Fixed;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -121,6 +127,15 @@ fn run_driver(arguments: &[String]) -> BenchResult<()> {
                 }
                 variant_filters.push(variant);
             }
+            "--order" => {
+                index += 1;
+                variant_order = VariantOrder::from_name(
+                    arguments
+                        .get(index)
+                        .ok_or("--order requires fixed, alternate, or alternate-reversed")?,
+                )
+                .ok_or("--order requires fixed, alternate, or alternate-reversed")?;
+            }
             other => return Err(format!("unknown argument {other:?}").into()),
         }
         index += 1;
@@ -143,15 +158,20 @@ fn run_driver(arguments: &[String]) -> BenchResult<()> {
 
     let mut metadata = Vec::new();
     println!(
-        "Profiling windows: {} scenario(s) x {} variant(s), target {seconds:.1}s each, no allocator accounting.",
+        "Profiling windows: {} scenario(s) x {} variant(s), target {seconds:.1}s each, order {}, no allocator accounting.",
         selected_scenarios.len(),
-        variants.len()
+        variants.len(),
+        variant_order.name()
     );
-    for &(scenario, description) in &selected_scenarios {
+    metadata.push(format!(
+        "META\tsuite\tvariant_order\t{}",
+        variant_order.name()
+    ));
+    for (scenario_index, &(scenario, description)) in selected_scenarios.iter().enumerate() {
         eprintln!("profile {scenario}: {description}");
         let runs = runs_override.unwrap_or_else(|| scenarios::repetitions_for(scenario));
         let mut pair_checksums = Vec::new();
-        for &variant in &variants {
+        for &variant in &variant_order.variants(scenario_index, &variants) {
             let (window_metadata, checksum) =
                 run_window_process(&executable, scenario, variant, runs, seconds)?;
             metadata.extend(window_metadata);
@@ -183,6 +203,45 @@ fn run_driver(arguments: &[String]) -> BenchResult<()> {
         eprintln!("wrote profile metadata to {path}");
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VariantOrder {
+    Fixed,
+    Alternate,
+    AlternateReversed,
+}
+
+impl VariantOrder {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Alternate => "alternate",
+            Self::AlternateReversed => "alternate-reversed",
+        }
+    }
+
+    fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "fixed" => Some(Self::Fixed),
+            "alternate" => Some(Self::Alternate),
+            "alternate-reversed" => Some(Self::AlternateReversed),
+            _ => None,
+        }
+    }
+
+    fn variants<'a>(self, scenario_index: usize, variants: &[&'a str]) -> Vec<&'a str> {
+        let reverse = match self {
+            Self::Fixed => false,
+            Self::Alternate => scenario_index % 2 == 1,
+            Self::AlternateReversed => scenario_index % 2 == 0,
+        };
+        let mut ordered = variants.to_vec();
+        if reverse && ordered.len() == 2 {
+            ordered.reverse();
+        }
+        ordered
+    }
 }
 
 fn run_window_process(
@@ -227,6 +286,7 @@ fn run_window_process(
                 }
             }
             checksum = Some(reported);
+            metadata.push(line.to_owned());
         } else if line.starts_with("META\t") {
             metadata.push(line.to_owned());
         }
@@ -277,19 +337,23 @@ fn run_window(arguments: &[String]) -> BenchResult<()> {
     }
 
     let target = Duration::from_secs_f64(seconds);
-    let started = Instant::now();
-    let deadline = started + target;
+    let mut workload_elapsed = Duration::ZERO;
     let mut windows = 0_u64;
     loop {
+        let window_started = Instant::now();
         scenarios::run(scenario, variant, runs)?;
+        workload_elapsed += window_started.elapsed();
         windows += 1;
-        if Instant::now() >= deadline {
+        if variant == "compact" {
+            measure::validate_compact_state(scenario, variant)?;
+        }
+        if workload_elapsed >= target {
             break;
         }
     }
     println!(
         "META\tprofile_window\t{scenario}\t{variant}\twindows\t{windows}\truns_per_window\t{runs}\ttarget_seconds\t{seconds:.3}\telapsed_ns\t{}",
-        started.elapsed().as_nanos()
+        workload_elapsed.as_nanos()
     );
     Ok(())
 }

@@ -28,6 +28,8 @@ jobs:
         run: cargo miri test -p compact_collections --test cage_collections
       - name: Borrow-scoped deque batch view
         run: cargo miri test -p compact_collections --test deque_view
+      - name: Batched collection access
+        run: cargo miri test -p compact_collections --test collection_batch_access
       - name: Cage allocator ownership and drop behavior
         run: cargo miri test -p compact_backend_std --test integration
       - name: Intrusive allocator invariants

@@ -242,6 +242,9 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
         return Err(format!("unknown benchmark variant {variant:?}").into());
     }
     scenarios::run(scenario, variant, repetitions)?;
+    if variant == "compact" && mode == MeasurementMode::Profile {
+        measure::validate_compact_state(scenario, variant)?;
+    }
     #[cfg(feature = "allocator-telemetry")]
     if variant == "compact" {
         let stats = compact_std::CompactRuntime::allocator_stats()?;

@@ -3710,6 +3710,67 @@ mod tests {
     }
 
     #[test]
+    fn production_allocator_operations_use_model_legal_transitions() {
+        use crate::allocator_model::{transition_is_legal, ByteState, ThreadKey};
+        let owner = ThreadKey(1);
+        let state = local_state(4096);
+        let mut allocator = lock(&state).unwrap();
+
+        // Keep a live block after the first allocation so releasing the first
+        // creates a reusable extent instead of contracting the unallocated tail.
+        let first = local_allocate(&state, &mut allocator, 24);
+        let blocker = local_allocate(&state, &mut allocator, 24);
+        let mut release_first = [first];
+        local_release(&state, &mut allocator, &mut release_first);
+
+        // Free -> Live on an actual free-list or size-class allocation.
+        let (data, prefix, block_len) = allocate_block(&state, &mut allocator, 24, 8).unwrap();
+        let reused = ReleaseExtent {
+            start: data - size_of::<AllocationHeader>() as u32 - prefix,
+            len: block_len,
+        };
+        assert_eq!(reused, first);
+        assert!(transition_is_legal(
+            ByteState::Free,
+            ByteState::Live { owner }
+        ));
+
+        // Live -> PendingRelease when the reused extent enters a collector.
+        let mut collector = ReleaseCollector::new();
+        collector.push(reused);
+        assert!(transition_is_legal(
+            ByteState::Live { owner },
+            ByteState::PendingRelease { owner }
+        ));
+
+        // PendingRelease -> Live on exact-size pending reuse.
+        let (lookup, recycled) = collector.take_compatible(state.base(), 24, 8);
+        assert!(matches!(lookup, PendingLookup::Recycled));
+        let recycled = recycled.expect("the pending exact extent is compatible");
+        assert_eq!(recycled.block_len, reused.len);
+        assert_eq!(
+            recycled.data_offset.get(),
+            reused.start + recycled.prefix + size_of::<AllocationHeader>() as u32
+        );
+        assert!(transition_is_legal(
+            ByteState::PendingRelease { owner },
+            ByteState::Live { owner }
+        ));
+
+        // Live -> Free when the exact reused extent is flushed globally.
+        let mut release_reused = [reused];
+        local_release(&state, &mut allocator, &mut release_reused);
+        assert!(transition_is_legal(
+            ByteState::Live { owner },
+            ByteState::Free
+        ));
+        let mut release_blocker = [blocker];
+        local_release(&state, &mut allocator, &mut release_blocker);
+        assert_eq!(allocator.live_bytes, 0);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
     fn deterministic_allocator_churn_matches_live_extent_model() {
         let state = local_state(64 * 1024);
         let mut allocator = lock(&state).unwrap();

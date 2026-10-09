@@ -1,5 +1,5 @@
 use crate::datasets;
-use crate::measure::{self, BenchResult, Mutation, Read};
+use crate::measure::{self, BenchResult, MeasurementMode, Mutation, Read};
 use crate::models::*;
 use compact_std::{
     CompactBox, CompactBytes, CompactHashMap, CompactHashSet, CompactPathBuf, CompactRuntime,
@@ -66,7 +66,10 @@ pub fn run(scenario: &str, variant: &str, repetitions: usize) -> BenchResult<()>
         "B10" => concurrent_workers(variant, repetitions)?,
         _ => return Err(format!("unknown scenario {scenario:?}").into()),
     };
-    if compact && CompactRuntime::used_bytes()? != 0 {
+    if compact
+        && measure::measurement_mode() == MeasurementMode::Measure
+        && CompactRuntime::used_bytes()? != 0
+    {
         return Err(format!("{scenario} retained cage bytes after scenario completion").into());
     }
     let _ = checksum;
@@ -1533,7 +1536,9 @@ fn cache_churn(variant: &str, repetitions: usize) -> BenchResult<u64> {
         vec![mutation],
         vec![reads],
     )?;
-    if compact {
+    if compact && measure::measurement_mode() == MeasurementMode::Measure {
+        // This allocator-state diagnostic is outside the measured B8 phases.
+        // Keep it out of accounting-free timing and CPU-profile windows.
         diagnose_cache_fragmentation(&seeds)?;
     }
     Ok(checksum)
