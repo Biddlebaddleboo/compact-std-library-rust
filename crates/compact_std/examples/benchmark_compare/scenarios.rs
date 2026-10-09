@@ -1833,7 +1833,15 @@ enum WorkerState {
 }
 
 fn concurrent_workers(variant: &str, repetitions: usize) -> BenchResult<u64> {
-    let seeds = datasets::worker_records();
+    let worker_count = match std::env::var("CSL_B10_WORKERS") {
+        Ok(value) => value.parse::<usize>()?,
+        Err(std::env::VarError::NotPresent) => datasets::WORKERS,
+        Err(error) => return Err(Box::new(error)),
+    };
+    if !(1..=8).contains(&worker_count) {
+        return Err("CSL_B10_WORKERS must be between 1 and 8".into());
+    }
+    let seeds = datasets::worker_records(worker_count);
     let compact = variant == "compact";
     let build = || -> BenchResult<WorkerState> {
         if compact {
@@ -1900,9 +1908,7 @@ fn concurrent_workers(variant: &str, repetitions: usize) -> BenchResult<u64> {
     );
     println!(
         "META\tworker_threads\tB10\t{variant}\tbuild={}\tchurn={}\ttraversal={}",
-        datasets::WORKERS,
-        datasets::WORKERS,
-        datasets::WORKERS
+        worker_count, worker_count, worker_count
     );
     measure::run_case(
         "B10",

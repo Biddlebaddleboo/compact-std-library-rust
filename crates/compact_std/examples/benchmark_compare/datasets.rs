@@ -289,8 +289,8 @@ pub fn frozen_catalog() -> Vec<NativeCatalogRecord> {
         .collect()
 }
 
-pub fn worker_records() -> Vec<Vec<WorkerRecord>> {
-    (0..WORKERS)
+pub fn worker_records(worker_count: usize) -> Vec<Vec<WorkerRecord>> {
+    (0..worker_count)
         .map(|worker| {
             (0..WORKER_RECORDS)
                 .map(|index| WorkerRecord {
