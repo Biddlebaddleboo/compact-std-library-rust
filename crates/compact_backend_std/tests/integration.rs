@@ -81,6 +81,30 @@ fn process_cage_owners_layout_drop_and_threaded_release() {
     assert_eq!(zero_sized.len(), 2);
     drop(zero_sized);
 
+    // Repeated small allocate/drop cycles reuse the same range without
+    // changing the four-byte owner representation.
+    let first_cycle = CompactRuntime::alloc_owned_slice::<u8>(16).unwrap();
+    let cycle_offset = first_cycle.offset().as_u32();
+    drop(first_cycle);
+    for _ in 0..128 {
+        let cycle = CompactRuntime::alloc_owned_slice::<u8>(16).unwrap();
+        assert_eq!(cycle.offset().as_u32(), cycle_offset);
+        drop(cycle);
+    }
+    assert_eq!(CompactRuntime::used_bytes().unwrap(), 0);
+    CompactRuntime::validate_allocator_state().unwrap();
+
+    for _ in 0..32 {
+        thread::spawn(|| {
+            let allocation = CompactRuntime::alloc_owned_slice::<u8>(16).unwrap();
+            drop(allocation);
+        })
+        .join()
+        .unwrap();
+    }
+    assert_eq!(CompactRuntime::used_bytes().unwrap(), 0);
+    CompactRuntime::validate_allocator_state().unwrap();
+
     let mut tail = CompactRuntime::alloc_owned_slice::<u32>(2).unwrap();
     tail.push(11).unwrap();
     let tail_offset = tail.offset().as_u32();
@@ -190,6 +214,9 @@ fn process_cage_owners_layout_drop_and_threaded_release() {
     allocation_done.wait();
     worker.join().unwrap();
     drop(other_thread_owner);
+    // Flush this thread's bounded cache so the next allocation exercises the
+    // cross-thread release published by the worker.
+    let _ = CompactRuntime::used_bytes().unwrap();
     let globally_released_owner = CompactRuntime::alloc_owned_slice::<u64>(3).unwrap();
     assert_eq!(globally_released_owner.offset().as_u32(), pending_offset);
     drop(globally_released_owner);
@@ -240,6 +267,18 @@ fn process_cage_owners_layout_drop_and_threaded_release() {
     drop(first);
     let second = CompactRuntime::alloc_owned_slice::<u64>(16).unwrap();
     assert_eq!(second.offset().as_u32(), first_offset);
+
+    let (owner_sender, owner_receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        owner_sender
+            .send(CompactRuntime::alloc_owned_slice::<u8>(16).unwrap())
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+    drop(owner_receiver.recv().unwrap());
+    drop(second);
+    assert_eq!(CompactRuntime::used_bytes().unwrap(), 0);
     assert!(matches!(
         CompactRuntime::init(CageConfig::new(1024)),
         Err(compact_core::Error::RuntimeAlreadyInitialized)

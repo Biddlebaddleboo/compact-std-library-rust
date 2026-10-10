@@ -1,24 +1,20 @@
 //! State-transition contract for allocator-owned cage bytes.
 //!
-//! This module is the design gate required by `PLAN_ALLOCATOR_CONCURRENCY.md`
-//! ("Mandatory state-machine design gate") before any thread-local chunk or
-//! reservation scheme may be implemented. It is documentation plus a small
-//! executable model. It adds no runtime allocator behaviour, no `unsafe`, and
-//! no fields to any retained or frozen layout; it is compiled only under
-//! `cfg(test)` so it cannot affect production codegen.
+//! This test-only module captures the ownership gate for the proposed
+//! owner-affine chunk manager. It is documentation plus a small executable
+//! model. Production now has a separate bounded exact-extent cache, but that
+//! cache does not reserve or transfer chunks. This module adds no runtime
+//! behavior, no `unsafe`, and no fields to any retained or frozen layout.
 //!
 //! # Why this exists
 //!
-//! The production allocator serializes every mutation behind one process-wide
-//! mutex. Deterministic measurement on the two-vCPU Neoverse host shows B10's
-//! `parallel_allocate_drop_churn` performs exactly one lock acquisition per
-//! allocation and one per release (16,000 acquisitions for 8,000
-//! allocate/drop pairs, zero pending reuse, zero size-class hits, 8,000 cursor
-//! fallbacks). The only changes that remove either acquisition are the gated
-//! thread-local reservation/caching schemes. Those schemes are unsafe to build
-//! without an explicit ownership contract, so this module records that
-//! contract, the legal transitions, the invariants, and the questions a chunk
-//! implementation must answer.
+//! The pinned baseline serialized every allocation and release behind one
+//! process-wide mutex. In the measured two-worker B10 case that meant 16,000
+//! acquisitions for 8,000 allocate/drop pairs. The production exact-extent
+//! cache now removes those acquisitions after contention is detected; the
+//! chunk reservation and teardown design remains gated. This module records
+//! that proposed chunk contract, its legal transitions, its invariants, and
+//! the questions a future chunk implementation must answer.
 //!
 //! # Byte states
 //!
@@ -31,15 +27,19 @@
 //! | --- | --- | --- | --- |
 //! | `Reserved` | Handed to one thread for future bump allocation; no header yet | the owning thread's chunk record | `reserved_bytes` (new, separate) |
 //! | `Live` | Covered by exactly one `AllocationHeader` | the unique `CageAllocation<T>` handle; its holder may change threads when `T: Send` | `live_bytes` |
-//! | `PendingRelease` | Handle dropped; held by the current thread's `ReleaseCollector` | the collector that received the release, which may differ from the former handle holder | `live_bytes` (unchanged) |
+//! | `PendingRelease` | Handle dropped; held by a collector or in-cage retry list | the collector/queue that received the release | `live_bytes` (unchanged) |
+//! | `LocallyReusable` | A bounded per-thread cache owns the released extent | the registered cache for the dropping thread | `live_bytes` until reuse or shared publication |
 //! | `Free` | On the general free list or in a size-class cache | the global `Allocator` | `free_bytes` |
 //! | `Reclaimable` | Unused slack in a reserved chunk at teardown | the tearing-down thread until it is published | `reclaimable_bytes` separately; then `free_bytes` after publication |
+//! | `Quarantined` | A release or metadata error made reuse unsafe | the retained descriptor/faulted cage | `quarantined_bytes` in the model; production has no separate public bucket |
 //!
 //! # Legal transitions
 //!
 //! See [`transition_is_legal`] for the executable table. Production paths use
 //! `Free -> Live`, `Live -> PendingRelease`, `PendingRelease -> Live` (same
-//! collector only), `Live -> Free`, and `PendingRelease -> Free`. A live
+//! collector only), `PendingRelease -> LocallyReusable`, `LocallyReusable ->
+//! Live` (same cache owner), `LocallyReusable -> Free`, `Live -> Free`, and
+//! `PendingRelease -> Free`. A live
 //! handle may move between threads without changing its bytes; a remote drop
 //! records the receiving collector as the `PendingRelease` owner. The chunk
 //! design adds `Free -> Reserved`, `Reserved -> Live` (same thread),
@@ -56,14 +56,15 @@
 //! # Invariants a chunk implementation must preserve
 //!
 //! 1. Every byte has exactly one state and, when owned, exactly one owner.
-//! 2. `live_bytes == sum(Live) + sum(PendingRelease)`.
-//! 3. `live_bytes + free_bytes + reserved_bytes + reclaimable_bytes == cursor - INITIAL_CURSOR`.
-//! 4. No byte is simultaneously `Free` and (`Live` | `PendingRelease` | `Reserved`).
-//! 5. A chunk may become `Reclaimable` only once it holds zero `Live` and zero
-//!    `PendingRelease` bytes. No chunk byte is ever globally reusable while any
-//!    suballocation of that chunk is live.
+//! 2. `live_bytes == sum(Live) + sum(PendingRelease) + sum(LocallyReusable)`.
+//! 3. `live_bytes + free_bytes + reserved_bytes + reclaimable_bytes + quarantined_bytes == cursor - INITIAL_CURSOR`.
+//! 4. No byte is simultaneously `Free` and (`Live` | `PendingRelease` | `LocallyReusable` | `Reserved` | `Quarantined`).
+//! 5. A chunk may become `Reclaimable` only once it holds zero `Live`,
+//!    `PendingRelease`, and `LocallyReusable` bytes. No chunk byte is ever
+//!    globally reusable while any suballocation of that chunk is live.
+//!    Quarantined bytes never transition to a reusable state.
 //! 6. An allocation always returns bytes disjoint from every `Live`,
-//!    `PendingRelease`, and `Reserved` byte.
+//!    `PendingRelease`, `LocallyReusable`, `Reserved`, and `Quarantined` byte.
 //!
 //! The small transition helpers below are supplemented by
 //! [`hypothetical_chunk_model`], a deterministic sequential reference
@@ -96,10 +97,15 @@ pub(crate) enum ByteState {
     /// Handle dropped, still held by this thread's `ReleaseCollector`; this
     /// can be a remote free from the thread that previously held `Live`.
     PendingRelease { owner: ThreadKey },
+    /// A bounded registered cache owns this released extent. Its bytes remain
+    /// in the public live/pending count until reuse or global publication.
+    LocallyReusable { owner: ThreadKey },
     /// Reachable from the general free list or a size-class cache.
     Free,
     /// Unused slack in a reserved chunk at teardown.
     Reclaimable,
+    /// An unrecoverable metadata/allocator failure prevents safe reuse.
+    Quarantined,
 }
 
 /// Model-only thread identity. Production code has no such field.
@@ -128,7 +134,9 @@ impl Block {
 ///
 /// Identity is legal so callers can express "unchanged" without special cases.
 pub(crate) fn transition_is_legal(from: ByteState, to: ByteState) -> bool {
-    use ByteState::{Free, Live, PendingRelease, Reclaimable, Reserved};
+    use ByteState::{
+        Free, Live, LocallyReusable, PendingRelease, Quarantined, Reclaimable, Reserved,
+    };
     if from == to {
         return true;
     }
@@ -140,6 +148,14 @@ pub(crate) fn transition_is_legal(from: ByteState, to: ByteState) -> bool {
         | (Live { .. }, PendingRelease { .. })
         | (Live { .. }, Free)
         | (PendingRelease { .. }, Free) => true,
+        // The production local cache commits a drop to one bounded owner,
+        // then either reuses it there or publishes it globally.
+        (PendingRelease { .. }, LocallyReusable { .. })
+        | (LocallyReusable { .. }, Free)
+        | (Live { .. }, Quarantined)
+        | (PendingRelease { .. }, Quarantined)
+        | (LocallyReusable { .. }, Quarantined)
+        | (Reserved { .. }, Quarantined) => true,
         // Pending exact reuse and reservation activation are thread-local.
         // Cross-thread reuse of pending bytes must first publish them as Free.
         // Reserved ownership transfer is modeled only by a whole-chunk method
@@ -150,6 +166,11 @@ pub(crate) fn transition_is_legal(from: ByteState, to: ByteState) -> bool {
             },
             Live { owner: live_owner },
         ) if release_owner == live_owner => true,
+        (LocallyReusable { owner: cache_owner }, Live { owner: live_owner })
+            if cache_owner == live_owner =>
+        {
+            true
+        }
         // Added by the gated chunk design.
         (Free, Reserved { .. }) | (Reserved { .. }, Reclaimable) | (Reclaimable, Free) => true,
         (
@@ -179,11 +200,14 @@ pub(crate) fn check_no_overlap(blocks: &[Block]) -> bool {
 }
 
 /// Reachable states a chunk teardown must prove empty before `Reclaimable`.
-pub(crate) const LIVE_STATES: [ByteState; 2] = [
+pub(crate) const LIVE_STATES: [ByteState; 3] = [
     ByteState::Live {
         owner: ThreadKey(0),
     },
     ByteState::PendingRelease {
+        owner: ThreadKey(0),
+    },
+    ByteState::LocallyReusable {
         owner: ThreadKey(0),
     },
 ];
@@ -224,6 +248,18 @@ mod tests {
             (
                 ByteState::PendingRelease { owner: owner(1) },
                 ByteState::Live { owner: owner(1) },
+            ),
+            (
+                ByteState::PendingRelease { owner: owner(1) },
+                ByteState::LocallyReusable { owner: owner(1) },
+            ),
+            (
+                ByteState::LocallyReusable { owner: owner(1) },
+                ByteState::Live { owner: owner(1) },
+            ),
+            (
+                ByteState::LocallyReusable { owner: owner(1) },
+                ByteState::Free,
             ),
             (ByteState::Live { owner: owner(1) }, ByteState::Free),
             (
@@ -271,6 +307,46 @@ mod tests {
     }
 
     #[test]
+    fn local_cache_reuse_stays_with_its_registered_thread() {
+        assert!(transition_is_legal(
+            ByteState::PendingRelease { owner: owner(1) },
+            ByteState::LocallyReusable { owner: owner(1) }
+        ));
+        assert!(transition_is_legal(
+            ByteState::LocallyReusable { owner: owner(1) },
+            ByteState::Live { owner: owner(1) }
+        ));
+        assert!(!transition_is_legal(
+            ByteState::LocallyReusable { owner: owner(1) },
+            ByteState::Live { owner: owner(2) }
+        ));
+        assert!(transition_is_legal(
+            ByteState::LocallyReusable { owner: owner(1) },
+            ByteState::Free
+        ));
+    }
+
+    #[test]
+    fn quarantined_bytes_cannot_be_reused() {
+        for state in [
+            ByteState::Live { owner: owner(1) },
+            ByteState::PendingRelease { owner: owner(1) },
+            ByteState::LocallyReusable { owner: owner(1) },
+            ByteState::Reserved { owner: owner(1) },
+        ] {
+            assert!(transition_is_legal(state, ByteState::Quarantined));
+        }
+        assert!(!transition_is_legal(
+            ByteState::Quarantined,
+            ByteState::Free
+        ));
+        assert!(!transition_is_legal(
+            ByteState::Quarantined,
+            ByteState::Live { owner: owner(1) }
+        ));
+    }
+
+    #[test]
     fn chunk_transitions_are_legal_but_must_pass_through_reclaimable() {
         assert!(transition_is_legal(
             ByteState::Free,
@@ -295,6 +371,10 @@ mod tests {
                 ByteState::Free,
                 ByteState::PendingRelease { owner: owner(1) },
             ),
+            (
+                ByteState::Free,
+                ByteState::LocallyReusable { owner: owner(1) },
+            ),
             // A live byte cannot become reservation slack; it must be released.
             (
                 ByteState::Live { owner: owner(1) },
@@ -304,6 +384,7 @@ mod tests {
             (ByteState::Reclaimable, ByteState::Live { owner: owner(1) }),
             // Reservation slack cannot bypass the live/pending check.
             (ByteState::Reserved { owner: owner(1) }, ByteState::Free),
+            (ByteState::Quarantined, ByteState::Free),
         ] {
             assert!(
                 !transition_is_legal(from, to),
@@ -334,11 +415,13 @@ mod tests {
 
     #[test]
     fn live_and_pending_states_are_the_ones_a_chunk_teardown_must_clear() {
-        assert_eq!(LIVE_STATES.len(), 2);
+        assert_eq!(LIVE_STATES.len(), 3);
         for state in LIVE_STATES {
             assert!(matches!(
                 state,
-                ByteState::Live { .. } | ByteState::PendingRelease { .. }
+                ByteState::Live { .. }
+                    | ByteState::PendingRelease { .. }
+                    | ByteState::LocallyReusable { .. }
             ));
         }
     }

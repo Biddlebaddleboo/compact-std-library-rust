@@ -8,6 +8,7 @@ compile_error!("compact_backend_std requires a 64-bit process ABI");
 #[cfg(test)]
 mod allocator_model;
 mod cage;
+mod deterministic_memory;
 mod scratch;
 
 pub use cage::{AllocatorStats, CageAllocation, CageConfig, CompactRuntime};

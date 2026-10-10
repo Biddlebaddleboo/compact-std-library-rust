@@ -1,5 +1,9 @@
 //! Process-wide cage and four-byte allocation owners.
 
+use crate::deterministic_memory::{
+    LocalCacheState, RecycledExtent, ReleaseExtent, LOCAL_CACHE_CAPACITY,
+    MAX_ACTIVE_LOCAL_CACHE_OWNERS,
+};
 use compact_core::{
     checked_align_up, CompactValue, Error, Offset32, Result, MAX_CAGE_BYTES, MIN_CAGE_BYTES,
 };
@@ -8,12 +12,12 @@ use core::mem::{align_of, size_of, MaybeUninit};
 use core::ptr::NonNull;
 use core::slice;
 use std::alloc::{alloc, dealloc, Layout};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "allocator-telemetry")]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 #[cfg(feature = "allocator-telemetry")]
 use std::time::Instant;
 
@@ -26,6 +30,8 @@ const SIZE_CLASS_COUNT: usize = SIZE_CLASSES.len();
 const SIZE_CLASS_CACHE_CAPACITY: u32 = 32;
 const MAX_SIZE_CLASS_EXTENTS: usize = SIZE_CLASSES.len() * SIZE_CLASS_CACHE_CAPACITY as usize;
 const MAX_MERGE_EXTENTS: usize = RELEASE_BATCH_CAPACITY + MAX_SIZE_CLASS_EXTENTS;
+const MAX_PENDING_RELEASE_DRAIN: usize = RELEASE_BATCH_CAPACITY;
+const LOCAL_CACHE_BYTE_BUDGET: usize = 4 * 1024;
 const BENCHMARK_POLICY_A: bool = cfg!(feature = "benchmark-allocator-a")
     && !cfg!(feature = "benchmark-allocator-b")
     && !cfg!(feature = "benchmark-allocator-c");
@@ -50,22 +56,9 @@ struct FreeNode {
     len: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ReleaseExtent {
-    start: u32,
-    len: u32,
-}
-
 struct ReleaseCollector {
     extents: [ReleaseExtent; RELEASE_BATCH_CAPACITY],
     len: usize,
-}
-
-#[derive(Clone, Copy)]
-struct RecycledExtent {
-    data_offset: core::num::NonZeroU32,
-    prefix: u32,
-    block_len: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +156,12 @@ impl ReleaseCollector {
         if self.len < RELEASE_BATCH_CAPACITY {
             self.extents[self.len] = extent;
             self.len += 1;
+        } else {
+            // A failed batch must not erase the descriptor already in this
+            // bounded collector or lose the new release. The shared release
+            // path has an in-cage pending-list fallback for this case.
+            let mut one = [extent];
+            let _ = release_many(&mut one);
         }
     }
 
@@ -233,14 +232,30 @@ impl ReleaseCollector {
         if self.len == 0 {
             return;
         }
-        if release(&mut self.extents[..self.len]).is_err() {
-            // A bad member must not prevent the remaining valid descriptors
-            // from being returned during destructor unwinding.
-            for index in 0..self.len {
-                let mut one = [self.extents[index]];
-                let _ = release(&mut one);
+        if release(&mut self.extents[..self.len]).is_ok() {
+            self.clear();
+            return;
+        }
+
+        // A bad member must not prevent the remaining valid descriptors from
+        // being returned during destructor unwinding. Retain every descriptor
+        // whose individual retry also fails so the caller can preserve it.
+        let original_len = self.len;
+        let mut failed_len = 0;
+        for index in 0..original_len {
+            let extent = self.extents[index];
+            let mut one = [extent];
+            if release(&mut one).is_err() {
+                self.extents[failed_len] = extent;
+                failed_len += 1;
             }
         }
+        self.extents[failed_len..original_len].fill(ReleaseExtent::default());
+        self.len = failed_len;
+    }
+
+    fn clear(&mut self) {
+        self.extents[..self.len].fill(ReleaseExtent::default());
         self.len = 0;
     }
 }
@@ -249,6 +264,35 @@ thread_local! {
     static ACTIVE_RELEASE_COLLECTOR: Cell<*mut ReleaseCollector> = const {
         Cell::new(core::ptr::null_mut())
     };
+    static LOCAL_REUSE_CACHE: LocalReuseCacheSlot = const { LocalReuseCacheSlot::new() };
+}
+
+struct LocalReuseCacheSlot {
+    cache: RefCell<LocalCacheState>,
+    registered: Cell<bool>,
+}
+
+impl LocalReuseCacheSlot {
+    const fn new() -> Self {
+        Self {
+            cache: RefCell::new(LocalCacheState::new()),
+            registered: Cell::new(false),
+        }
+    }
+}
+
+impl Drop for LocalReuseCacheSlot {
+    fn drop(&mut self) {
+        if !self.registered.replace(false) {
+            return;
+        }
+        if let Ok(state) = state() {
+            flush_local_cache_state(state, self.cache.get_mut());
+            state
+                .active_local_cache_owners
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 // Ordinary allocations can avoid touching TLS when no thread is batching
@@ -326,6 +370,23 @@ struct CageState {
     capacity: usize,
     memory: NonNull<u8>,
     allocator: Mutex<Allocator>,
+    local_reuse_activated: AtomicBool,
+    active_local_cache_owners: AtomicUsize,
+    local_cache_bytes: AtomicUsize,
+    local_cache_budget: usize,
+    pending_releases: Mutex<PendingReleaseQueue>,
+    pending_release_nonempty: AtomicBool,
+    allocator_faulted: AtomicBool,
+}
+
+/// Intrusive in-cage releases waiting for a bounded foreground drain.
+///
+/// The queue mutex prevents an offset head from suffering ABA if a released
+/// extent is drained, reused, and later released at the same address while a
+/// producer is trying to publish another node.
+#[derive(Default)]
+struct PendingReleaseQueue {
+    head: u32,
 }
 
 /// Holds the global allocator lock for one internal operation. Callers must
@@ -400,7 +461,7 @@ pub struct CageConfig {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocatorStats {
-    /// Bytes occupied by live allocations, including headers and padding.
+    /// Bytes occupied by live allocations and authoritative pending releases.
     pub live_bytes: u32,
     /// Current high-water cursor measured from the start of the cage.
     pub high_water_cursor: u32,
@@ -617,6 +678,13 @@ impl CompactRuntime {
                 #[cfg(feature = "allocator-telemetry")]
                 exact_size_extents_coalesced_before_cache: 0,
             }),
+            local_reuse_activated: AtomicBool::new(false),
+            active_local_cache_owners: AtomicUsize::new(0),
+            local_cache_bytes: AtomicUsize::new(0),
+            local_cache_budget: (config.capacity / 50).min(LOCAL_CACHE_BYTE_BUDGET),
+            pending_releases: Mutex::new(PendingReleaseQueue::default()),
+            pending_release_nonempty: AtomicBool::new(false),
+            allocator_faulted: AtomicBool::new(false),
         };
         CAGE.set(state)
             .map_err(|_| Error::RuntimeAlreadyInitialized)
@@ -632,23 +700,28 @@ impl CompactRuntime {
         Ok(state()?.capacity)
     }
 
-    /// Return live allocated bytes including allocation headers and padding.
+    /// Return live plus pending bytes, including allocation headers and padding.
     pub fn used_bytes() -> Result<usize> {
-        Ok(lock(state()?)?.live_bytes as usize)
+        let state = state()?;
+        flush_current_local_cache(state);
+        Ok(lock(state)?.live_bytes as usize)
     }
 
     /// Return capacity not currently occupied by live allocation blocks.
     pub fn remaining_bytes() -> Result<usize> {
         let state = state()?;
+        flush_current_local_cache(state);
         Ok(state
             .capacity
             .saturating_sub(lock(state)?.live_bytes as usize))
     }
 
-    /// Snapshot live and reusable cage allocator ranges without mutation.
+    /// Snapshot live and globally reusable bytes after flushing this thread's
+    /// bounded cache and draining one pending-release batch.
     #[doc(hidden)]
     pub fn allocator_stats() -> Result<AllocatorStats> {
         let state = state()?;
+        flush_current_local_cache(state);
         let allocator = lock(state)?;
         let mut stats = AllocatorStats {
             live_bytes: allocator.live_bytes,
@@ -896,6 +969,7 @@ impl CompactRuntime {
     #[doc(hidden)]
     pub fn validate_allocator_state() -> Result<()> {
         let state = state()?;
+        flush_current_local_cache(state);
         let allocator = lock(state)?;
         validate_allocator(state, &allocator)
     }
@@ -1058,7 +1132,14 @@ impl<T: CompactValue> CageAllocation<T> {
             debug_assert_ne!(lookup, PendingLookup::Recycled);
             record_pending_lookup(lookup, 0);
         }
-        let mut allocator = lock(state)?;
+        if let Some(recycled) = take_local_reuse(state, needed, alignment, capacity_u32) {
+            record_pending_lookup(PendingLookup::Recycled, recycled.block_len);
+            return Ok(Self {
+                offset: NonZeroOffset(recycled.data_offset),
+                marker: PhantomData,
+            });
+        }
+        let mut allocator = lock_for_allocation(state)?;
         let (data_offset, prefix, block_len) =
             allocate_block(state, &mut allocator, needed, alignment)?;
         let offset = core::num::NonZeroU32::new(data_offset)
@@ -1359,11 +1440,32 @@ impl<T: CompactValue> CageAllocation<T> {
             .checked_mul(capacity)
             .ok_or(Error::OffsetOverflow)?
             .max(1);
-        let mut allocator = lock(state)?;
+        let mut allocator = lock_for_allocation(state)?;
+        if self.try_resize_locked(state, &mut allocator, offset, header, requested, bytes)? {
+            return Ok(true);
+        }
+        drop(allocator);
+        if state.local_cache_bytes.load(Ordering::Acquire) == 0 {
+            return Ok(false);
+        }
+        flush_current_local_cache(state);
+        let mut allocator = lock_for_allocation(state)?;
+        self.try_resize_locked(state, &mut allocator, offset, header, requested, bytes)
+    }
+
+    fn try_resize_locked(
+        &self,
+        state: &CageState,
+        allocator: &mut Allocator,
+        offset: u32,
+        header: AllocationHeader,
+        requested: u32,
+        bytes: usize,
+    ) -> Result<bool> {
         if allocator.size_class_counts.iter().any(|count| *count != 0) {
             // Resize uses the ordered free list to consume adjacent blocks.
             // Merge cached extents first so no class-owned neighbor is missed.
-            merge_free_ranges_locked(state, &mut allocator)?;
+            merge_free_ranges_locked(state, allocator)?;
         }
         let start = self
             .raw_offset()
@@ -1381,7 +1483,7 @@ impl<T: CompactValue> CageAllocation<T> {
         .map_err(|_| Error::OffsetOverflow)?;
         if new_len <= old_len {
             if new_len < old_len {
-                insert_free(state, &mut allocator, start + new_len, old_len - new_len)?;
+                insert_free(state, allocator, start + new_len, old_len - new_len)?;
             }
             allocator.live_bytes = allocator.live_bytes - old_len + new_len;
             let mut changed = header;
@@ -1403,11 +1505,11 @@ impl<T: CompactValue> CageAllocation<T> {
                 return Ok(false);
             }
             allocator.cursor += extra;
-        } else if let Some((free_len, _next)) = free_node_at(state, &allocator, end)? {
+        } else if let Some((free_len, _next)) = free_node_at(state, allocator, end)? {
             if free_len < extra {
                 return Ok(false);
             }
-            consume_free_prefix(state, &mut allocator, end, extra)?;
+            consume_free_prefix(state, allocator, end, extra)?;
         } else {
             return Ok(false);
         }
@@ -1543,14 +1645,202 @@ fn lock(state: &CageState) -> Result<AllocatorTransaction<'_>> {
     let lock_result = state.allocator.lock();
     #[cfg(feature = "allocator-telemetry")]
     drop(lock_wait_phase);
-    let allocator = lock_result.map_err(|_| Error::AllocatorPoisoned)?;
+    finish_lock(state, lock_result)
+}
+
+fn lock_for_allocation(state: &CageState) -> Result<AllocatorTransaction<'_>> {
     #[cfg(feature = "allocator-telemetry")]
-    let allocator = {
-        let mut allocator = allocator;
-        allocator.lock_acquisitions = allocator.lock_acquisitions.saturating_add(1);
-        allocator
+    let lock_wait_phase = PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.lock_wait_ns);
+    let lock_result = if state.local_reuse_activated.load(Ordering::Acquire) {
+        state.allocator.lock()
+    } else {
+        match state.allocator.try_lock() {
+            // The uncontended try-lock is the acquisition, so the disabled
+            // cache path does not add a separate probe lock or touch TLS.
+            Ok(allocator) => Ok(allocator),
+            Err(TryLockError::WouldBlock) => {
+                state.local_reuse_activated.store(true, Ordering::Release);
+                state.allocator.lock()
+            }
+            Err(TryLockError::Poisoned(poisoned)) => Err(poisoned),
+        }
     };
+    #[cfg(feature = "allocator-telemetry")]
+    drop(lock_wait_phase);
+    finish_lock(state, lock_result)
+}
+
+fn finish_lock<'a>(
+    state: &'a CageState,
+    lock_result: std::sync::LockResult<MutexGuard<'a, Allocator>>,
+) -> Result<AllocatorTransaction<'a>> {
+    let mut allocator = lock_result.map_err(|_| Error::AllocatorPoisoned)?;
+    if state.allocator_faulted.load(Ordering::Acquire) {
+        return Err(Error::AllocatorPoisoned);
+    }
+    #[cfg(feature = "allocator-telemetry")]
+    {
+        allocator.lock_acquisitions = allocator.lock_acquisitions.saturating_add(1);
+    }
+    drain_pending_releases_locked(state, &mut allocator)?;
     Ok(AllocatorTransaction { state, allocator })
+}
+
+fn reserve_local_cache_owner(active_owners: &AtomicUsize) -> bool {
+    let mut current = active_owners.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ACTIVE_LOCAL_CACHE_OWNERS {
+            return false;
+        }
+        match active_owners.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn flush_local_cache_state(state: &CageState, cache: &mut LocalCacheState) {
+    if cache.len == 0 {
+        return;
+    }
+    let cached_bytes = cache.bytes();
+    let mut extents = cache.extents;
+    let len = cache.len.min(LOCAL_CACHE_CAPACITY);
+    if release_many(&mut extents[..len]).is_err() {
+        for extent in extents[..len].iter().copied() {
+            enqueue_pending_release(state, extent);
+        }
+    }
+    cache.clear();
+    state
+        .local_cache_bytes
+        .fetch_sub(cached_bytes, Ordering::AcqRel);
+}
+
+fn flush_current_local_cache(state: &CageState) {
+    let _ = LOCAL_REUSE_CACHE.try_with(|slot| {
+        if let Ok(mut cache) = slot.cache.try_borrow_mut() {
+            flush_local_cache_state(state, &mut cache);
+        }
+    });
+}
+
+/// Apply at most one fixed-size batch of published releases.
+/// Unprocessed descriptors remain linked from the queue head.
+fn drain_pending_releases_locked(state: &CageState, allocator: &mut Allocator) -> Result<()> {
+    if state.allocator_faulted.load(Ordering::Acquire) {
+        return Err(Error::AllocatorPoisoned);
+    }
+    if !state.pending_release_nonempty.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut queue = match state.pending_releases.lock() {
+        Ok(queue) => queue,
+        Err(poisoned) => {
+            state.allocator_faulted.store(true, Ordering::Release);
+            drop(poisoned.into_inner());
+            return Err(Error::AllocatorPoisoned);
+        }
+    };
+    let original_head = queue.head;
+    if original_head == 0 {
+        state
+            .pending_release_nonempty
+            .store(false, Ordering::Release);
+        return Ok(());
+    }
+
+    let mut extents = [ReleaseExtent::default(); MAX_PENDING_RELEASE_DRAIN];
+    let mut len = 0;
+    let mut current = original_head;
+    while current != 0 && len < extents.len() {
+        // SAFETY: release descriptors are in-cage nodes; read_free_node checks
+        // the offset and node header bounds before reading it.
+        let node = match unsafe { read_free_node(state, current) } {
+            Ok(node) => node,
+            Err(error) => {
+                state.allocator_faulted.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let extent = ReleaseExtent {
+            start: current,
+            len: node.len,
+        };
+        if validate_free_extent(allocator, extent).is_err()
+            || extents[..len]
+                .iter()
+                .any(|previous| previous.start == extent.start)
+        {
+            state.allocator_faulted.store(true, Ordering::Release);
+            return Err(Error::AllocatorPoisoned);
+        }
+        extents[len] = extent;
+        len += 1;
+        current = node.next;
+    }
+
+    if let Err(error) = release_many_locked(
+        state,
+        allocator,
+        &mut extents[..len],
+        ENABLE_SIZE_CLASS_CACHE,
+    ) {
+        // The batch validator runs before its mutation phase. Restoring the
+        // chain keeps all descriptors authoritative while the allocator is
+        // failed closed. The queue head remains at its original descriptor.
+        state.allocator_faulted.store(true, Ordering::Release);
+        return Err(error);
+    }
+
+    queue.head = current;
+    state
+        .pending_release_nonempty
+        .store(current != 0, Ordering::Release);
+    Ok(())
+}
+
+fn enqueue_pending_release(state: &CageState, extent: ReleaseExtent) {
+    if extent.len < FREE_NODE_BYTES
+        || extent.len % 8 != 0
+        || extent.start < INITIAL_CURSOR
+        || extent
+            .start
+            .checked_add(extent.len)
+            .map_or(true, |end| end as usize > state.capacity)
+    {
+        state.allocator_faulted.store(true, Ordering::Release);
+        return;
+    }
+
+    let mut queue = match state.pending_releases.lock() {
+        Ok(queue) => queue,
+        Err(poisoned) => {
+            state.allocator_faulted.store(true, Ordering::Release);
+            poisoned.into_inner()
+        }
+    };
+    // SAFETY: the released extent remains exclusively owned by this
+    // descriptor until the consumer removes it under the queue mutex.
+    unsafe {
+        write_free_node(
+            state,
+            extent.start,
+            FreeNode {
+                next: queue.head,
+                len: extent.len,
+            },
+        )
+    };
+    queue.head = extent.start;
+    state
+        .pending_release_nonempty
+        .store(true, Ordering::Release);
 }
 
 fn initialize_allocation_header(state: &CageState, offset: u32, header: AllocationHeader) {
@@ -1559,6 +1849,115 @@ fn initialize_allocation_header(state: &CageState, offset: u32, header: Allocati
         PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.header_initialization_ns);
     // SAFETY: callers pass the data offset for a newly reserved live extent.
     unsafe { header_ptr(state, offset).write(header) };
+}
+
+fn local_reuse_enabled(state: &CageState) -> bool {
+    ENABLE_PENDING_REUSE
+        && state.local_reuse_activated.load(Ordering::Acquire)
+        && state.local_cache_budget != 0
+        && !state.allocator_faulted.load(Ordering::Acquire)
+}
+
+fn local_reuse_eligible(bytes: usize, alignment: usize) -> bool {
+    if alignment > 8 {
+        return false;
+    }
+    let Ok(bytes) = u32::try_from(bytes) else {
+        return false;
+    };
+    bytes
+        .checked_add(size_of::<AllocationHeader>() as u32 + 7)
+        .is_some_and(|len| size_class_index(len & !7).is_some())
+}
+
+fn with_local_reuse_cache<R>(
+    state: &CageState,
+    create: bool,
+    operation: impl FnOnce(&mut LocalCacheState) -> R,
+) -> Option<R> {
+    LOCAL_REUSE_CACHE
+        .try_with(|slot| {
+            let mut cache = slot.cache.try_borrow_mut().ok()?;
+            if !slot.registered.get() {
+                if !create || !reserve_local_cache_owner(&state.active_local_cache_owners) {
+                    return None;
+                }
+                slot.registered.set(true);
+            }
+            Some(operation(&mut cache))
+        })
+        .ok()
+        .flatten()
+}
+
+fn take_local_reuse(
+    state: &CageState,
+    bytes: usize,
+    alignment: usize,
+    capacity: u32,
+) -> Option<RecycledExtent> {
+    if state.local_cache_bytes.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    if !local_reuse_eligible(bytes, alignment) || !local_reuse_enabled(state) {
+        return None;
+    }
+    let (_, _, wanted_len) = block_layout(state.base(), INITIAL_CURSOR, bytes, alignment).ok()?;
+    with_local_reuse_cache(state, false, |cache| {
+        cache.take_compatible(
+            &state.local_cache_bytes,
+            wanted_len,
+            |extent| {
+                let (data_offset, prefix, block_len) =
+                    block_layout(state.base(), extent.start, bytes, alignment).ok()?;
+                if block_len != extent.len {
+                    return None;
+                }
+                Some(RecycledExtent {
+                    data_offset: core::num::NonZeroU32::new(data_offset)?,
+                    prefix,
+                    block_len,
+                })
+            },
+            |recycled| {
+                let header = AllocationHeader {
+                    block_len: recycled.block_len,
+                    prefix: recycled.prefix,
+                    capacity,
+                    initialized: 0,
+                };
+                // SAFETY: the exact compatible extent is exclusively held by
+                // this thread's mutable cache borrow until its header is
+                // initialized and the descriptor is removed.
+                initialize_allocation_header(state, recycled.data_offset.get(), header);
+            },
+        )
+    })
+    .flatten()
+}
+
+fn cache_released_extent(state: &CageState, extent: ReleaseExtent) -> bool {
+    if size_class_index(extent.len).is_none() {
+        return false;
+    }
+    if !local_reuse_enabled(state) {
+        return false;
+    }
+    let Some(publish) = with_local_reuse_cache(state, true, |cache| {
+        cache.push(
+            extent,
+            &state.local_cache_bytes,
+            state.local_cache_budget,
+            |candidate| size_class_index(candidate.len).is_some(),
+        )
+    }) else {
+        return false;
+    };
+    for extent in publish.into_iter().flatten() {
+        let mut one = [extent];
+        let _ = release_many(&mut one);
+    }
+    true
 }
 
 fn take_pending_reuse(
@@ -2312,7 +2711,14 @@ fn insert_free(state: &CageState, allocator: &mut Allocator, start: u32, len: u3
 }
 
 fn release(offset: u32) {
-    let Some(extent) = release_extent(offset) else {
+    let Ok(state) = state() else {
+        return;
+    };
+    let Some(extent) = release_extent(state, offset) else {
+        // The owner is private and allocator-issued. An invalid release header
+        // is therefore allocator corruption; fail closed instead of silently
+        // pretending the range was reclaimed.
+        state.allocator_faulted.store(true, Ordering::Release);
         return;
     };
     let collected = ACTIVE_RELEASE_COLLECTOR.with(|active| {
@@ -2326,14 +2732,13 @@ fn release(offset: u32) {
             true
         }
     });
-    if !collected {
+    if !collected && !cache_released_extent(state, extent) {
         let mut one = [extent];
         let _ = release_many(&mut one);
     }
 }
 
-fn release_extent(offset: u32) -> Option<ReleaseExtent> {
-    let state = state().ok()?;
+fn release_extent(state: &CageState, offset: u32) -> Option<ReleaseExtent> {
     // SAFETY: the owner releases this allocator-issued offset exactly once.
     let header = unsafe { read_header(state, offset) }.ok()?;
     let start = offset
@@ -2350,11 +2755,35 @@ fn release_many(extents: &mut [ReleaseExtent]) -> Result<()> {
         return Ok(());
     }
     if extents.len() > RELEASE_BATCH_CAPACITY {
-        return Err(Error::InvalidOffset);
+        let state = state()?;
+        for extent in extents.iter().copied() {
+            enqueue_pending_release(state, extent);
+        }
+        return Ok(());
     }
     let state = state()?;
-    let mut transaction = lock(state)?;
-    transaction.release_many(extents)
+    let mut transaction = match lock(state) {
+        Ok(transaction) => transaction,
+        Err(_) => {
+            for extent in extents.iter().copied() {
+                enqueue_pending_release(state, extent);
+            }
+            return Ok(());
+        }
+    };
+    match transaction.release_many(extents) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Validation errors are fail-closed: preserve the descriptors in
+            // the in-cage retry list and prevent further allocator mutation.
+            state.allocator_faulted.store(true, Ordering::Release);
+            for extent in extents.iter().copied() {
+                enqueue_pending_release(state, extent);
+            }
+            let _ = error;
+            Ok(())
+        }
+    }
 }
 
 fn next_merge_extent(
@@ -2955,6 +3384,7 @@ fn validate_allocator(state: &CageState, allocator: &Allocator) -> Result<()> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::sync::Arc;
 
     #[repr(align(64))]
     struct OverAlignedValue {
@@ -3188,6 +3618,13 @@ mod tests {
                 #[cfg(feature = "allocator-telemetry")]
                 exact_size_extents_coalesced_before_cache: 0,
             }),
+            local_reuse_activated: AtomicBool::new(false),
+            active_local_cache_owners: AtomicUsize::new(0),
+            local_cache_bytes: AtomicUsize::new(0),
+            local_cache_budget: (capacity / 50).min(LOCAL_CACHE_BYTE_BUDGET),
+            pending_releases: Mutex::new(PendingReleaseQueue::default()),
+            pending_release_nonempty: AtomicBool::new(false),
+            allocator_faulted: AtomicBool::new(false),
         }
     }
 
@@ -3581,6 +4018,148 @@ mod tests {
         assert_eq!(allocator.live_bytes, 0);
         assert_eq!(allocator.cursor, INITIAL_CURSOR);
         validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn release_collector_keeps_descriptors_when_every_publication_attempt_fails() {
+        let mut collector = ReleaseCollector::new();
+        let first = ReleaseExtent { start: 64, len: 32 };
+        let second = ReleaseExtent {
+            start: 128,
+            len: 40,
+        };
+        collector.push(first);
+        collector.push(second);
+        let mut attempted = Vec::new();
+
+        collector.flush_with(|extents| {
+            attempted.extend_from_slice(extents);
+            Err(Error::InvalidOffset)
+        });
+        assert_eq!(collector.len, 2);
+        assert_eq!(&collector.extents[..collector.len], &[first, second]);
+        assert_eq!(attempted.len(), 4);
+
+        collector.flush_with(|_| Ok(()));
+        assert_eq!(collector.len, 0);
+    }
+
+    #[test]
+    fn local_reuse_cache_recycles_an_exact_extent_before_global_publication() {
+        let state = local_state(4096);
+        state.local_reuse_activated.store(true, Ordering::Release);
+        let extent = {
+            let mut allocator = lock(&state).unwrap();
+            local_allocate(&state, &mut allocator, 16)
+        };
+        let data_offset = extent.start + size_of::<AllocationHeader>() as u32;
+        let original_header = AllocationHeader {
+            block_len: extent.len,
+            prefix: 0,
+            capacity: 16,
+            initialized: 0,
+        };
+        initialize_allocation_header(&state, data_offset, original_header);
+
+        assert!(cache_released_extent(&state, extent));
+        assert_eq!(
+            state.local_cache_bytes.load(Ordering::Acquire),
+            extent.len as usize
+        );
+        let recycled = take_local_reuse(&state, 16, 8, 16).unwrap();
+        assert_eq!(recycled.data_offset.get(), data_offset);
+        assert_eq!(recycled.block_len, extent.len);
+        assert_eq!(state.local_cache_bytes.load(Ordering::Acquire), 0);
+        // SAFETY: local reuse initialized the header before removing its only
+        // cache descriptor.
+        assert_eq!(
+            unsafe { read_header(&state, data_offset) }
+                .unwrap()
+                .capacity,
+            16
+        );
+
+        LOCAL_REUSE_CACHE.with(|slot| {
+            assert!(slot.registered.replace(false));
+            assert_eq!(slot.cache.borrow().len, 0);
+        });
+        assert_eq!(state.active_local_cache_owners.load(Ordering::Acquire), 1);
+        state
+            .active_local_cache_owners
+            .fetch_sub(1, Ordering::AcqRel);
+        let allocator = lock(&state).unwrap();
+        assert_eq!(allocator.live_bytes, extent.len);
+        validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn actual_allocator_lock_contention_activates_local_reuse() {
+        let state = Arc::new(local_state(4096));
+        let allocator_guard = state.allocator.lock().unwrap();
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let worker_state = Arc::clone(&state);
+        let worker_started = Arc::clone(&started);
+        let worker = std::thread::spawn(move || {
+            worker_started.wait();
+            drop(lock_for_allocation(&worker_state).unwrap());
+        });
+        started.wait();
+        while !state.local_reuse_activated.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        drop(allocator_guard);
+        worker.join().unwrap();
+        assert!(state.local_reuse_activated.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pending_release_queue_drains_in_bounded_batches_under_concurrent_publication() {
+        const RELEASES: usize = RELEASE_BATCH_CAPACITY * 2 + 3;
+        let state = Arc::new(local_state(8192));
+        let extents = {
+            let mut allocator = lock(&state).unwrap();
+            (0..RELEASES)
+                .map(|_| local_allocate(&state, &mut allocator, 8))
+                .collect::<Vec<_>>()
+        };
+
+        std::thread::scope(|scope| {
+            for partition in extents.chunks(RELEASE_BATCH_CAPACITY / 2) {
+                let state = Arc::clone(&state);
+                scope.spawn(move || {
+                    for extent in partition.iter().copied() {
+                        enqueue_pending_release(&state, extent);
+                    }
+                });
+            }
+        });
+
+        {
+            let allocator = lock(&state).unwrap();
+            assert_eq!(
+                allocator.live_bytes,
+                (RELEASES - RELEASE_BATCH_CAPACITY) as u32 * 24
+            );
+            assert_ne!(state.pending_releases.lock().unwrap().head, 0);
+            assert!(state.pending_release_nonempty.load(Ordering::Acquire));
+        }
+        {
+            let allocator = lock(&state).unwrap();
+            assert_eq!(
+                allocator.live_bytes,
+                (RELEASES - RELEASE_BATCH_CAPACITY * 2) as u32 * 24
+            );
+            assert_ne!(state.pending_releases.lock().unwrap().head, 0);
+            assert!(state.pending_release_nonempty.load(Ordering::Acquire));
+        }
+        {
+            let allocator = lock(&state).unwrap();
+            assert_eq!(allocator.live_bytes, 0);
+            assert_eq!(allocator.cursor, INITIAL_CURSOR);
+            assert_eq!(state.pending_releases.lock().unwrap().head, 0);
+            assert!(!state.pending_release_nonempty.load(Ordering::Acquire));
+            validate_allocator(&state, &allocator).unwrap();
+        }
     }
 
     proptest! {
