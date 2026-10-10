@@ -24,6 +24,8 @@ use std::time::Instant;
 const INITIAL_CURSOR: u32 = 8;
 const FREE_NODE_BYTES: u32 = size_of::<FreeNode>() as u32;
 const BLOCK_SIZE_BUCKETS: usize = 129;
+#[cfg(feature = "allocator-telemetry")]
+const ALIGNMENT_BUCKETS: usize = 16;
 const RELEASE_BATCH_CAPACITY: usize = 64;
 const SIZE_CLASSES: [u32; 4] = [32, 40, 112, 528];
 const SIZE_CLASS_COUNT: usize = SIZE_CLASSES.len();
@@ -32,6 +34,7 @@ const MAX_SIZE_CLASS_EXTENTS: usize = SIZE_CLASSES.len() * SIZE_CLASS_CACHE_CAPA
 const MAX_MERGE_EXTENTS: usize = RELEASE_BATCH_CAPACITY + MAX_SIZE_CLASS_EXTENTS;
 const MAX_PENDING_RELEASE_DRAIN: usize = RELEASE_BATCH_CAPACITY;
 const LOCAL_CACHE_BYTE_BUDGET: usize = 4 * 1024;
+const UNCONTENDED_LOCAL_REUSE_BLOCK_LEN: u32 = 32;
 const BENCHMARK_POLICY_A: bool = cfg!(feature = "benchmark-allocator-a")
     && !cfg!(feature = "benchmark-allocator-b")
     && !cfg!(feature = "benchmark-allocator-c");
@@ -122,6 +125,33 @@ static LOCAL_REUSE_TELEMETRY: LocalReuseTelemetry = LocalReuseTelemetry {
 };
 
 #[cfg(feature = "allocator-telemetry")]
+struct AllocationRequestTelemetry {
+    alignment_histogram: [AtomicU64; ALIGNMENT_BUCKETS],
+}
+
+#[cfg(feature = "allocator-telemetry")]
+static ALLOCATION_REQUEST_TELEMETRY: AllocationRequestTelemetry = AllocationRequestTelemetry {
+    alignment_histogram: [const { AtomicU64::new(0) }; ALIGNMENT_BUCKETS],
+};
+
+#[cfg(feature = "allocator-telemetry")]
+struct PendingReleaseQueueTelemetry {
+    enqueued: AtomicU64,
+    drained: AtomicU64,
+    current: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[cfg(feature = "allocator-telemetry")]
+static PENDING_RELEASE_QUEUE_TELEMETRY: PendingReleaseQueueTelemetry =
+    PendingReleaseQueueTelemetry {
+        enqueued: AtomicU64::new(0),
+        drained: AtomicU64::new(0),
+        current: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    };
+
+#[cfg(feature = "allocator-telemetry")]
 static PENDING_REUSE_TELEMETRY: PendingReuseTelemetry = PendingReuseTelemetry {
     hits: AtomicU64::new(0),
     misses: AtomicU64::new(0),
@@ -178,8 +208,20 @@ impl Drop for PhaseTimer {
 }
 
 #[cfg(feature = "allocator-telemetry")]
-static PENDING_ALLOCATION_SIZE_HISTOGRAM: [AtomicU64; BLOCK_SIZE_BUCKETS] =
+static REUSED_ALLOCATION_SIZE_HISTOGRAM: [AtomicU64; BLOCK_SIZE_BUCKETS] =
     [const { AtomicU64::new(0) }; BLOCK_SIZE_BUCKETS];
+
+#[cfg(feature = "allocator-telemetry")]
+fn record_allocation_alignment(alignment: usize) {
+    let bucket = (alignment.trailing_zeros() as usize).min(ALIGNMENT_BUCKETS - 1);
+    ALLOCATION_REQUEST_TELEMETRY.alignment_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "allocator-telemetry")]
+fn record_reused_allocation_size(block_len: u32) {
+    let bucket = ((block_len as usize) / 8).min(BLOCK_SIZE_BUCKETS - 1);
+    REUSED_ALLOCATION_SIZE_HISTOGRAM[bucket].fetch_add(1, Ordering::Relaxed);
+}
 
 impl ReleaseCollector {
     fn new() -> Self {
@@ -404,6 +446,16 @@ struct Allocator {
     exact_size_extents_cached: u64,
     #[cfg(feature = "allocator-telemetry")]
     exact_size_extents_coalesced_before_cache: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_attempts: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_in_place_no_growth: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_in_place_cursor_growth: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_in_place_free_growth: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_no_space: u64,
 }
 
 struct CageState {
@@ -644,6 +696,36 @@ pub struct AllocatorStats {
     pub exact_size_extents_coalesced_before_cache: u64,
     /// Allocation counts by 8-byte block-size bucket; bucket 128 is 1024 B+.
     pub allocation_size_histogram: [u64; BLOCK_SIZE_BUCKETS],
+    #[cfg(feature = "allocator-telemetry")]
+    /// Allocation request counts by log2 alignment; bucket 15 is 32768 B+.
+    pub allocation_alignment_histogram: [u64; ALIGNMENT_BUCKETS],
+    #[cfg(feature = "allocator-telemetry")]
+    /// Descriptors published to the in-cage pending-release queue.
+    pub pending_release_queue_enqueued: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Descriptors drained from the in-cage pending-release queue.
+    pub pending_release_queue_drained: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Pending-release descriptors still queued at this snapshot.
+    pub pending_release_queue_current: usize,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Peak pending-release queue depth since runtime initialization.
+    pub pending_release_queue_peak: usize,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Number of in-place resize attempts, including retry attempts.
+    pub resize_attempts: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// In-place resizes that kept or reduced the existing block length.
+    pub resize_in_place_no_growth: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// In-place growths served from the cage cursor.
+    pub resize_in_place_cursor_growth: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// In-place growths served from an adjacent free range.
+    pub resize_in_place_free_growth: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// In-place resize attempts that could not grow in place.
+    pub resize_no_space: u64,
     /// Cached free block counts for the measured exact-size classes.
     pub size_class_free_blocks: [u32; SIZE_CLASSES.len()],
     /// Cached free bytes for the measured exact-size classes.
@@ -737,6 +819,26 @@ impl Default for AllocatorStats {
             exact_size_extents_cached: 0,
             exact_size_extents_coalesced_before_cache: 0,
             allocation_size_histogram: [0; BLOCK_SIZE_BUCKETS],
+            #[cfg(feature = "allocator-telemetry")]
+            allocation_alignment_histogram: [0; ALIGNMENT_BUCKETS],
+            #[cfg(feature = "allocator-telemetry")]
+            pending_release_queue_enqueued: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            pending_release_queue_drained: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            pending_release_queue_current: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            pending_release_queue_peak: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_attempts: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_in_place_no_growth: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_in_place_cursor_growth: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_in_place_free_growth: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_no_space: 0,
             size_class_free_blocks: [0; SIZE_CLASSES.len()],
             size_class_free_bytes: [0; SIZE_CLASSES.len()],
         }
@@ -815,6 +917,16 @@ impl CompactRuntime {
                 exact_size_extents_cached: 0,
                 #[cfg(feature = "allocator-telemetry")]
                 exact_size_extents_coalesced_before_cache: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_attempts: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_in_place_no_growth: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_in_place_cursor_growth: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_in_place_free_growth: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_no_space: 0,
             }),
             local_reuse_activated: AtomicBool::new(false),
             active_local_cache_owners: AtomicUsize::new(0),
@@ -1012,10 +1124,39 @@ impl CompactRuntime {
                 .exact_size_extents_coalesced_before_cache,
             #[cfg(feature = "allocator-telemetry")]
             allocation_size_histogram: core::array::from_fn(|index| {
-                allocator.allocation_size_histogram[index].saturating_add(
-                    PENDING_ALLOCATION_SIZE_HISTOGRAM[index].load(Ordering::Relaxed),
-                )
+                allocator.allocation_size_histogram[index]
+                    .saturating_add(REUSED_ALLOCATION_SIZE_HISTOGRAM[index].load(Ordering::Relaxed))
             }),
+            #[cfg(feature = "allocator-telemetry")]
+            allocation_alignment_histogram: core::array::from_fn(|index| {
+                ALLOCATION_REQUEST_TELEMETRY.alignment_histogram[index].load(Ordering::Relaxed)
+            }),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_release_queue_enqueued: PENDING_RELEASE_QUEUE_TELEMETRY
+                .enqueued
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_release_queue_drained: PENDING_RELEASE_QUEUE_TELEMETRY
+                .drained
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_release_queue_current: PENDING_RELEASE_QUEUE_TELEMETRY
+                .current
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            pending_release_queue_peak: PENDING_RELEASE_QUEUE_TELEMETRY
+                .peak
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            resize_attempts: allocator.resize_attempts,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_in_place_no_growth: allocator.resize_in_place_no_growth,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_in_place_cursor_growth: allocator.resize_in_place_cursor_growth,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_in_place_free_growth: allocator.resize_in_place_free_growth,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_no_space: allocator.resize_no_space,
             ..AllocatorStats::default()
         };
         let mut current = allocator.free_head;
@@ -1306,6 +1447,8 @@ impl<T: CompactValue> CageAllocation<T> {
         let needed = bytes.max(1);
         let alignment = align_of::<T>().max(4);
         #[cfg(feature = "allocator-telemetry")]
+        record_allocation_alignment(alignment);
+        #[cfg(feature = "allocator-telemetry")]
         let pending_lookup_phase = PhaseTimer::start(&ALLOCATOR_PHASE_TELEMETRY.pending_lookup_ns);
         let (lookup, recycled) = take_pending_reuse(state, needed, alignment);
         #[cfg(feature = "allocator-telemetry")]
@@ -1331,7 +1474,8 @@ impl<T: CompactValue> CageAllocation<T> {
             record_pending_lookup(lookup, 0);
         }
         if let Some(recycled) = take_local_reuse(state, needed, alignment, capacity_u32) {
-            record_pending_lookup(PendingLookup::Recycled, recycled.block_len);
+            #[cfg(feature = "allocator-telemetry")]
+            record_reused_allocation_size(recycled.block_len);
             return Ok(Self {
                 offset: NonZeroOffset(recycled.data_offset),
                 marker: PhantomData,
@@ -1660,6 +1804,10 @@ impl<T: CompactValue> CageAllocation<T> {
         requested: u32,
         bytes: usize,
     ) -> Result<bool> {
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.resize_attempts = allocator.resize_attempts.saturating_add(1);
+        }
         if allocator.size_class_counts.iter().any(|count| *count != 0) {
             // Resize uses the ordered free list to consume adjacent blocks.
             // Merge cached extents first so no class-owned neighbor is missed.
@@ -1689,10 +1837,17 @@ impl<T: CompactValue> CageAllocation<T> {
             changed.capacity = requested;
             // SAFETY: this owner uniquely represents the live allocation.
             unsafe { header_ptr(state, offset).write(changed) };
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                allocator.resize_in_place_no_growth =
+                    allocator.resize_in_place_no_growth.saturating_add(1);
+            }
             return Ok(true);
         }
         let end = start.checked_add(old_len).ok_or(Error::OffsetOverflow)?;
         let extra = new_len - old_len;
+        #[cfg(feature = "allocator-telemetry")]
+        let growth_source: u8;
         if end == allocator.cursor {
             if allocator
                 .cursor
@@ -1700,15 +1855,35 @@ impl<T: CompactValue> CageAllocation<T> {
                 .ok_or(Error::OffsetOverflow)?
                 > state.capacity as u32
             {
+                #[cfg(feature = "allocator-telemetry")]
+                {
+                    allocator.resize_no_space = allocator.resize_no_space.saturating_add(1);
+                }
                 return Ok(false);
             }
             allocator.cursor += extra;
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                growth_source = 1;
+            }
         } else if let Some((free_len, _next)) = free_node_at(state, allocator, end)? {
             if free_len < extra {
+                #[cfg(feature = "allocator-telemetry")]
+                {
+                    allocator.resize_no_space = allocator.resize_no_space.saturating_add(1);
+                }
                 return Ok(false);
             }
             consume_free_prefix(state, allocator, end, extra)?;
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                growth_source = 2;
+            }
         } else {
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                allocator.resize_no_space = allocator.resize_no_space.saturating_add(1);
+            }
             return Ok(false);
         }
         allocator.live_bytes = allocator
@@ -1720,6 +1895,18 @@ impl<T: CompactValue> CageAllocation<T> {
         changed.capacity = requested;
         // SAFETY: this owner uniquely represents the live allocation.
         unsafe { header_ptr(state, offset).write(changed) };
+        #[cfg(feature = "allocator-telemetry")]
+        match growth_source {
+            1 => {
+                allocator.resize_in_place_cursor_growth =
+                    allocator.resize_in_place_cursor_growth.saturating_add(1)
+            }
+            2 => {
+                allocator.resize_in_place_free_growth =
+                    allocator.resize_in_place_free_growth.saturating_add(1)
+            }
+            _ => unreachable!("successful in-place growth has a source"),
+        }
         Ok(true)
     }
     /// Borrow the full capacity as potentially uninitialized slots.
@@ -2000,6 +2187,16 @@ fn drain_pending_releases_locked(state: &CageState, allocator: &mut Allocator) -
     state
         .pending_release_nonempty
         .store(current != 0, Ordering::Release);
+    #[cfg(feature = "allocator-telemetry")]
+    if len != 0 {
+        PENDING_RELEASE_QUEUE_TELEMETRY
+            .drained
+            .fetch_add(len as u64, Ordering::Relaxed);
+        let previous = PENDING_RELEASE_QUEUE_TELEMETRY
+            .current
+            .fetch_sub(len, Ordering::Relaxed);
+        debug_assert!(previous >= len);
+    }
     Ok(())
 }
 
@@ -2039,6 +2236,19 @@ fn enqueue_pending_release(state: &CageState, extent: ReleaseExtent) {
     state
         .pending_release_nonempty
         .store(true, Ordering::Release);
+    #[cfg(feature = "allocator-telemetry")]
+    {
+        PENDING_RELEASE_QUEUE_TELEMETRY
+            .enqueued
+            .fetch_add(1, Ordering::Relaxed);
+        let depth = PENDING_RELEASE_QUEUE_TELEMETRY
+            .current
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        PENDING_RELEASE_QUEUE_TELEMETRY
+            .peak
+            .fetch_max(depth, Ordering::Relaxed);
+    }
 }
 
 fn initialize_allocation_header(state: &CageState, offset: u32, header: AllocationHeader) {
@@ -2049,23 +2259,27 @@ fn initialize_allocation_header(state: &CageState, offset: u32, header: Allocati
     unsafe { header_ptr(state, offset).write(header) };
 }
 
-fn local_reuse_enabled(state: &CageState) -> bool {
-    ENABLE_PENDING_REUSE
-        && state.local_reuse_activated.load(Ordering::Acquire)
-        && state.local_cache_budget != 0
-        && !state.allocator_faulted.load(Ordering::Acquire)
+fn local_reuse_policy_selects(contended: bool, block_len: u32) -> bool {
+    contended || block_len == UNCONTENDED_LOCAL_REUSE_BLOCK_LEN
 }
 
-fn local_reuse_eligible(bytes: usize, alignment: usize) -> bool {
+fn local_reuse_enabled(state: &CageState, block_len: u32) -> bool {
+    ENABLE_PENDING_REUSE
+        && state.local_cache_budget != 0
+        && !state.allocator_faulted.load(Ordering::Acquire)
+        && local_reuse_policy_selects(
+            state.local_reuse_activated.load(Ordering::Acquire),
+            block_len,
+        )
+}
+
+fn local_reuse_block_len(bytes: usize, alignment: usize) -> Option<u32> {
     if alignment > 8 {
-        return false;
+        return None;
     }
-    let Ok(bytes) = u32::try_from(bytes) else {
-        return false;
-    };
-    bytes
-        .checked_add(size_of::<AllocationHeader>() as u32 + 7)
-        .is_some_and(|len| size_class_index(len & !7).is_some())
+    let bytes = u32::try_from(bytes).ok()?;
+    let block_len = bytes.checked_add(size_of::<AllocationHeader>() as u32 + 7)? & !7;
+    size_class_index(block_len).map(|_| block_len)
 }
 
 fn with_local_reuse_cache<R>(
@@ -2119,23 +2333,20 @@ fn take_local_reuse(
             .fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if !local_reuse_eligible(bytes, alignment) {
+    let Some(wanted_len) = local_reuse_block_len(bytes, alignment) else {
         #[cfg(feature = "allocator-telemetry")]
         LOCAL_REUSE_TELEMETRY
             .misses_size
             .fetch_add(1, Ordering::Relaxed);
         return None;
-    }
-    if !local_reuse_enabled(state) {
+    };
+    if !local_reuse_enabled(state, wanted_len) {
         #[cfg(feature = "allocator-telemetry")]
         LOCAL_REUSE_TELEMETRY
             .misses_disabled
             .fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let wanted_len = block_layout(state.base(), INITIAL_CURSOR, bytes, alignment)
-        .ok()?
-        .2;
     let Some(recycled) = with_local_reuse_cache(state, false, |cache| {
         cache.take_compatible(
             &state.local_cache_bytes,
@@ -2192,7 +2403,7 @@ fn cache_released_extent(state: &CageState, extent: ReleaseExtent) -> bool {
             .fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if !local_reuse_enabled(state) {
+    if !local_reuse_enabled(state, extent.len) {
         #[cfg(feature = "allocator-telemetry")]
         LOCAL_REUSE_TELEMETRY
             .releases_disabled
@@ -2303,8 +2514,7 @@ fn record_pending_lookup(lookup: PendingLookup, block_len: u32) {
         }
         PendingLookup::Recycled => {
             PENDING_REUSE_TELEMETRY.hits.fetch_add(1, Ordering::Relaxed);
-            let bucket = ((block_len as usize) / 8).min(BLOCK_SIZE_BUCKETS - 1);
-            PENDING_ALLOCATION_SIZE_HISTOGRAM[bucket].fetch_add(1, Ordering::Relaxed);
+            record_reused_allocation_size(block_len);
         }
     }
     #[cfg(not(feature = "allocator-telemetry"))]
@@ -3907,6 +4117,16 @@ mod tests {
                 exact_size_extents_cached: 0,
                 #[cfg(feature = "allocator-telemetry")]
                 exact_size_extents_coalesced_before_cache: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_attempts: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_in_place_no_growth: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_in_place_cursor_growth: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_in_place_free_growth: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_no_space: 0,
             }),
             local_reuse_activated: AtomicBool::new(false),
             active_local_cache_owners: AtomicUsize::new(0),
@@ -4380,6 +4600,18 @@ mod tests {
         let allocator = lock(&state).unwrap();
         assert_eq!(allocator.live_bytes, extent.len);
         validate_allocator(&state, &allocator).unwrap();
+    }
+
+    #[test]
+    fn uncontended_policy_selects_only_the_repeated_32_byte_class() {
+        assert!(local_reuse_policy_selects(false, 32));
+        assert!(!local_reuse_policy_selects(false, 40));
+        assert!(!local_reuse_policy_selects(false, 48));
+        assert!(!local_reuse_policy_selects(false, 112));
+        assert!(local_reuse_policy_selects(true, 40));
+        assert_eq!(local_reuse_block_len(16, 8), Some(32));
+        assert_eq!(local_reuse_block_len(24, 8), Some(40));
+        assert_eq!(local_reuse_block_len(16, 16), None);
     }
 
     #[test]

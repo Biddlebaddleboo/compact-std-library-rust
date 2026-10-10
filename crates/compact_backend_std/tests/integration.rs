@@ -44,6 +44,26 @@ fn process_cage_owners_layout_drop_and_threaded_release() {
     assert_eq!(CompactRuntime::capacity().unwrap(), 1 << 20);
     assert!(CompactRuntime::remaining_bytes().unwrap() > 0);
 
+    if !BENCHMARK_POLICY_A {
+        #[cfg(feature = "allocator-telemetry")]
+        let local_hits_before = CompactRuntime::allocator_stats().unwrap().local_cache_hits;
+        let anchor = CompactRuntime::alloc_owned_slice::<u8>(1).unwrap();
+        let first = CompactRuntime::alloc_owned_slice::<u64>(2).unwrap();
+        let first_offset = first.offset().as_u32();
+        let tail = CompactRuntime::alloc_owned_slice::<u8>(1).unwrap();
+        drop(first);
+
+        let reused = CompactRuntime::alloc_owned_slice::<u64>(2).unwrap();
+        assert_eq!(reused.offset().as_u32(), first_offset);
+        #[cfg(feature = "allocator-telemetry")]
+        assert!(CompactRuntime::allocator_stats().unwrap().local_cache_hits > local_hits_before);
+
+        drop(reused);
+        drop(tail);
+        drop(anchor);
+        CompactRuntime::allocator_stats().unwrap();
+    }
+
     #[repr(align(64))]
     struct Aligned([u8; 64]);
     unsafe impl CompactValue for Aligned {}

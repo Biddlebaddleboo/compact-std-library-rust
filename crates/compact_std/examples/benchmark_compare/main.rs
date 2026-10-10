@@ -306,6 +306,30 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
             owners = stats.active_local_cache_owners,
             budget = stats.local_cache_budget,
         );
+        let alignment_histogram = stats
+            .allocation_alignment_histogram
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "META\tallocation_alignment_histogram\t{scenario}\t{variant}\t{alignment_histogram}"
+        );
+        println!(
+            "META\tpending_release_queue\t{scenario}\t{variant}\t{enqueued}\t{drained}\t{current}\t{peak}",
+            enqueued = stats.pending_release_queue_enqueued,
+            drained = stats.pending_release_queue_drained,
+            current = stats.pending_release_queue_current,
+            peak = stats.pending_release_queue_peak,
+        );
+        println!(
+            "META\tin_place_resize_summary\t{scenario}\t{variant}\t{attempts}\t{no_growth}\t{cursor_growth}\t{free_growth}\t{no_space}",
+            attempts = stats.resize_attempts,
+            no_growth = stats.resize_in_place_no_growth,
+            cursor_growth = stats.resize_in_place_cursor_growth,
+            free_growth = stats.resize_in_place_free_growth,
+            no_space = stats.resize_no_space,
+        );
         let pending_scan_depths = stats
             .pending_reuse_scan_depth_histogram
             .iter()
