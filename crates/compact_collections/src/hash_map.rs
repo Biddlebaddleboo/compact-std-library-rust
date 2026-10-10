@@ -88,17 +88,17 @@ impl Default for CompactBuildHasher {
     }
 }
 impl BuildHasher for CompactBuildHasher {
-    type Hasher = SipHasher24;
+    type Hasher = SipHasher13;
     fn build_hasher(&self) -> Self::Hasher {
-        SipHasher24::new(self.k0, self.k1)
+        SipHasher13::new(self.k0, self.k1)
     }
 }
 // SAFETY: the builder retains only two integer hash keys.
 unsafe impl CompactValue for CompactBuildHasher {}
 
-/// SipHash-2-4 state used transiently while hashing a key.
+/// SipHash state used transiently while hashing a key.
 #[derive(Clone, Copy)]
-pub struct SipHasher24 {
+pub struct SipHasher<const COMPRESS_ROUNDS: usize, const FINAL_ROUNDS: usize> {
     v0: u64,
     v1: u64,
     v2: u64,
@@ -107,7 +107,15 @@ pub struct SipHasher24 {
     tail_len: u8,
     length: u64,
 }
-impl SipHasher24 {
+/// SipHash-2-4, retained for explicit internal reference checks.
+#[allow(dead_code)]
+pub type SipHasher24 = SipHasher<2, 4>;
+/// SipHash-1-3, used by the randomized default builder.
+pub type SipHasher13 = SipHasher<1, 3>;
+
+impl<const COMPRESS_ROUNDS: usize, const FINAL_ROUNDS: usize>
+    SipHasher<COMPRESS_ROUNDS, FINAL_ROUNDS>
+{
     fn new(k0: u64, k1: u64) -> Self {
         Self {
             v0: 0x736f6d6570736575 ^ k0,
@@ -137,8 +145,9 @@ impl SipHasher24 {
     }
     fn compress(&mut self, word: u64) {
         self.v3 ^= word;
-        self.round();
-        self.round();
+        for _ in 0..COMPRESS_ROUNDS {
+            self.round();
+        }
         self.v0 ^= word;
     }
 
@@ -168,13 +177,15 @@ impl SipHasher24 {
         self.tail_len = remaining as u8;
     }
 }
-impl Hasher for SipHasher24 {
+impl<const COMPRESS_ROUNDS: usize, const FINAL_ROUNDS: usize> Hasher
+    for SipHasher<COMPRESS_ROUNDS, FINAL_ROUNDS>
+{
     fn finish(&self) -> u64 {
         let mut state = *self;
         let final_word = state.tail | ((state.length & 0xff) << 56);
         state.compress(final_word);
         state.v2 ^= 0xff;
-        for _ in 0..4 {
+        for _ in 0..FINAL_ROUNDS {
             state.round();
         }
         state.v0 ^ state.v1 ^ state.v2 ^ state.v3
@@ -1028,7 +1039,8 @@ unsafe impl<T: CompactValue + Hash + Eq, S: BuildHasher + CompactValue> CompactV
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_control_group, CompactHashMap, CompactValue, SipHasher24, EMPTY, FULL, TOMBSTONE,
+        classify_control_group, CompactHashMap, CompactValue, SipHasher13, SipHasher24, EMPTY,
+        FULL, TOMBSTONE,
     };
     use crate::hash_control::{self, ControlGroupMask, WIDTH};
     use compact_backend_std::{CageConfig, CompactRuntime};
@@ -1168,6 +1180,16 @@ mod tests {
             map.insert(key, key ^ 0xa5a5).unwrap();
         }
         assert_probe_matches_scalar(&map);
+    }
+
+    #[test]
+    fn siphash13_matches_reference_vectors() {
+        let k0 = 0x0706_0504_0302_0100;
+        let k1 = 0x0f0e_0d0c_0b0a_0908;
+        let mut empty = SipHasher13::new(k0, k1);
+        assert_eq!(empty.finish(), 0xabac_0158_050f_c4dc);
+        empty.write(&[0]);
+        assert_eq!(empty.finish(), 0xc9f4_9bf3_7d57_ca93);
     }
 
     #[test]

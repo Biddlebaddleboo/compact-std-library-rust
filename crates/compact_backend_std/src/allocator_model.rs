@@ -67,8 +67,9 @@
 //!
 //! The small transition helpers below are supplemented by
 //! [`hypothetical_chunk_model`], a deterministic sequential reference
-//! protocol. That model accounts for ranges and chunk identities and tests
-//! failure paths, including a remote lookup pin interleaved with retirement.
+//! protocol. That model accounts for ranges, monotonic chunk generations,
+//! quarantined bytes, and failures including a remote lookup pin interleaved
+//! with retirement.
 //! It is hypothetical: remote publication is atomic at a model method boundary,
 //! the reaper is an abstract owner, and the model does not
 //! establish actual memory ordering, thread-local destructor behavior, or
@@ -371,6 +372,9 @@ mod hypothetical_chunk_model {
     struct ChunkId(u32);
 
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct ChunkGeneration(u32);
+
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     struct AllocationId(u32);
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,12 +383,14 @@ mod hypothetical_chunk_model {
         Retiring,
         Reclaiming,
         Reclaimed,
+        Quarantined,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum PendingRoute {
         LocalCollector,
         RemoteQueue,
+        Quarantined,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,6 +428,7 @@ mod hypothetical_chunk_model {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Chunk {
         id: ChunkId,
+        generation: ChunkGeneration,
         start: u32,
         len: u32,
         owner: ThreadKey,
@@ -433,6 +440,7 @@ mod hypothetical_chunk_model {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct RemoteReleasePin {
         chunk: ChunkId,
+        generation: ChunkGeneration,
         allocation: AllocationId,
         dropper: ThreadKey,
     }
@@ -509,6 +517,7 @@ mod hypothetical_chunk_model {
         WrongAllocationHolder,
         WrongQueueOwner,
         ChunkNotActive,
+        ChunkQuarantined,
         ChunkTransferForbidden,
         ChunkBusy,
         WrongPhase,
@@ -523,13 +532,14 @@ mod hypothetical_chunk_model {
         capacity: u32,
         cursor: u32,
         next_chunk: u32,
+        next_generation: u32,
         next_allocation: u32,
         extents: Vec<Extent>,
         chunks: BTreeMap<ChunkId, Chunk>,
         exited_threads: BTreeSet<ThreadKey>,
         /// Outstanding registry lookup pins. A pinned allocation remains
         /// Live until the operation commits or explicitly cancels.
-        remote_release_pins: BTreeSet<AllocationId>,
+        remote_release_pins: BTreeMap<AllocationId, ChunkGeneration>,
         accounting: Accounting,
     }
 
@@ -539,11 +549,12 @@ mod hypothetical_chunk_model {
                 capacity,
                 cursor: 0,
                 next_chunk: 0,
+                next_generation: 1,
                 next_allocation: 0,
                 extents: Vec::new(),
                 chunks: BTreeMap::new(),
                 exited_threads: BTreeSet::new(),
-                remote_release_pins: BTreeSet::new(),
+                remote_release_pins: BTreeMap::new(),
                 accounting: Accounting::default(),
             }
         }
@@ -575,7 +586,13 @@ mod hypothetical_chunk_model {
                 .next_chunk
                 .checked_add(1)
                 .ok_or(ModelError::IdExhausted)?;
+            let generation = ChunkGeneration(self.next_generation);
+            let next_generation = self
+                .next_generation
+                .checked_add(1)
+                .ok_or(ModelError::IdExhausted)?;
             self.next_chunk = next_chunk;
+            self.next_generation = next_generation;
             if let Some(end) = bump_end {
                 self.cursor = end;
             }
@@ -610,6 +627,7 @@ mod hypothetical_chunk_model {
                 id,
                 Chunk {
                     id,
+                    generation,
                     start,
                     len,
                     owner,
@@ -632,6 +650,9 @@ mod hypothetical_chunk_model {
                 return Err(ModelError::InvalidSize);
             }
             let chunk = self.chunk(chunk_id)?;
+            if chunk.phase == ChunkPhase::Quarantined {
+                return Err(ModelError::ChunkQuarantined);
+            }
             if chunk.phase != ChunkPhase::Active {
                 return Err(ModelError::ChunkNotActive);
             }
@@ -733,6 +754,11 @@ mod hypothetical_chunk_model {
             }
             let chunk_id = extent.chunk.ok_or(ModelError::InvariantViolation)?;
             let chunk = self.chunk(chunk_id)?;
+            if chunk.phase == ChunkPhase::Quarantined {
+                self.quarantine_live_allocation(allocation, dropper)?;
+                self.assert_valid();
+                return Ok(());
+            }
             let local = chunk.phase == ChunkPhase::Active && chunk.owner == dropper;
             if local {
                 self.extents[index].state = ExtentState::PendingRelease {
@@ -770,16 +796,23 @@ mod hypothetical_chunk_model {
             let chunk_id = extent.chunk.ok_or(ModelError::InvariantViolation)?;
             let chunk = self.chunk(chunk_id)?;
             if !matches!(chunk.phase, ChunkPhase::Active | ChunkPhase::Retiring) {
-                return Err(ModelError::ChunkNotActive);
+                return Err(if chunk.phase == ChunkPhase::Quarantined {
+                    ModelError::ChunkQuarantined
+                } else {
+                    ModelError::ChunkNotActive
+                });
             }
             if chunk.owner == dropper {
                 return Err(ModelError::WrongChunkOwner);
             }
-            if !self.remote_release_pins.insert(allocation) {
+            if self.remote_release_pins.contains_key(&allocation) {
                 return Err(ModelError::ChunkBusy);
             }
+            self.remote_release_pins
+                .insert(allocation, chunk.generation);
             let pin = RemoteReleasePin {
                 chunk: chunk_id,
+                generation: chunk.generation,
                 allocation,
                 dropper,
             };
@@ -791,7 +824,7 @@ mod hypothetical_chunk_model {
         /// This remains valid after the home changes `Active -> Retiring`.
         fn commit_remote_release(&mut self, pin: RemoteReleasePin) -> Result<(), ModelError> {
             self.ensure_thread_active(pin.dropper)?;
-            if !self.remote_release_pins.contains(&pin.allocation) {
+            if self.remote_release_pins.get(&pin.allocation) != Some(&pin.generation) {
                 return Err(ModelError::UnknownOrStaleAllocation);
             }
             let index = self
@@ -807,13 +840,20 @@ mod hypothetical_chunk_model {
                 return Err(ModelError::UnknownChunk);
             }
             let chunk = self.chunk(pin.chunk)?;
-            if !matches!(chunk.phase, ChunkPhase::Active | ChunkPhase::Retiring) {
-                return Err(ModelError::ChunkNotActive);
+            if chunk.generation != pin.generation {
+                return Err(ModelError::UnknownOrStaleAllocation);
             }
+            let (owner, route) = match chunk.phase {
+                ChunkPhase::Active | ChunkPhase::Retiring => {
+                    (chunk.owner, PendingRoute::RemoteQueue)
+                }
+                ChunkPhase::Quarantined => (REAPER, PendingRoute::Quarantined),
+                _ => return Err(ModelError::ChunkNotActive),
+            };
             self.extents[index].state = ExtentState::PendingRelease {
-                owner: chunk.owner,
+                owner,
                 allocation: pin.allocation,
-                route: PendingRoute::RemoteQueue,
+                route,
             };
             self.remote_release_pins.remove(&pin.allocation);
             self.assert_valid();
@@ -824,12 +864,88 @@ mod hypothetical_chunk_model {
         /// point. The live owner remains authoritative and may retry or cause
         /// the real implementation to quarantine the chunk on lock failure.
         fn cancel_remote_release(&mut self, pin: RemoteReleasePin) -> Result<(), ModelError> {
-            if self.remote_release_pins.remove(&pin.allocation) {
+            if self.remote_release_pins.remove(&pin.allocation).is_some() {
                 self.assert_valid();
                 Ok(())
             } else {
                 Err(ModelError::UnknownOrStaleAllocation)
             }
+        }
+
+        /// Preserve all ranges when an ambiguous allocator error makes the
+        /// record unsafe to reuse. Reclamation is permanently disabled for
+        /// this generation; outstanding pins may still finish into quarantine.
+        fn quarantine_chunk(&mut self, chunk_id: ChunkId) -> Result<(), ModelError> {
+            let chunk = self.chunk(chunk_id)?;
+            if chunk.phase == ChunkPhase::Reclaimed {
+                return Err(ModelError::AlreadyReclaimed);
+            }
+            if chunk.phase == ChunkPhase::Quarantined {
+                return Ok(());
+            }
+
+            let record = self.chunks.get_mut(&chunk_id).unwrap();
+            record.owner = REAPER;
+            record.phase = ChunkPhase::Quarantined;
+            for extent in self
+                .extents
+                .iter_mut()
+                .filter(|extent| extent.chunk == Some(chunk_id))
+            {
+                match extent.state {
+                    ExtentState::Reserved { .. } | ExtentState::Reclaimable => {
+                        let old = extent.state;
+                        self.accounting.move_bytes(
+                            old,
+                            ExtentState::Reserved { owner: REAPER },
+                            extent.len,
+                        );
+                        extent.state = ExtentState::Reserved { owner: REAPER };
+                    }
+                    ExtentState::PendingRelease { allocation, .. } => {
+                        extent.state = ExtentState::PendingRelease {
+                            owner: REAPER,
+                            allocation,
+                            route: PendingRoute::Quarantined,
+                        };
+                    }
+                    ExtentState::Live { .. } => {}
+                    ExtentState::GlobalFree => unreachable!(),
+                }
+            }
+            self.assert_valid();
+            Ok(())
+        }
+
+        /// A release that arrives after quarantine remains counted as live and
+        /// gets a durable model descriptor instead of entering a reusable queue.
+        fn quarantine_live_allocation(
+            &mut self,
+            allocation: AllocationId,
+            dropper: ThreadKey,
+        ) -> Result<(), ModelError> {
+            self.ensure_thread_active(dropper)?;
+            let index = self
+                .extent_for_allocation(allocation)
+                .ok_or(ModelError::UnknownOrStaleAllocation)?;
+            let extent = self.extents[index];
+            match extent.state {
+                ExtentState::Live { holder, .. } if holder == dropper => {}
+                ExtentState::Live { .. } => return Err(ModelError::WrongAllocationHolder),
+                _ => return Err(ModelError::UnknownOrStaleAllocation),
+            }
+            let chunk_id = extent.chunk.ok_or(ModelError::InvariantViolation)?;
+            if self.chunk(chunk_id)?.phase != ChunkPhase::Quarantined {
+                return Err(ModelError::WrongPhase);
+            }
+            self.extents[index].state = ExtentState::PendingRelease {
+                owner: REAPER,
+                allocation,
+                route: PendingRoute::Quarantined,
+            };
+            self.remote_release_pins.remove(&allocation);
+            self.assert_valid();
+            Ok(())
         }
 
         /// Exact pending reuse is local to the collector that owns the entry.
@@ -921,6 +1037,9 @@ mod hypothetical_chunk_model {
             let chunk = self.chunk(chunk_id)?;
             if chunk.owner != queue_owner {
                 return Err(ModelError::WrongQueueOwner);
+            }
+            if chunk.phase == ChunkPhase::Quarantined {
+                return Err(ModelError::ChunkQuarantined);
             }
             if !matches!(chunk.phase, ChunkPhase::Active | ChunkPhase::Retiring) {
                 return Err(ModelError::ChunkNotActive);
@@ -1025,6 +1144,9 @@ mod hypothetical_chunk_model {
             let chunk = self.chunk(chunk_id)?;
             if chunk.phase == ChunkPhase::Reclaimed {
                 return Err(ModelError::AlreadyReclaimed);
+            }
+            if chunk.phase == ChunkPhase::Quarantined {
+                return Err(ModelError::ChunkQuarantined);
             }
             if self.has_live_or_pending(chunk_id) || self.has_remote_pin(chunk_id) {
                 return Err(ModelError::ChunkBusy);
@@ -1141,11 +1263,19 @@ mod hypothetical_chunk_model {
         }
 
         fn has_remote_pin(&self, chunk_id: ChunkId) -> bool {
-            self.remote_release_pins.iter().any(|allocation| {
-                self.extent_for_allocation(*allocation)
-                    .and_then(|index| self.extents.get(index))
-                    .is_some_and(|extent| extent.chunk == Some(chunk_id))
-            })
+            self.remote_release_pins
+                .iter()
+                .any(|(allocation, generation)| {
+                    self.extent_for_allocation(*allocation)
+                        .and_then(|index| self.extents.get(index))
+                        .is_some_and(|extent| {
+                            extent.chunk == Some(chunk_id)
+                                && self
+                                    .chunks
+                                    .get(&chunk_id)
+                                    .is_some_and(|chunk| chunk.generation == *generation)
+                        })
+                })
         }
 
         fn accounting(&self) -> Accounting {
@@ -1348,6 +1478,8 @@ mod hypothetical_chunk_model {
                                             chunk.phase,
                                             ChunkPhase::Active | ChunkPhase::Retiring
                                         ) => {}
+                                    PendingRoute::Quarantined
+                                        if chunk.phase == ChunkPhase::Quarantined => {}
                                     _ => return Err(ModelError::InvariantViolation),
                                 }
                             }
@@ -1365,20 +1497,31 @@ mod hypothetical_chunk_model {
                 return Err(ModelError::InvariantViolation);
             }
 
-            for allocation in &self.remote_release_pins {
+            for (allocation, generation) in &self.remote_release_pins {
                 let Some(index) = self.extent_for_allocation(*allocation) else {
                     return Err(ModelError::InvariantViolation);
                 };
+                let Some(chunk_id) = self.extents[index].chunk else {
+                    return Err(ModelError::InvariantViolation);
+                };
                 if !matches!(self.extents[index].state, ExtentState::Live { .. })
-                    || self.extents[index].chunk.is_none()
+                    || self
+                        .chunks
+                        .get(&chunk_id)
+                        .is_none_or(|chunk| chunk.generation != *generation)
                 {
                     return Err(ModelError::InvariantViolation);
                 }
             }
 
             let mut active_ranges = Vec::new();
+            let mut generations = BTreeSet::new();
             for (id, chunk) in &self.chunks {
-                if chunk.id != *id || chunk.len == 0 {
+                if chunk.id != *id
+                    || chunk.generation.0 == 0
+                    || !generations.insert(chunk.generation)
+                    || chunk.len == 0
+                {
                     return Err(ModelError::InvariantViolation);
                 }
                 if chunk.phase == ChunkPhase::Reclaimed {
@@ -1414,6 +1557,9 @@ mod hypothetical_chunk_model {
                     return Err(ModelError::InvariantViolation);
                 }
                 if chunk.phase == ChunkPhase::Reclaiming && has_reserved && has_reclaimable {
+                    return Err(ModelError::InvariantViolation);
+                }
+                if chunk.phase == ChunkPhase::Quarantined && has_reclaimable {
                     return Err(ModelError::InvariantViolation);
                 }
                 if self.has_live_or_pending(*id) && has_reclaimable {
@@ -1628,6 +1774,84 @@ mod hypothetical_chunk_model {
             model.teardown_chunk(chunk).unwrap();
             assert_eq!(model.chunks[&chunk].phase, ChunkPhase::Reclaimed);
             assert_eq!(model.accounting(), Accounting::default());
+            model.assert_valid();
+        }
+
+        #[test]
+        fn quarantine_preserves_a_pinned_release_and_forbids_reuse() {
+            let mut model = HypotheticalAllocator::new(32);
+            let chunk = model.reserve_chunk(thread(1), 16).unwrap();
+            let allocation = model.allocate_from_chunk(chunk, thread(1), 8).unwrap();
+            model
+                .transfer_live_handle(allocation, thread(1), thread(2))
+                .unwrap();
+            let pin = model.begin_remote_release(allocation, thread(2)).unwrap();
+
+            model.quarantine_chunk(chunk).unwrap();
+            assert_eq!(model.chunks[&chunk].phase, ChunkPhase::Quarantined);
+            assert_eq!(model.chunks[&chunk].owner, REAPER);
+            assert_eq!(model.accounting().live_bytes, 8);
+            assert_eq!(model.accounting().reserved_bytes, 8);
+            assert_eq!(model.accounting().free_bytes, 0);
+            assert_eq!(
+                model.allocate_from_chunk(chunk, thread(3), 1),
+                Err(ModelError::ChunkQuarantined)
+            );
+            assert_eq!(
+                model.flush_remote(chunk, REAPER),
+                Err(ModelError::ChunkQuarantined)
+            );
+            assert_eq!(
+                model.teardown_chunk(chunk),
+                Err(ModelError::ChunkQuarantined)
+            );
+
+            model.commit_remote_release(pin).unwrap();
+            assert_eq!(model.remote_release_pins.len(), 0);
+            assert_eq!(model.accounting().live_bytes, 8);
+            assert_eq!(model.accounting().free_bytes, 0);
+            assert!(model.extents.iter().any(|extent| {
+                extent.chunk == Some(chunk)
+                    && extent.state
+                        == ExtentState::PendingRelease {
+                            owner: REAPER,
+                            allocation,
+                            route: PendingRoute::Quarantined,
+                        }
+            }));
+            model.assert_valid();
+        }
+
+        #[test]
+        fn reused_arena_interval_receives_a_fresh_chunk_generation() {
+            let mut model = HypotheticalAllocator::new(32);
+            let old_chunk = model.reserve_chunk(thread(1), 16).unwrap();
+            let old_generation = model.chunks[&old_chunk].generation;
+            let old_allocation = model.allocate_from_chunk(old_chunk, thread(1), 16).unwrap();
+            model.release_allocation(old_allocation, thread(1)).unwrap();
+            model.flush_local(thread(1)).unwrap();
+            model.teardown_chunk(old_chunk).unwrap();
+
+            let new_chunk = model.reserve_chunk(thread(2), 16).unwrap();
+            let new_generation = model.chunks[&new_chunk].generation;
+            assert_eq!(
+                model.chunks[&new_chunk].start,
+                model.chunks[&old_chunk].start
+            );
+            assert_ne!(old_chunk, new_chunk);
+            assert!(new_generation > old_generation);
+            let new_allocation = model.allocate_from_chunk(new_chunk, thread(2), 16).unwrap();
+            assert_eq!(
+                model.release_allocation(old_allocation, thread(1)),
+                Err(ModelError::UnknownOrStaleAllocation)
+            );
+            assert!(model.extents.iter().any(|extent| {
+                extent.state
+                    == ExtentState::Live {
+                        holder: thread(2),
+                        allocation: new_allocation,
+                    }
+            }));
             model.assert_valid();
         }
 
