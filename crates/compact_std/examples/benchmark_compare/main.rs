@@ -284,6 +284,28 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
             cached_exact = stats.exact_size_extents_cached,
             coalesced_exact = stats.exact_size_extents_coalesced_before_cache,
         );
+        println!(
+            "META\tlocal_reuse_summary\t{scenario}\t{variant}\t{lookups}\t{hits}\t{miss_empty}\t{miss_size}\t{miss_alignment}\t{miss_disabled}\t{miss_no_owner}\t{owner_limit}\t{miss_no_match}\t{releases_cached}\t{releases_ineligible}\t{releases_budget}\t{releases_disabled}\t{releases_no_owner}\t{evictions}\t{cached_bytes}\t{cached_peak}\t{owners}\t{budget}",
+            lookups = stats.local_cache_lookups,
+            hits = stats.local_cache_hits,
+            miss_empty = stats.local_cache_misses_empty,
+            miss_size = stats.local_cache_misses_size,
+            miss_alignment = stats.local_cache_misses_alignment,
+            miss_disabled = stats.local_cache_misses_disabled,
+            miss_no_owner = stats.local_cache_misses_no_owner,
+            owner_limit = stats.local_cache_owner_limit_misses,
+            miss_no_match = stats.local_cache_misses_no_match,
+            releases_cached = stats.local_cache_releases_cached,
+            releases_ineligible = stats.local_cache_releases_ineligible,
+            releases_budget = stats.local_cache_releases_budget_limited,
+            releases_disabled = stats.local_cache_releases_disabled,
+            releases_no_owner = stats.local_cache_releases_no_owner,
+            evictions = stats.local_cache_evictions,
+            cached_bytes = stats.local_cache_bytes,
+            cached_peak = stats.local_cache_bytes_peak,
+            owners = stats.active_local_cache_owners,
+            budget = stats.local_cache_budget,
+        );
         let pending_scan_depths = stats
             .pending_reuse_scan_depth_histogram
             .iter()

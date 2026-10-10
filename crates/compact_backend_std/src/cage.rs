@@ -82,6 +82,46 @@ struct PendingReuseTelemetry {
 }
 
 #[cfg(feature = "allocator-telemetry")]
+struct LocalReuseTelemetry {
+    lookups: AtomicU64,
+    hits: AtomicU64,
+    misses_empty: AtomicU64,
+    misses_size: AtomicU64,
+    misses_alignment: AtomicU64,
+    misses_disabled: AtomicU64,
+    misses_no_owner: AtomicU64,
+    owner_limit_misses: AtomicU64,
+    misses_no_match: AtomicU64,
+    releases_cached: AtomicU64,
+    releases_ineligible: AtomicU64,
+    releases_budget_limited: AtomicU64,
+    releases_disabled: AtomicU64,
+    releases_no_owner: AtomicU64,
+    evictions: AtomicU64,
+    cached_bytes_peak: AtomicUsize,
+}
+
+#[cfg(feature = "allocator-telemetry")]
+static LOCAL_REUSE_TELEMETRY: LocalReuseTelemetry = LocalReuseTelemetry {
+    lookups: AtomicU64::new(0),
+    hits: AtomicU64::new(0),
+    misses_empty: AtomicU64::new(0),
+    misses_size: AtomicU64::new(0),
+    misses_alignment: AtomicU64::new(0),
+    misses_disabled: AtomicU64::new(0),
+    misses_no_owner: AtomicU64::new(0),
+    owner_limit_misses: AtomicU64::new(0),
+    misses_no_match: AtomicU64::new(0),
+    releases_cached: AtomicU64::new(0),
+    releases_ineligible: AtomicU64::new(0),
+    releases_budget_limited: AtomicU64::new(0),
+    releases_disabled: AtomicU64::new(0),
+    releases_no_owner: AtomicU64::new(0),
+    evictions: AtomicU64::new(0),
+    cached_bytes_peak: AtomicUsize::new(0),
+};
+
+#[cfg(feature = "allocator-telemetry")]
 static PENDING_REUSE_TELEMETRY: PendingReuseTelemetry = PendingReuseTelemetry {
     hits: AtomicU64::new(0),
     misses: AtomicU64::new(0),
@@ -370,6 +410,9 @@ struct CageState {
     capacity: usize,
     memory: NonNull<u8>,
     allocator: Mutex<Allocator>,
+    // Becomes true only after allocator contention, allowing allocation lock
+    // acquisition to switch from try_lock to lock without changing the
+    // uncontended path merely because an extent was cached.
     local_reuse_activated: AtomicBool,
     active_local_cache_owners: AtomicUsize,
     local_cache_bytes: AtomicUsize,
@@ -496,6 +539,63 @@ pub struct AllocatorStats {
     /// Pending-reuse misses where alignment padding made an exact-size block too small.
     pub pending_reuse_alignment_incompatible: u64,
     #[cfg(feature = "allocator-telemetry")]
+    /// Local-cache lookup count, including cache misses.
+    pub local_cache_lookups: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Allocations served by the calling thread's local cache.
+    pub local_cache_hits: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Local lookups skipped because the cage-wide cache was empty.
+    pub local_cache_misses_empty: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Requests whose payload size does not map to a cacheable extent class.
+    pub local_cache_misses_size: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Requests whose alignment exceeds the local-cache policy.
+    pub local_cache_misses_alignment: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Local lookups skipped because reuse was disabled or the cage faulted.
+    pub local_cache_misses_disabled: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Local lookups with no registered or borrowable cache owner.
+    pub local_cache_misses_no_owner: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Cache owner registrations denied by the fixed owner limit.
+    pub local_cache_owner_limit_misses: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Local cache scans that found no exact compatible extent.
+    pub local_cache_misses_no_match: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Released extents retained in a local cache.
+    pub local_cache_releases_cached: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Released extents rejected by the current local-cache eligibility policy.
+    pub local_cache_releases_ineligible: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Released extents published because the byte budget could not retain them.
+    pub local_cache_releases_budget_limited: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Released extents published because local reuse was disabled or faulted.
+    pub local_cache_releases_disabled: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Released extents published because no local cache owner was available.
+    pub local_cache_releases_no_owner: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Locally cached extents evicted to stay within entry or byte budgets.
+    pub local_cache_evictions: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Current cage-wide local-cache occupancy after flushing this thread's cache.
+    pub local_cache_bytes: usize,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Peak cage-wide local-cache occupancy since runtime initialization.
+    pub local_cache_bytes_peak: usize,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Threads currently registered as local-cache owners.
+    pub active_local_cache_owners: usize,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Configured cage-wide local-cache byte budget.
+    pub local_cache_budget: usize,
+    #[cfg(feature = "allocator-telemetry")]
     /// Candidate extents examined by pending exact-size lookups.
     pub pending_reuse_scan_candidates: u64,
     #[cfg(feature = "allocator-telemetry")]
@@ -570,6 +670,44 @@ impl Default for AllocatorStats {
             pending_reuse_no_active_collector: 0,
             pending_reuse_no_exact_block: 0,
             pending_reuse_alignment_incompatible: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_lookups: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_hits: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_empty: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_size: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_alignment: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_disabled: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_no_owner: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_owner_limit_misses: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_no_match: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_cached: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_ineligible: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_budget_limited: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_disabled: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_no_owner: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_evictions: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_bytes: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_bytes_peak: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            active_local_cache_owners: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_budget: 0,
             #[cfg(feature = "allocator-telemetry")]
             pending_reuse_scan_candidates: 0,
             #[cfg(feature = "allocator-telemetry")]
@@ -757,6 +895,66 @@ impl CompactRuntime {
             pending_reuse_alignment_incompatible: PENDING_REUSE_TELEMETRY
                 .alignment_incompatible
                 .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_lookups: LOCAL_REUSE_TELEMETRY.lookups.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_hits: LOCAL_REUSE_TELEMETRY.hits.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_empty: LOCAL_REUSE_TELEMETRY.misses_empty.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_size: LOCAL_REUSE_TELEMETRY.misses_size.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_alignment: LOCAL_REUSE_TELEMETRY
+                .misses_alignment
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_disabled: LOCAL_REUSE_TELEMETRY
+                .misses_disabled
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_no_owner: LOCAL_REUSE_TELEMETRY
+                .misses_no_owner
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_owner_limit_misses: LOCAL_REUSE_TELEMETRY
+                .owner_limit_misses
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_misses_no_match: LOCAL_REUSE_TELEMETRY
+                .misses_no_match
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_cached: LOCAL_REUSE_TELEMETRY
+                .releases_cached
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_ineligible: LOCAL_REUSE_TELEMETRY
+                .releases_ineligible
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_budget_limited: LOCAL_REUSE_TELEMETRY
+                .releases_budget_limited
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_disabled: LOCAL_REUSE_TELEMETRY
+                .releases_disabled
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_releases_no_owner: LOCAL_REUSE_TELEMETRY
+                .releases_no_owner
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_evictions: LOCAL_REUSE_TELEMETRY.evictions.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_bytes: state.local_cache_bytes.load(Ordering::Acquire),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_bytes_peak: LOCAL_REUSE_TELEMETRY
+                .cached_bytes_peak
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            active_local_cache_owners: state.active_local_cache_owners.load(Ordering::Acquire),
+            #[cfg(feature = "allocator-telemetry")]
+            local_cache_budget: state.local_cache_budget,
             #[cfg(feature = "allocator-telemetry")]
             pending_reuse_scan_candidates: PENDING_REUSE_TELEMETRY
                 .scan_candidates
@@ -1879,7 +2077,14 @@ fn with_local_reuse_cache<R>(
         .try_with(|slot| {
             let mut cache = slot.cache.try_borrow_mut().ok()?;
             if !slot.registered.get() {
-                if !create || !reserve_local_cache_owner(&state.active_local_cache_owners) {
+                if !create {
+                    return None;
+                }
+                if !reserve_local_cache_owner(&state.active_local_cache_owners) {
+                    #[cfg(feature = "allocator-telemetry")]
+                    LOCAL_REUSE_TELEMETRY
+                        .owner_limit_misses
+                        .fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
                 slot.registered.set(true);
@@ -1896,14 +2101,42 @@ fn take_local_reuse(
     alignment: usize,
     capacity: u32,
 ) -> Option<RecycledExtent> {
+    #[cfg(feature = "allocator-telemetry")]
+    LOCAL_REUSE_TELEMETRY
+        .lookups
+        .fetch_add(1, Ordering::Relaxed);
     if state.local_cache_bytes.load(Ordering::Acquire) == 0 {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .misses_empty
+            .fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if !local_reuse_eligible(bytes, alignment) || !local_reuse_enabled(state) {
+    if alignment > 8 {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .misses_alignment
+            .fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let (_, _, wanted_len) = block_layout(state.base(), INITIAL_CURSOR, bytes, alignment).ok()?;
-    with_local_reuse_cache(state, false, |cache| {
+    if !local_reuse_eligible(bytes, alignment) {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .misses_size
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if !local_reuse_enabled(state) {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .misses_disabled
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let wanted_len = block_layout(state.base(), INITIAL_CURSOR, bytes, alignment)
+        .ok()?
+        .2;
+    let Some(recycled) = with_local_reuse_cache(state, false, |cache| {
         cache.take_compatible(
             &state.local_cache_bytes,
             wanted_len,
@@ -1932,15 +2165,38 @@ fn take_local_reuse(
                 initialize_allocation_header(state, recycled.data_offset.get(), header);
             },
         )
-    })
-    .flatten()
+    }) else {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .misses_no_owner
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let Some(recycled) = recycled else {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .misses_no_match
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    #[cfg(feature = "allocator-telemetry")]
+    LOCAL_REUSE_TELEMETRY.hits.fetch_add(1, Ordering::Relaxed);
+    Some(recycled)
 }
 
 fn cache_released_extent(state: &CageState, extent: ReleaseExtent) -> bool {
     if size_class_index(extent.len).is_none() {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .releases_ineligible
+            .fetch_add(1, Ordering::Relaxed);
         return false;
     }
     if !local_reuse_enabled(state) {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .releases_disabled
+            .fetch_add(1, Ordering::Relaxed);
         return false;
     }
     let Some(publish) = with_local_reuse_cache(state, true, |cache| {
@@ -1951,8 +2207,42 @@ fn cache_released_extent(state: &CageState, extent: ReleaseExtent) -> bool {
             |candidate| size_class_index(candidate.len).is_some(),
         )
     }) else {
+        #[cfg(feature = "allocator-telemetry")]
+        LOCAL_REUSE_TELEMETRY
+            .releases_no_owner
+            .fetch_add(1, Ordering::Relaxed);
         return false;
     };
+    #[cfg(feature = "allocator-telemetry")]
+    let cached = with_local_reuse_cache(state, false, |cache| {
+        cache.extents[..cache.len].contains(&extent)
+    })
+    .unwrap_or(false);
+    #[cfg(feature = "allocator-telemetry")]
+    let evicted = publish
+        .iter()
+        .flatten()
+        .any(|published| *published != extent);
+    #[cfg(feature = "allocator-telemetry")]
+    if evicted {
+        LOCAL_REUSE_TELEMETRY
+            .evictions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "allocator-telemetry")]
+    if cached {
+        LOCAL_REUSE_TELEMETRY
+            .releases_cached
+            .fetch_add(1, Ordering::Relaxed);
+        LOCAL_REUSE_TELEMETRY.cached_bytes_peak.fetch_max(
+            state.local_cache_bytes.load(Ordering::Acquire),
+            Ordering::Relaxed,
+        );
+    } else {
+        LOCAL_REUSE_TELEMETRY
+            .releases_budget_limited
+            .fetch_add(1, Ordering::Relaxed);
+    }
     for extent in publish.into_iter().flatten() {
         let mut one = [extent];
         let _ = release_many(&mut one);

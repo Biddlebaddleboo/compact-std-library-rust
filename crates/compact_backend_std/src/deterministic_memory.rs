@@ -181,6 +181,33 @@ mod tests {
     }
 
     #[test]
+    fn local_cache_finds_an_exact_match_among_mixed_extent_sizes() {
+        let mut cache = LocalCacheState::new();
+        let bytes = AtomicUsize::new(0);
+        let small = extent(64, 32);
+        let wanted = extent(128, 40);
+        assert_eq!(cache.push(wanted, &bytes, 128, |_| true), [None, None]);
+        assert_eq!(cache.push(small, &bytes, 128, |_| true), [None, None]);
+
+        let recycled = RecycledExtent {
+            data_offset: core::num::NonZeroU32::new(wanted.start + 16).unwrap(),
+            prefix: 0,
+            block_len: wanted.len,
+        };
+        let found = cache.take_compatible(
+            &bytes,
+            wanted.len,
+            |candidate| (candidate == wanted).then_some(recycled),
+            |_| {},
+        );
+
+        assert_eq!(found.map(|item| item.block_len), Some(wanted.len));
+        assert_eq!(cache.len, 1);
+        assert_eq!(cache.extents[0], small);
+        assert_eq!(bytes.load(Ordering::Acquire), small.len as usize);
+    }
+
+    #[test]
     fn local_cache_budget_and_capacity_return_overflow_without_losing_it() {
         let mut cache = LocalCacheState::new();
         let bytes = AtomicUsize::new(0);
