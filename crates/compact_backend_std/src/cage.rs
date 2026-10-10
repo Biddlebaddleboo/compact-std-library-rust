@@ -184,6 +184,18 @@ static ALLOCATOR_PHASE_TELEMETRY: AllocatorPhaseTelemetry = AllocatorPhaseTeleme
 };
 
 #[cfg(feature = "allocator-telemetry")]
+struct OwnershipTransferTelemetry {
+    moves: AtomicU64,
+    bytes: AtomicU64,
+}
+
+#[cfg(feature = "allocator-telemetry")]
+static OWNERSHIP_TRANSFER_TELEMETRY: OwnershipTransferTelemetry = OwnershipTransferTelemetry {
+    moves: AtomicU64::new(0),
+    bytes: AtomicU64::new(0),
+};
+
+#[cfg(feature = "allocator-telemetry")]
 struct PhaseTimer {
     started: Instant,
     total_ns: &'static AtomicU64,
@@ -456,6 +468,32 @@ struct Allocator {
     resize_in_place_free_growth: u64,
     #[cfg(feature = "allocator-telemetry")]
     resize_no_space: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_merge_calls: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_adjacent_too_short: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_no_adjacent_free: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_nonadjacent_free_available: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_cursor_capacity_limited: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_old_block_bytes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_requested_block_bytes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_incremental_bytes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_local_cache_flush_retries: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_local_cache_flush_skips_unrelated: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_local_cache_flush_bytes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_local_cache_retry_successes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    resize_local_cache_retry_failures: u64,
 }
 
 struct CageState {
@@ -726,6 +764,50 @@ pub struct AllocatorStats {
     #[cfg(feature = "allocator-telemetry")]
     /// In-place resize attempts that could not grow in place.
     pub resize_no_space: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Number of resize attempts that merged cached size-class ranges first.
+    pub resize_merge_calls: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Failed growth attempts with an adjacent published extent that was too short.
+    pub resize_adjacent_too_short: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Failed growth attempts with no adjacent published free extent.
+    pub resize_no_adjacent_free: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// No-adjacent failures where published free space remained elsewhere.
+    pub resize_nonadjacent_free_available: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Cursor growth failures caused by cage capacity.
+    pub resize_cursor_capacity_limited: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Sum of old physical block lengths examined by resize attempts.
+    pub resize_old_block_bytes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Sum of requested physical block lengths examined by resize attempts.
+    pub resize_requested_block_bytes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Sum of positive physical growth deltas examined by resize attempts.
+    pub resize_incremental_bytes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Resize retries that flushed the calling thread's local cache.
+    pub resize_local_cache_flush_retries: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Resize misses that skipped a local-cache flush because no adjacent extent was present.
+    pub resize_local_cache_flush_skips_unrelated: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Bytes flushed from the calling thread's local cache for resize retries.
+    pub resize_local_cache_flush_bytes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Resize retries that succeeded after flushing the calling thread's cache.
+    pub resize_local_cache_retry_successes: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Resize retries that still failed after flushing the calling thread's cache.
+    pub resize_local_cache_retry_failures: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    /// Successful ownership transfers and the values moved by them.
+    pub ownership_transfer_moves: u64,
+    #[cfg(feature = "allocator-telemetry")]
+    pub ownership_transfer_bytes: u64,
     /// Cached free block counts for the measured exact-size classes.
     pub size_class_free_blocks: [u32; SIZE_CLASSES.len()],
     /// Cached free bytes for the measured exact-size classes.
@@ -839,6 +921,36 @@ impl Default for AllocatorStats {
             resize_in_place_free_growth: 0,
             #[cfg(feature = "allocator-telemetry")]
             resize_no_space: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_merge_calls: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_adjacent_too_short: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_no_adjacent_free: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_nonadjacent_free_available: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_cursor_capacity_limited: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_old_block_bytes: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_requested_block_bytes: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_incremental_bytes: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_flush_retries: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_flush_skips_unrelated: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_flush_bytes: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_retry_successes: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_retry_failures: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            ownership_transfer_moves: 0,
+            #[cfg(feature = "allocator-telemetry")]
+            ownership_transfer_bytes: 0,
             size_class_free_blocks: [0; SIZE_CLASSES.len()],
             size_class_free_bytes: [0; SIZE_CLASSES.len()],
         }
@@ -927,6 +1039,32 @@ impl CompactRuntime {
                 resize_in_place_free_growth: 0,
                 #[cfg(feature = "allocator-telemetry")]
                 resize_no_space: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_merge_calls: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_adjacent_too_short: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_no_adjacent_free: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_nonadjacent_free_available: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_cursor_capacity_limited: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_old_block_bytes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_requested_block_bytes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_incremental_bytes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_flush_retries: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_flush_skips_unrelated: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_flush_bytes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_retry_successes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_retry_failures: 0,
             }),
             local_reuse_activated: AtomicBool::new(false),
             active_local_cache_owners: AtomicUsize::new(0),
@@ -1157,6 +1295,37 @@ impl CompactRuntime {
             resize_in_place_free_growth: allocator.resize_in_place_free_growth,
             #[cfg(feature = "allocator-telemetry")]
             resize_no_space: allocator.resize_no_space,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_merge_calls: allocator.resize_merge_calls,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_adjacent_too_short: allocator.resize_adjacent_too_short,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_no_adjacent_free: allocator.resize_no_adjacent_free,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_nonadjacent_free_available: allocator.resize_nonadjacent_free_available,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_cursor_capacity_limited: allocator.resize_cursor_capacity_limited,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_old_block_bytes: allocator.resize_old_block_bytes,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_requested_block_bytes: allocator.resize_requested_block_bytes,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_incremental_bytes: allocator.resize_incremental_bytes,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_flush_retries: allocator.resize_local_cache_flush_retries,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_flush_skips_unrelated: allocator
+                .resize_local_cache_flush_skips_unrelated,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_flush_bytes: allocator.resize_local_cache_flush_bytes,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_retry_successes: allocator.resize_local_cache_retry_successes,
+            #[cfg(feature = "allocator-telemetry")]
+            resize_local_cache_retry_failures: allocator.resize_local_cache_retry_failures,
+            #[cfg(feature = "allocator-telemetry")]
+            ownership_transfer_moves: OWNERSHIP_TRANSFER_TELEMETRY.moves.load(Ordering::Relaxed),
+            #[cfg(feature = "allocator-telemetry")]
+            ownership_transfer_bytes: OWNERSHIP_TRANSFER_TELEMETRY.bytes.load(Ordering::Relaxed),
             ..AllocatorStats::default()
         };
         let mut current = allocator.free_head;
@@ -1406,6 +1575,14 @@ impl<'a, T> ResolvedAllocationMut<'a, T> {
         // SAFETY: this view is exclusively borrowed from the live allocation.
         unsafe { (*self.header_ptr).initialized = initialized };
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeAttempt {
+    Success,
+    CursorCapacityLimited,
+    AdjacentExtentTooShort,
+    NoAdjacentExtent,
 }
 
 struct AppendInitGuard<'a, T> {
@@ -1741,6 +1918,16 @@ impl<T: CompactValue> CageAllocation<T> {
         }
         source.set_initialized(0);
         destination.set_initialized(len as u32);
+        #[cfg(feature = "allocator-telemetry")]
+        if len != 0 {
+            OWNERSHIP_TRANSFER_TELEMETRY
+                .moves
+                .fetch_add(1, Ordering::Relaxed);
+            let bytes = len.saturating_mul(size_of::<T>()) as u64;
+            OWNERSHIP_TRANSFER_TELEMETRY
+                .bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
         Ok(())
     }
     /// Move initialized values from an inline uninitialized slice.
@@ -1783,16 +1970,58 @@ impl<T: CompactValue> CageAllocation<T> {
             .ok_or(Error::OffsetOverflow)?
             .max(1);
         let mut allocator = lock_for_allocation(state)?;
-        if self.try_resize_locked(state, &mut allocator, offset, header, requested, bytes)? {
+        let first_attempt =
+            self.try_resize_locked(state, &mut allocator, offset, header, requested, bytes)?;
+        if first_attempt == ResizeAttempt::Success {
             return Ok(true);
         }
-        drop(allocator);
         if state.local_cache_bytes.load(Ordering::Acquire) == 0 {
             return Ok(false);
         }
+        if first_attempt == ResizeAttempt::NoAdjacentExtent {
+            let allocation_start = offset
+                .checked_sub(size_of::<AllocationHeader>() as u32)
+                .and_then(|header_offset| header_offset.checked_sub(header.prefix))
+                .ok_or(Error::InvalidOffset)?;
+            let adjacent_start = allocation_start
+                .checked_add(header.block_len)
+                .ok_or(Error::OffsetOverflow)?;
+            if !current_local_cache_has_extent_at(state, adjacent_start) {
+                #[cfg(feature = "allocator-telemetry")]
+                {
+                    allocator.resize_local_cache_flush_skips_unrelated = allocator
+                        .resize_local_cache_flush_skips_unrelated
+                        .saturating_add(1);
+                }
+                return Ok(false);
+            }
+        }
+        drop(allocator);
+        #[cfg(feature = "allocator-telemetry")]
+        let flushed_bytes = flush_current_local_cache(state);
+        #[cfg(not(feature = "allocator-telemetry"))]
         flush_current_local_cache(state);
         let mut allocator = lock_for_allocation(state)?;
-        self.try_resize_locked(state, &mut allocator, offset, header, requested, bytes)
+        let result =
+            self.try_resize_locked(state, &mut allocator, offset, header, requested, bytes);
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.resize_local_cache_flush_retries =
+                allocator.resize_local_cache_flush_retries.saturating_add(1);
+            allocator.resize_local_cache_flush_bytes = allocator
+                .resize_local_cache_flush_bytes
+                .saturating_add(flushed_bytes as u64);
+            if matches!(&result, Ok(ResizeAttempt::Success)) {
+                allocator.resize_local_cache_retry_successes = allocator
+                    .resize_local_cache_retry_successes
+                    .saturating_add(1);
+            } else if result.is_ok() {
+                allocator.resize_local_cache_retry_failures = allocator
+                    .resize_local_cache_retry_failures
+                    .saturating_add(1);
+            }
+        }
+        result.map(|attempt| attempt == ResizeAttempt::Success)
     }
 
     fn try_resize_locked(
@@ -1803,15 +2032,10 @@ impl<T: CompactValue> CageAllocation<T> {
         header: AllocationHeader,
         requested: u32,
         bytes: usize,
-    ) -> Result<bool> {
+    ) -> Result<ResizeAttempt> {
         #[cfg(feature = "allocator-telemetry")]
         {
             allocator.resize_attempts = allocator.resize_attempts.saturating_add(1);
-        }
-        if allocator.size_class_counts.iter().any(|count| *count != 0) {
-            // Resize uses the ordered free list to consume adjacent blocks.
-            // Merge cached extents first so no class-owned neighbor is missed.
-            merge_free_ranges_locked(state, allocator)?;
         }
         let start = self
             .raw_offset()
@@ -1827,6 +2051,29 @@ impl<T: CompactValue> CageAllocation<T> {
             8,
         )?)
         .map_err(|_| Error::OffsetOverflow)?;
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.resize_old_block_bytes = allocator
+                .resize_old_block_bytes
+                .saturating_add(old_len as u64);
+            allocator.resize_requested_block_bytes = allocator
+                .resize_requested_block_bytes
+                .saturating_add(new_len as u64);
+            if new_len > old_len {
+                allocator.resize_incremental_bytes = allocator
+                    .resize_incremental_bytes
+                    .saturating_add((new_len - old_len) as u64);
+            }
+        }
+        if allocator.size_class_counts.iter().any(|count| *count != 0) {
+            // Resize uses the ordered free list to consume adjacent blocks.
+            // Merge cached extents first so no class-owned neighbor is missed.
+            #[cfg(feature = "allocator-telemetry")]
+            {
+                allocator.resize_merge_calls = allocator.resize_merge_calls.saturating_add(1);
+            }
+            merge_free_ranges_locked(state, allocator)?;
+        }
         if new_len <= old_len {
             if new_len < old_len {
                 insert_free(state, allocator, start + new_len, old_len - new_len)?;
@@ -1842,7 +2089,7 @@ impl<T: CompactValue> CageAllocation<T> {
                 allocator.resize_in_place_no_growth =
                     allocator.resize_in_place_no_growth.saturating_add(1);
             }
-            return Ok(true);
+            return Ok(ResizeAttempt::Success);
         }
         let end = start.checked_add(old_len).ok_or(Error::OffsetOverflow)?;
         let extra = new_len - old_len;
@@ -1858,8 +2105,10 @@ impl<T: CompactValue> CageAllocation<T> {
                 #[cfg(feature = "allocator-telemetry")]
                 {
                     allocator.resize_no_space = allocator.resize_no_space.saturating_add(1);
+                    allocator.resize_cursor_capacity_limited =
+                        allocator.resize_cursor_capacity_limited.saturating_add(1);
                 }
-                return Ok(false);
+                return Ok(ResizeAttempt::CursorCapacityLimited);
             }
             allocator.cursor += extra;
             #[cfg(feature = "allocator-telemetry")]
@@ -1871,8 +2120,10 @@ impl<T: CompactValue> CageAllocation<T> {
                 #[cfg(feature = "allocator-telemetry")]
                 {
                     allocator.resize_no_space = allocator.resize_no_space.saturating_add(1);
+                    allocator.resize_adjacent_too_short =
+                        allocator.resize_adjacent_too_short.saturating_add(1);
                 }
-                return Ok(false);
+                return Ok(ResizeAttempt::AdjacentExtentTooShort);
             }
             consume_free_prefix(state, allocator, end, extra)?;
             #[cfg(feature = "allocator-telemetry")]
@@ -1883,8 +2134,15 @@ impl<T: CompactValue> CageAllocation<T> {
             #[cfg(feature = "allocator-telemetry")]
             {
                 allocator.resize_no_space = allocator.resize_no_space.saturating_add(1);
+                allocator.resize_no_adjacent_free =
+                    allocator.resize_no_adjacent_free.saturating_add(1);
+                if allocator.free_head != 0 {
+                    allocator.resize_nonadjacent_free_available = allocator
+                        .resize_nonadjacent_free_available
+                        .saturating_add(1);
+                }
             }
-            return Ok(false);
+            return Ok(ResizeAttempt::NoAdjacentExtent);
         }
         allocator.live_bytes = allocator
             .live_bytes
@@ -1907,7 +2165,7 @@ impl<T: CompactValue> CageAllocation<T> {
             }
             _ => unreachable!("successful in-place growth has a source"),
         }
-        Ok(true)
+        Ok(ResizeAttempt::Success)
     }
     /// Borrow the full capacity as potentially uninitialized slots.
     #[inline]
@@ -2089,9 +2347,9 @@ fn reserve_local_cache_owner(active_owners: &AtomicUsize) -> bool {
     }
 }
 
-fn flush_local_cache_state(state: &CageState, cache: &mut LocalCacheState) {
+fn flush_local_cache_state(state: &CageState, cache: &mut LocalCacheState) -> usize {
     if cache.len == 0 {
-        return;
+        return 0;
     }
     let cached_bytes = cache.bytes();
     let mut extents = cache.extents;
@@ -2105,14 +2363,20 @@ fn flush_local_cache_state(state: &CageState, cache: &mut LocalCacheState) {
     state
         .local_cache_bytes
         .fetch_sub(cached_bytes, Ordering::AcqRel);
+    cached_bytes
 }
 
-fn flush_current_local_cache(state: &CageState) {
-    let _ = LOCAL_REUSE_CACHE.try_with(|slot| {
-        if let Ok(mut cache) = slot.cache.try_borrow_mut() {
-            flush_local_cache_state(state, &mut cache);
-        }
-    });
+fn flush_current_local_cache(state: &CageState) -> usize {
+    LOCAL_REUSE_CACHE
+        .try_with(|slot| {
+            slot.cache
+                .try_borrow_mut()
+                .ok()
+                .map(|mut cache| flush_local_cache_state(state, &mut cache))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(0)
 }
 
 /// Apply at most one fixed-size batch of published releases.
@@ -2307,6 +2571,20 @@ fn with_local_reuse_cache<R>(
         })
         .ok()
         .flatten()
+}
+
+fn current_local_cache_has_extent_at(state: &CageState, start: u32) -> bool {
+    with_local_reuse_cache(state, false, |cache| {
+        local_cache_has_extent_at(cache, start)
+    })
+    .unwrap_or(false)
+}
+
+fn local_cache_has_extent_at(cache: &LocalCacheState, start: u32) -> bool {
+    cache.len <= cache.extents.len()
+        && cache.extents[..cache.len]
+            .iter()
+            .any(|extent| extent.start == start)
 }
 
 fn take_local_reuse(
@@ -2995,11 +3273,15 @@ unsafe fn write_free_node(state: &CageState, offset: u32, node: FreeNode) {
 
 fn free_node_at(
     state: &CageState,
-    allocator: &Allocator,
+    allocator: &mut Allocator,
     offset: u32,
 ) -> Result<Option<(u32, u32)>> {
     let mut current = allocator.free_head;
     while current != 0 {
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.free_list_nodes_visited = allocator.free_list_nodes_visited.saturating_add(1);
+        }
         let node = unsafe { read_free_node(state, current)? };
         if current == offset {
             return Ok(Some((node.len, node.next)));
@@ -3021,11 +3303,19 @@ fn consume_free_prefix(
     let mut previous = 0;
     let mut current = allocator.free_head;
     while current != 0 && current < start {
+        #[cfg(feature = "allocator-telemetry")]
+        {
+            allocator.free_list_nodes_visited = allocator.free_list_nodes_visited.saturating_add(1);
+        }
         previous = current;
         current = unsafe { read_free_node(state, current)? }.next;
     }
     if current != start {
         return Err(Error::InvalidOffset);
+    }
+    #[cfg(feature = "allocator-telemetry")]
+    {
+        allocator.free_list_nodes_visited = allocator.free_list_nodes_visited.saturating_add(1);
     }
     let node = unsafe { read_free_node(state, current)? };
     if consumed > node.len {
@@ -4127,6 +4417,32 @@ mod tests {
                 resize_in_place_free_growth: 0,
                 #[cfg(feature = "allocator-telemetry")]
                 resize_no_space: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_merge_calls: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_adjacent_too_short: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_no_adjacent_free: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_nonadjacent_free_available: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_cursor_capacity_limited: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_old_block_bytes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_requested_block_bytes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_incremental_bytes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_flush_retries: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_flush_skips_unrelated: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_flush_bytes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_retry_successes: 0,
+                #[cfg(feature = "allocator-telemetry")]
+                resize_local_cache_retry_failures: 0,
             }),
             local_reuse_activated: AtomicBool::new(false),
             active_local_cache_owners: AtomicUsize::new(0),
@@ -4576,6 +4892,11 @@ mod tests {
             state.local_cache_bytes.load(Ordering::Acquire),
             extent.len as usize
         );
+        assert!(current_local_cache_has_extent_at(&state, extent.start));
+        assert!(!current_local_cache_has_extent_at(
+            &state,
+            extent.start + extent.len
+        ));
         let recycled = take_local_reuse(&state, 16, 8, 16).unwrap();
         assert_eq!(recycled.data_offset.get(), data_offset);
         assert_eq!(recycled.block_len, extent.len);
@@ -4612,6 +4933,25 @@ mod tests {
         assert_eq!(local_reuse_block_len(16, 8), Some(32));
         assert_eq!(local_reuse_block_len(24, 8), Some(40));
         assert_eq!(local_reuse_block_len(16, 16), None);
+    }
+
+    #[test]
+    fn resize_local_cache_probe_requires_the_exact_adjacent_start() {
+        let mut cache = LocalCacheState::new();
+        cache.extents[0] = ReleaseExtent { start: 64, len: 32 };
+        cache.extents[1] = ReleaseExtent {
+            start: 128,
+            len: 40,
+        };
+        cache.len = 2;
+
+        assert!(local_cache_has_extent_at(&cache, 64));
+        assert!(local_cache_has_extent_at(&cache, 128));
+        assert!(!local_cache_has_extent_at(&cache, 96));
+        assert!(!local_cache_has_extent_at(&cache, 200));
+
+        cache.len = LOCAL_CACHE_CAPACITY + 1;
+        assert!(!local_cache_has_extent_at(&cache, 64));
     }
 
     #[test]
@@ -4910,7 +5250,7 @@ mod tests {
         merge_free_ranges_locked(&state, &mut allocator).unwrap();
         assert_eq!(allocator.size_class_counts, [0; SIZE_CLASSES.len()]);
         assert_eq!(
-            free_node_at(&state, &allocator, b.start).unwrap(),
+            free_node_at(&state, &mut allocator, b.start).unwrap(),
             Some((b.len, d.start))
         );
 

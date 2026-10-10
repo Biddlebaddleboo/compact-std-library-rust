@@ -330,6 +330,24 @@ fn run_child(arguments: &[String]) -> BenchResult<()> {
             free_growth = stats.resize_in_place_free_growth,
             no_space = stats.resize_no_space,
         );
+        println!(
+            "META\tresize_diagnostics\t{scenario}\t{variant}\tmerge_calls={merge_calls}\tadjacent_too_short={adjacent_too_short}\tno_adjacent={no_adjacent}\tnonadjacent_free={nonadjacent_free}\tcursor_limited={cursor_limited}\told_block_bytes={old_bytes}\trequested_block_bytes={requested_bytes}\tincremental_bytes={incremental_bytes}\tflush_retries={flush_retries}\tflush_skipped_unrelated={flush_skipped_unrelated}\tflush_bytes={flush_bytes}\tretry_successes={retry_successes}\tretry_failures={retry_failures}\ttransfer_moves={transfer_moves}\ttransfer_bytes={transfer_bytes}",
+            merge_calls = stats.resize_merge_calls,
+            adjacent_too_short = stats.resize_adjacent_too_short,
+            no_adjacent = stats.resize_no_adjacent_free,
+            nonadjacent_free = stats.resize_nonadjacent_free_available,
+            cursor_limited = stats.resize_cursor_capacity_limited,
+            old_bytes = stats.resize_old_block_bytes,
+            requested_bytes = stats.resize_requested_block_bytes,
+            incremental_bytes = stats.resize_incremental_bytes,
+            flush_retries = stats.resize_local_cache_flush_retries,
+            flush_skipped_unrelated = stats.resize_local_cache_flush_skips_unrelated,
+            flush_bytes = stats.resize_local_cache_flush_bytes,
+            retry_successes = stats.resize_local_cache_retry_successes,
+            retry_failures = stats.resize_local_cache_retry_failures,
+            transfer_moves = stats.ownership_transfer_moves,
+            transfer_bytes = stats.ownership_transfer_bytes,
+        );
         let pending_scan_depths = stats
             .pending_reuse_scan_depth_histogram
             .iter()
